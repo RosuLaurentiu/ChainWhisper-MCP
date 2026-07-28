@@ -1,0 +1,213 @@
+{
+  "schemaVersion": "chainwhisper.runtime/1",
+  "network": {
+    "name": "COTI Mainnet",
+    "chainId": 2632500,
+    "rpcUrl": "https://mainnet.coti.io/rpc",
+    "explorerUrl": "https://mainnet.cotiscan.io"
+  },
+  "registry": {
+    "address": "0x91e32EdFAb1e74DA07ea3012491a44D983aeBA46",
+    "bytecodeHash": "0xae15baa1cec72cc10e7e66887db7074c83e91412a7a835fd12503c5235f46d5b",
+    "bytecodeBytes": 1241,
+    "selectors": {
+      "getContracts": "0xc3a2a93a"
+    }
+  },
+  "contracts": {
+    "standardEscrow": {
+      "address": "0x7a232810f250a2C6e90895215aFf826116DFDb06",
+      "bytecodeHash": "0xecf06d3293e8b9997a430279dfbbd5f8851e5ac933e2ef1ed0edf4a11e81e892",
+      "bytecodeBytes": 23051,
+      "selectors": {
+        "createTradeAdvanced": "0x41ee5bda",
+        "createTradeWithPolicy": "0x5a9974fc",
+        "fillTrade": "0xb7e7659d",
+        "acceptCounterTradeAndCloseParent": "0x878610c5",
+        "counterTradeAndCloseCounteredTrade": "0x41d3e839",
+        "cancelTrade": "0x09ec6cc7",
+        "declineTrade": "0xe0834c72",
+        "reclaimExpiredTrade": "0xa680a293",
+        "extendTradeExpiry": "0x8d561815",
+        "refreshTrade": "0xc78d9cbc",
+        "editTrade": "0x093c1468",
+        "editTradeWithPolicy": "0xcae9fdc4"
+      }
+    },
+    "privateEscrow": {
+      "address": "0xe211c032E4432FdeB9e48f06b69EB98583B2A231",
+      "bytecodeHash": "0xad34b4097ff02f8f72c9596c43a3f5fddc8ac939d6ef0911bd6e2433676c79bf",
+      "bytecodeBytes": 23743,
+      "selectors": {
+        "createPrivateOrderWithRecoveryNote": "0xc046ea5d",
+        "cancelAndReplacePrivateOrderWithRecoveryNote": "0x39502758",
+        "fillPrivateOrder": "0xbecac0e2",
+        "fillPrivateOrderWithEncryptedAccess": "0x359d1061",
+        "fillHybridPrivateOrder": "0x46d212a4",
+        "fillHybridPrivateOrderWithEncryptedAccess": "0x93c30b36",
+        "cancelTrade": "0x09ec6cc7",
+        "declineTrade": "0xe0834c72",
+        "reclaimExpiredTrade": "0xa680a293",
+        "refreshTrade": "0xc78d9cbc"
+      }
+    },
+    "directEscrow": {
+      "address": "0x634c6dddda784c29d0435Cc54ca072Af0551914a",
+      "bytecodeHash": "0x82619fab3e36aeea5b025e0ea9dcd7d1e6ec63b442872033ca74912c726e463a",
+      "bytecodeBytes": 22637,
+      "selectors": {
+        "createDirectTrade": "0x74d8da0e",
+        "createDirectCounterTrade": "0x61d393f1",
+        "createDirectCounterTradeForParent": "0x08c084c6",
+        "counterTradeAndCloseCounteredTrade": "0x05907ed0",
+        "editDirectTrade": "0x3c565595",
+        "acceptDirectTrade": "0x12923fba",
+        "acceptDirectTradeWithEncryptedAccess": "0x543fe0a9",
+        "acceptCounterTradeAndCloseParent": "0x2bd027d4",
+        "cancelTrade": "0x09ec6cc7",
+        "declineTrade": "0xe0834c72",
+        "reclaimExpiredTrade": "0xa680a293"
+      }
+    },
+    "recurringEscrow": {
+      "address": "0x7235B18b9CD59fB9853BC3BF3a0A65bc32162cd5",
+      "bytecodeHash": "0x3ebc1ca2d3bc2cb25af2aa8b0c5cb5e3997f3ece1287c786ad65d807efa0febd",
+      "bytecodeBytes": 24514,
+      "requiresLiveAudit": true,
+      "selectors": {
+        "createRecurringOrder": "0xf02f02f3",
+        "createRecurringOrderWithRecoveryNote": "0x5526d468",
+        "createPrivateRecurringOrder": "0x3f857431",
+        "createPrivateRecurringOrderWithRecoveryNote": "0xf3f05fef",
+        "editOrder": "0x2a275930",
+        "fillBuySideWithSecret": "0x451903f0",
+        "fillSellSideWithSecret": "0xb916c07a",
+        "fillPrivateBuySideWithSecret": "0xe07ad3b3",
+        "fillPrivateSellSideWithSecret": "0x25c2920e",
+        "pauseOrder": "0xa81c643e",
+        "resumeOrder": "0x1a0ef727",
+        "cancelOrder": "0x514fcac7",
+        "settleInventory": "0xca9ad1f2"
+      }
+    },
+    "reader": {
+      "address": "0x77889B2f9F9fD812ad65AfF41048426fA1382660",
+      "bytecodeHash": "0xd7c523aad5b9b474c330c49e4c6e6cb9a75103ca131a15a4a72270f139ae87d0",
+      "bytecodeBytes": 19691,
+      "selectors": {}
+    },
+    "historyReader": {
+      "address": "0x650666328A771d70881c189F3B2BB1F3fBfe0514",
+      "bytecodeHash": "0x69477a00f0a96d1d5171cdaca7608c590683397e743f9d47218a4e3d5dd1ccbf",
+      "bytecodeBytes": 16347,
+      "selectors": {}
+    },
+    "privacyBridgeCoti": {
+      "address": "0x44D864973392064304dD88E2BDef39fF1ab11b7b",
+      "bytecodeHash": "0x463eb643ec8835baac402d3942a679715fab7aceae290955c3745b3e86b4e0c8",
+      "bytecodeBytes": 13647,
+      "selectors": {
+        "deposit": "0xe2bbb158",
+        "withdraw": "0xa41fe49f"
+      }
+    },
+    "privacyBridgeWeth": {
+      "address": "0x7286c83300f0C7131b4006f3cf9F8e44BeB45c13",
+      "bytecodeHash": "0xd9ca5fab2200b12a4d5d21739cfe9a7ab2dacc751ffa831d8ce6cea74a3582fc",
+      "bytecodeBytes": 14857,
+      "selectorAudit": "exact-bytecode-hash",
+      "selectors": {
+        "deposit": "0x00aeef8a",
+        "withdraw": "0xa41fe49f"
+      }
+    },
+    "privacyBridgeWbtc": {
+      "address": "0xc3B7EdEe4f1c0A0bA1AcD341e4982371eC869862",
+      "bytecodeHash": "0x5e8740497533ee6952e10029fd4af3f429a052c3398fd90ed11eba6ce5ea9064",
+      "bytecodeBytes": 14857,
+      "selectorAudit": "exact-bytecode-hash",
+      "selectors": {
+        "deposit": "0x00aeef8a",
+        "withdraw": "0xa41fe49f"
+      }
+    },
+    "privacyBridgeUsdt": {
+      "address": "0x7685B473DAF1c6DeD815Ca64C6fa18Da2227440D",
+      "bytecodeHash": "0x8c0548ef822cb556c09b36f6726cd936973f27574d492cab2a4586981ecc0828",
+      "bytecodeBytes": 14857,
+      "selectorAudit": "exact-bytecode-hash",
+      "selectors": {
+        "deposit": "0x00aeef8a",
+        "withdraw": "0xa41fe49f"
+      }
+    },
+    "privacyBridgeUsdcE": {
+      "address": "0x29334fC23ffa2c44AF1b372336C2296591Eadd86",
+      "bytecodeHash": "0x8c0548ef822cb556c09b36f6726cd936973f27574d492cab2a4586981ecc0828",
+      "bytecodeBytes": 14857,
+      "selectorAudit": "exact-bytecode-hash",
+      "selectors": {
+        "deposit": "0x00aeef8a",
+        "withdraw": "0xa41fe49f"
+      }
+    },
+    "privacyBridgeWada": {
+      "address": "0xFa2126C07F517013c8d237cc465342da89B96f92",
+      "bytecodeHash": "0x8c0548ef822cb556c09b36f6726cd936973f27574d492cab2a4586981ecc0828",
+      "bytecodeBytes": 14857,
+      "selectorAudit": "exact-bytecode-hash",
+      "selectors": {
+        "deposit": "0x00aeef8a",
+        "withdraw": "0xa41fe49f"
+      }
+    },
+    "privacyBridgeGcoti": {
+      "address": "0xD4e0d9AB16b48c68044cB6aeA3A089380d6D8cD4",
+      "bytecodeHash": "0xd9ca5fab2200b12a4d5d21739cfe9a7ab2dacc751ffa831d8ce6cea74a3582fc",
+      "bytecodeBytes": 14857,
+      "selectorAudit": "exact-bytecode-hash",
+      "selectors": {
+        "deposit": "0x00aeef8a",
+        "withdraw": "0xa41fe49f"
+      }
+    },
+    "privacyBridgeWisp": {
+      "address": "0x3bCeA2eD4b31107eF877899416dC97213bdc2809",
+      "bytecodeHash": "0xb0d6df57abe9e6cc8dbbde71b555c2321cbd00c3793fbb3b6dd4be704a696b45",
+      "bytecodeBytes": 9455,
+      "selectorAudit": "exact-bytecode-hash",
+      "selectors": {
+        "deposit": "0x00aeef8a",
+        "withdraw": "0xa41fe49f"
+      }
+    }
+  },
+  "tokens": [
+    { "symbol": "COTI", "kind": "native", "decimals": 18 },
+    { "symbol": "WISP", "kind": "erc20", "address": "0xb70c55bd0823436F44877DC6A9f46E0C55f2C3A8", "decimals": 6 },
+    { "symbol": "gCOTI", "kind": "erc20", "address": "0x7637C7838EC4Ec6b85080F28A678F8E234bB83D1", "decimals": 18 },
+    { "symbol": "Pengo", "kind": "erc20", "address": "0x659AD6d1F7353Df13Dec552cc05c9c15AfdD04e8", "decimals": 18 },
+    { "symbol": "WBBT", "kind": "erc20", "address": "0x256353f5B4b515f488876dD1CAc2300c6C6f98B7", "decimals": 18 },
+    { "symbol": "WBTC", "kind": "erc20", "address": "0x8C39B1fD0e6260fdf20652Fc436d25026832bfEA", "decimals": 8 },
+    { "symbol": "USDC.e", "kind": "erc20", "address": "0xf1Feebc4376c68B7003450ae66343Ae59AB37D3C", "decimals": 6 },
+    { "symbol": "USDT", "kind": "erc20", "address": "0xfA6f73446b17A97a56e464256DA54AD43c2Cbc3E", "decimals": 6 },
+    { "symbol": "wADA", "kind": "erc20", "address": "0xe757Ca19d2c237AA52eBb1d2E8E4368eeA3eb331", "decimals": 6 },
+    { "symbol": "NIGHT", "kind": "erc20", "address": "0xFc075Bd3e22d337C19b7Ca25635282ad8e24941a", "decimals": 6 },
+    { "symbol": "WETH", "kind": "erc20", "address": "0x639aCc80569c5FC83c6FBf2319A6Cc38bBfe26d1", "decimals": 18 },
+    { "symbol": "p.COTI", "kind": "private-erc20", "address": "0xD2F2692B83C3ecDF2EAa0f7c2632BBd46Ae1cC91", "decimals": 18, "publicCounterpart": "COTI" },
+    { "symbol": "p.WETH", "kind": "private-erc20", "address": "0x4727FE8D8450CEBcB142331FAc034Cd8d311f0E5", "decimals": 18, "publicCounterpart": "WETH" },
+    { "symbol": "p.WBTC", "kind": "private-erc20", "address": "0x65449561257ba5756631Aa0d34f07f6457a319be", "decimals": 8, "publicCounterpart": "WBTC" },
+    { "symbol": "p.USDT", "kind": "private-erc20", "address": "0x42107250C3D385ddfABE69ab6de163702040FeB0", "decimals": 6, "publicCounterpart": "USDT" },
+    { "symbol": "p.USDC.e", "kind": "private-erc20", "address": "0x63C9a1D05471fc8d47C83968725Dcfdcb5410392", "decimals": 6, "publicCounterpart": "USDC.e" },
+    { "symbol": "p.wADA", "kind": "private-erc20", "address": "0x3a8b49aAC1dAD86aa45a75231FbeC5bEb810e416", "decimals": 6, "publicCounterpart": "wADA" },
+    { "symbol": "p.gCOTI", "kind": "private-erc20", "address": "0x394b3c4328160f000763Ca391D07F902926EDaAc", "decimals": 18, "publicCounterpart": "gCOTI" },
+    { "symbol": "p.WISP", "kind": "private-erc20", "address": "0x682e3142e62a7aDe2a0CA5bdC87b205CaDe4B17a", "decimals": 6, "publicCounterpart": "WISP" },
+    { "symbol": "p.PENGO", "kind": "private-erc20", "address": "0xefe07cbd73538b2f7b3dd8cbc3a435fd4ee16213", "decimals": 6, "publicCounterpart": "Pengo" },
+    { "symbol": "HOTDOG", "kind": "private-erc20", "address": "0x5085Ea0611A9C49316972C57390ca25C9CF236AB", "decimals": 18 }
+  ],
+  "audit": {
+    "capturedAt": "2026-07-27T00:00:00.000Z",
+    "authority": "deployed-bytecode",
+    "recurringWritePolicy": "enable-only-after-live-bytecode-and-selector-match"
+  }
+}

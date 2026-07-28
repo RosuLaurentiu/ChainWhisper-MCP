@@ -1,0 +1,58 @@
+{
+  "name": "@chainwhisper/agent-tools",
+  "version": "0.1.0-beta.0",
+  "description": "Keyless ChainWhisper OTC and Privacy Portal planning with local COTI signing MCP servers.",
+  "type": "module",
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/RosuLaurentiu/ChainWhisper.git",
+    "directory": "packages/chainwhisper-agent-tools"
+  },
+  "homepage": "https://github.com/RosuLaurentiu/ChainWhisper/tree/agent/packages/chainwhisper-agent-tools#readme",
+  "bugs": {
+    "url": "https://github.com/RosuLaurentiu/ChainWhisper/issues"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "chainwhisper-mcp": "./dist/bin/chainwhisper-mcp.js",
+    "chainwhisper-coti-signer": "./dist/bin/chainwhisper-coti-signer.js"
+  },
+  "files": [
+    "dist",
+    "runtime",
+    "README.md"
+  ],
+  "exports": {
+    ".": "./dist/shared/index.js",
+    "./domain": "./dist/domain/index.js",
+    "./signer": "./dist/signer/index.js"
+  },
+  "scripts": {
+    "audit:runtime": "node dist/bin/audit-runtime.js",
+    "smoke:live-readonly": "node scripts/live-readonly-smoke.mjs",
+    "test:local-confirmation": "node scripts/local-confirmation-diagnostic.mjs",
+    "setup:live-confirmed": "node scripts/live-confirmed-setup.mjs",
+    "order:live-preview": "node scripts/live-order-preview.mjs",
+    "order:live-execute-step": "node scripts/live-order-execute-step.mjs"
+  },
+  "dependencies": {
+    "@coti-io/coti-ethers": "1.0.5",
+    "@coti-io/coti-sdk-private-messaging": "0.2.3",
+    "@coti-io/coti-sdk-typescript": "1.0.6",
+    "@modelcontextprotocol/sdk": "1.29.0",
+    "@scure/bip39": "1.6.0",
+    "viem": "2.55.1",
+    "zod": "3.25.76"
+  },
+  "devDependencies": {
+    "@types/node": "22.19.15",
+    "typescript": "5.9.3",
+    "vitest": "4.0.18"
+  }
+}
