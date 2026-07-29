@@ -109,7 +109,9 @@ const run = async (command, args, options = {}) =>
       rejectPromise(
         new Error(
           `${command} exited with code ${String(code)}${
-            stderr.trim() ? `\n${stderr.trim()}` : ''
+            [stderr.trim(), stdout.trim()].filter(Boolean).length > 0
+              ? `\n${[stderr.trim(), stdout.trim()].filter(Boolean).join('\n')}`
+              : ''
           }`,
         ),
       );
@@ -259,12 +261,27 @@ try {
       '--ignore-scripts',
       '--no-audit',
       '--no-fund',
-      '--package-lock=false',
       tarballPath,
     ],
     {
       cwd: consumerDirectory,
       env: withoutWorkspaceContext(),
+    },
+  );
+
+  const auditEnvironment = withoutWorkspaceContext();
+  auditEnvironment.npm_config_audit = 'true';
+  await run(
+    npm.command,
+    [
+      ...npm.prefix,
+      'audit',
+      '--omit=dev',
+      '--audit-level=low',
+    ],
+    {
+      cwd: consumerDirectory,
+      env: auditEnvironment,
     },
   );
 
@@ -395,7 +412,7 @@ try {
   });
 
   process.stdout.write(
-    `Packed, inspected, npm-installed outside the repository, and stdio-smoked ${entry.name}@${entry.version} through npm command shims.\n`,
+    `Packed, inspected, production-audited, npm-installed outside the repository, and stdio-smoked ${entry.name}@${entry.version} through npm command shims.\n`,
   );
 } finally {
   const resolvedTempDirectory = resolve(tmpdir());

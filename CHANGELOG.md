@@ -56,6 +56,12 @@ Initial public beta release candidate.
 - Private-artifact recipes must contain the exact outputs required by their
   signed call. Planner input and message traversal have explicit resource
   limits.
+- The COTI ethers dependency is constrained to `ethers@6.17.0`, which uses the
+  patched `ws@8.21.0`; the isolated release-tarball gate audits production
+  dependencies and fails on any reported advisory.
+- The MCP SDK is updated to `1.30.0`, allowing the patched
+  `@hono/node-server@2.0.12` dependency even though ChainWhisper exposes stdio
+  transports only.
 
 ### Verification
 
@@ -64,8 +70,9 @@ Initial public beta release candidate.
 - Stdio smoke coverage verifies the planner surface and the unconfigured
   signer's read-only status.
 - The npm tarball gate checks allowlisted contents, installs the exact release
-  archive into an external clean consumer, and starts both npm-created command
-  shims before that same archive can be published.
+  archive into an external clean consumer, audits its production dependency
+  tree, and starts both npm-created command shims before that same archive can
+  be published.
 - CI covers Node.js 20, 22, and 24 on Ubuntu and Node.js 22 on Windows.
 
 ### Known beta constraints
