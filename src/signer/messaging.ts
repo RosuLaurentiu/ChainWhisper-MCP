@@ -18,6 +18,10 @@ import {
   type HexString,
 } from '../shared/index.js';
 import { ConfirmationGate } from './confirmation.js';
+import {
+  AutonomyPolicyManager,
+  type AutonomyReservationV1,
+} from './autonomy.js';
 import { maximumNetworkFeeDisplay } from './cotiRuntime.js';
 import { SignerError } from './errors.js';
 import { OperationJournal } from './journal.js';
@@ -48,17 +52,122 @@ const SEND_TOOLS = new Set<McpToolName>([
   'send_private_agent_message',
 ]);
 
-const READ_TOOLS = new Set<McpToolName>([
+const READ_TOOL_NAMES = [
   'read_private_agent_message',
   'list_private_agent_inbox',
   'list_sent_private_agent_messages',
   'get_contract_config',
   'get_private_agent_inbox_stats',
   'get_message_metadata',
-]);
+] as const satisfies readonly McpToolName[];
+
+type EmbeddedReadToolName = (typeof READ_TOOL_NAMES)[number];
+
+const READ_TOOLS = new Set<McpToolName>(READ_TOOL_NAMES);
 
 export const CHAINWHISPER_MESSAGING_TOOL_ALLOWLIST =
   new Set<McpToolName>([...SEND_TOOLS, ...READ_TOOLS]);
+
+const ADDRESS_INPUT_SCHEMA = {
+  type: 'string',
+  pattern: '^0x[0-9a-fA-F]{40}$',
+  description: 'Wallet address to query',
+} as const;
+
+const MESSAGE_ID_INPUT_SCHEMA = {
+  oneOf: [
+    {
+      type: 'string',
+      pattern: '^(?:0|[1-9][0-9]{0,77})$',
+    },
+    {
+      type: 'integer',
+      minimum: 0,
+      maximum: Number.MAX_SAFE_INTEGER,
+    },
+  ],
+  description: 'Canonical uint256 message identifier',
+} as const;
+
+const PAGINATION_PROPERTIES = {
+  account: ADDRESS_INPUT_SCHEMA,
+  offset: {
+    type: 'integer',
+    minimum: 0,
+    default: 0,
+  },
+  limit: {
+    type: 'integer',
+    minimum: 1,
+    maximum: 100,
+    default: 20,
+  },
+  decrypt: {
+    type: 'boolean',
+    default: true,
+  },
+} as const;
+
+/**
+ * Do not forward the SDK's open root schemas directly. These are the complete
+ * ChainWhisper read-only argument contracts and intentionally contain no
+ * credential, RPC, runner, key, or arbitrary metadata escape hatch.
+ */
+const CLOSED_READ_TOOL_SCHEMAS: Record<
+  EmbeddedReadToolName,
+  Record<string, unknown>
+> = {
+  read_private_agent_message: {
+    type: 'object',
+    properties: {
+      messageId: MESSAGE_ID_INPUT_SCHEMA,
+      decrypt: {
+        type: 'boolean',
+        default: true,
+      },
+    },
+    required: ['messageId'],
+    additionalProperties: false,
+  },
+  list_private_agent_inbox: {
+    type: 'object',
+    properties: PAGINATION_PROPERTIES,
+    required: ['account'],
+    additionalProperties: false,
+  },
+  list_sent_private_agent_messages: {
+    type: 'object',
+    properties: PAGINATION_PROPERTIES,
+    required: ['account'],
+    additionalProperties: false,
+  },
+  get_contract_config: {
+    type: 'object',
+    properties: {},
+    additionalProperties: false,
+  },
+  get_private_agent_inbox_stats: {
+    type: 'object',
+    properties: {
+      account: ADDRESS_INPUT_SCHEMA,
+    },
+    required: ['account'],
+    additionalProperties: false,
+  },
+  get_message_metadata: {
+    type: 'object',
+    properties: {
+      messageId: MESSAGE_ID_INPUT_SCHEMA,
+    },
+    required: ['messageId'],
+    additionalProperties: false,
+  },
+};
+
+const closedReadToolSchema = (
+  toolName: EmbeddedReadToolName,
+): Record<string, unknown> =>
+  structuredClone(CLOSED_READ_TOOL_SCHEMAS[toolName]);
 
 const NEGOTIATION_KINDS = new Set<OtcNegotiationKind>([
   'proposal',
@@ -73,6 +182,13 @@ const RAW_32_BYTE_HEX_PATTERN = /0[xX][0-9a-fA-F]{64}/u;
 const RAW_32_BYTE_HEX_GLOBAL_PATTERN = /0[xX][0-9a-fA-F]{64}/gu;
 const SAFE_NEGOTIATION_MESSAGE_ID_PATTERN =
   /^(?!0[xX][0-9a-fA-F]{64}$)[a-zA-Z0-9][a-zA-Z0-9._:-]{0,127}$/u;
+const SAFE_POLICY_ID_PATTERN =
+  /^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,127}$/u;
+const EMBEDDED_SEND_INPUT_KEYS = new Set([
+  'to',
+  'plaintext',
+  'policyId',
+]);
 const SENSITIVE_MESSAGE_VALUE = '[sensitive message withheld]' as const;
 const sensitiveMessageKey = (index: number): string =>
   `[sensitive-key-${index}-withheld]`;
@@ -234,6 +350,108 @@ const asRecord = (value: unknown): Record<string, unknown> | null =>
   value && typeof value === 'object' && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : null;
+
+const unsafeOfficialToolInput = (): never => {
+  throw new SignerError(
+    'UNSAFE_MESSAGE',
+    'Official COTI messaging arguments do not match the closed ChainWhisper schema.',
+  );
+};
+
+const assertExactInputKeys = (
+  input: Readonly<Record<string, unknown>>,
+  allowedKeys: ReadonlySet<string>,
+): void => {
+  if (
+    containsSensitiveMaterial(input) ||
+    Object.keys(input).some((key) => !allowedKeys.has(key))
+  ) {
+    unsafeOfficialToolInput();
+  }
+};
+
+const normalizedMessageIdInput = (value: unknown): string => {
+  if (typeof value !== 'string' && typeof value !== 'number') {
+    return unsafeOfficialToolInput();
+  }
+  const normalized = canonicalMessageId(value);
+  if (normalized === null) return unsafeOfficialToolInput();
+  return normalized;
+};
+
+const normalizedBooleanInput = (
+  value: unknown,
+  fallback: boolean,
+): boolean => {
+  if (value === undefined) return fallback;
+  if (typeof value !== 'boolean') return unsafeOfficialToolInput();
+  return value;
+};
+
+const normalizedPaginationInteger = (
+  value: unknown,
+  fallback: number,
+  minimum: number,
+  maximum = Number.MAX_SAFE_INTEGER,
+): number => {
+  if (value === undefined) return fallback;
+  if (
+    typeof value !== 'number' ||
+    !Number.isSafeInteger(value) ||
+    value < minimum ||
+    value > maximum
+  ) {
+    return unsafeOfficialToolInput();
+  }
+  return value;
+};
+
+const normalizedAccountInput = (value: unknown): Address => {
+  if (!isHexAddress(value)) return unsafeOfficialToolInput();
+  return value.toLowerCase() as Address;
+};
+
+const normalizeOfficialReadInput = (
+  toolName: EmbeddedReadToolName,
+  rawInput: unknown,
+): Record<string, unknown> => {
+  assertBoundedTree(rawInput, OUTBOUND_TREE_LIMITS);
+  const input = asRecord(rawInput);
+  if (!input) return unsafeOfficialToolInput();
+  switch (toolName) {
+    case 'read_private_agent_message':
+      assertExactInputKeys(input, new Set(['messageId', 'decrypt']));
+      return {
+        messageId: normalizedMessageIdInput(input.messageId),
+        decrypt: normalizedBooleanInput(input.decrypt, true),
+      };
+    case 'list_private_agent_inbox':
+    case 'list_sent_private_agent_messages':
+      assertExactInputKeys(
+        input,
+        new Set(['account', 'offset', 'limit', 'decrypt']),
+      );
+      return {
+        account: normalizedAccountInput(input.account),
+        offset: normalizedPaginationInteger(input.offset, 0, 0),
+        limit: normalizedPaginationInteger(input.limit, 20, 1, 100),
+        decrypt: normalizedBooleanInput(input.decrypt, true),
+      };
+    case 'get_contract_config':
+      assertExactInputKeys(input, new Set());
+      return {};
+    case 'get_private_agent_inbox_stats':
+      assertExactInputKeys(input, new Set(['account']));
+      return {
+        account: normalizedAccountInput(input.account),
+      };
+    case 'get_message_metadata':
+      assertExactInputKeys(input, new Set(['messageId']));
+      return {
+        messageId: normalizedMessageIdInput(input.messageId),
+      };
+  }
+};
 
 const transactionHashFromResult = (value: unknown): HexString | null => {
   const record = asRecord(value);
@@ -580,6 +798,7 @@ export type SendOrderMessageInput = {
   body?: Record<string, unknown>;
   shareLocalAccessSecret?: boolean;
   accessSecretId?: string;
+  policyId?: string;
 };
 
 const ALLOWED_SEND_ORDER_MESSAGE_KEYS = new Set([
@@ -592,6 +811,7 @@ const ALLOWED_SEND_ORDER_MESSAGE_KEYS = new Set([
   'body',
   'shareLocalAccessSecret',
   'accessSecretId',
+  'policyId',
 ]);
 
 const ALLOWED_ORDER_REFERENCE_KEYS = new Set([
@@ -663,6 +883,9 @@ export class ChainWhisperMessagingBridge {
   readonly #journal: OperationJournal;
   readonly #vault: EncryptedSecretVault;
   readonly #orderMakers: OrderMakerReader | null;
+  readonly #assertRuntimeAttested: () => Promise<void>;
+  readonly #autonomy: AutonomyPolicyManager | null;
+  readonly #manifestHash: HexString | null;
   readonly #vaultSecretCandidateCache = new Map<string, boolean>();
 
   constructor(options: {
@@ -675,6 +898,9 @@ export class ChainWhisperMessagingBridge {
     journal: OperationJournal;
     vault: EncryptedSecretVault;
     orderMakers?: OrderMakerReader;
+    assertRuntimeAttested?: () => Promise<void>;
+    autonomy?: AutonomyPolicyManager;
+    manifestHash?: HexString;
   }) {
     this.#tools = options.tools ?? PRIVATE_MESSAGING_MCP_TOOLS;
     this.#invoke = options.invoke;
@@ -685,6 +911,10 @@ export class ChainWhisperMessagingBridge {
     this.#journal = options.journal;
     this.#vault = options.vault;
     this.#orderMakers = options.orderMakers ?? null;
+    this.#assertRuntimeAttested =
+      options.assertRuntimeAttested ?? (async () => undefined);
+    this.#autonomy = options.autonomy ?? null;
+    this.#manifestHash = options.manifestHash ?? null;
   }
 
   listTools(): OfficialMessagingTool[] {
@@ -712,7 +942,7 @@ export class ChainWhisperMessagingBridge {
               required: ['to', 'plaintext'],
               additionalProperties: false,
             }
-          : tool.inputSchema,
+          : closedReadToolSchema(tool.name as EmbeddedReadToolName),
       }));
   }
 
@@ -731,11 +961,22 @@ export class ChainWhisperMessagingBridge {
       );
     }
     if (SEND_TOOLS.has(toolName as McpToolName)) {
+      assertBoundedTree(input, OUTBOUND_TREE_LIMITS);
+      if (
+        containsSensitiveMaterial(input) ||
+        Object.keys(input).some(
+          (key) => !EMBEDDED_SEND_INPUT_KEYS.has(key),
+        ) ||
+        (input.policyId !== undefined &&
+          (typeof input.policyId !== 'string' ||
+            !SAFE_POLICY_ID_PATTERN.test(input.policyId)))
+      ) {
+        unsafeOfficialToolInput();
+      }
       const outbound = {
         to: input.to,
         plaintext: input.plaintext,
       };
-      assertBoundedTree(outbound, OUTBOUND_TREE_LIMITS);
       if (
         !isHexAddress(outbound.to) ||
         typeof outbound.plaintext !== 'string' ||
@@ -755,9 +996,15 @@ export class ChainWhisperMessagingBridge {
         toolName as McpToolName,
         outbound,
         false,
+        undefined,
+        typeof input.policyId === 'string' ? input.policyId : undefined,
       );
     }
-    const result = await this.#invoke(toolName, input);
+    const normalizedInput = normalizeOfficialReadInput(
+      toolName as EmbeddedReadToolName,
+      input,
+    );
+    const result = await this.#invoke(toolName, normalizedInput);
     return this.#markIncomingUntrusted(result);
   }
 
@@ -902,6 +1149,7 @@ export class ChainWhisperMessagingBridge {
             expectedResult: `One encrypted COTI access message is sent to ${input.to} for the exact ChainWhisper order ${input.order.escrowContract}:${input.order.localId}.`,
           }
         : undefined,
+      input.policyId,
     );
   }
 
@@ -986,6 +1234,7 @@ export class ChainWhisperMessagingBridge {
       summary: string;
       expectedResult: string;
     },
+    policyId?: string,
   ): Promise<unknown> {
     const recipient = input.to;
     const plaintext = input.plaintext;
@@ -1010,6 +1259,7 @@ export class ChainWhisperMessagingBridge {
         'Raw secrets cannot be supplied through a private message tool.',
       );
     }
+    await this.#assertRuntimeAttested();
     const outputAccessSecrets = containsVaultSecret
       ? collectExplicitAccessSecrets(plaintext)
       : new Set<string>();
@@ -1027,7 +1277,7 @@ export class ChainWhisperMessagingBridge {
       plaintext,
       outputAccessSecrets,
     );
-    if (!this.#confirmation.isWriteAvailable) {
+    if (!policyId && !this.#confirmation.isWriteAvailable) {
       throw new SignerError(
         'ELICITATION_UNSUPPORTED',
         'Private-message writes are disabled without MCP form elicitation.',
@@ -1141,6 +1391,54 @@ export class ChainWhisperMessagingBridge {
     const maximumNetworkFee = maximumNetworkFeeDisplay(
       DEFAULT_ENCRYPTED_MESSAGE_GAS_LIMIT,
     );
+    let autonomyReservation: AutonomyReservationV1 | null = null;
+    if (policyId) {
+      if (!this.#autonomy || !this.#manifestHash) {
+        return {
+          status: 'denied',
+          autonomyDenial: {
+            code: 'POLICY_NOT_FOUND',
+            message: 'Autonomy is not available for messaging in this signer session.',
+            policyId,
+          },
+        };
+      }
+      const reserved = await this.#autonomy.reserve(policyId, {
+        wallet,
+        chainId: 2_632_500,
+        manifestHash: this.#manifestHash,
+        operationHash,
+        action: 'send_order_message',
+        pairs: [],
+        priceQuotes: [],
+        grossSpend: [],
+        minimumReceive: [],
+        counterparty: recipient,
+        messageCount: 1,
+        nativeValue: '0',
+        maximumNetworkFee: maximumNetworkFee.wei,
+        agentProvidedPrivateAmounts: false,
+        stepDigests: [
+          sha256Hex(
+            canonicalize({
+              kind: 'coti-private-message',
+              contract: this.#messagingContract,
+              recipient,
+              messageContentHash,
+              gasLimit: String(DEFAULT_ENCRYPTED_MESSAGE_GAS_LIMIT),
+              maximumNetworkFeeWei: maximumNetworkFee.wei,
+            }),
+          ),
+        ],
+      });
+      if (!reserved.allowed) {
+        return {
+          status: 'denied',
+          autonomyDenial: reserved.denial,
+        };
+      }
+      autonomyReservation = reserved.value;
+    }
     const confirmation: ConfirmationRequest = {
       operationId,
       operationHash,
@@ -1188,12 +1486,14 @@ export class ChainWhisperMessagingBridge {
           contentPreview,
         )}`,
     };
-    await this.#journal.updateStage(
-      operationId,
-      'awaiting-confirmation',
-      0,
-    );
-    await this.#confirmation.confirm(confirmation);
+    if (!policyId) {
+      await this.#journal.updateStage(
+        operationId,
+        'awaiting-confirmation',
+        0,
+      );
+      await this.#confirmation.confirm(confirmation);
+    }
     let invoked: { nonce: number; result: unknown };
     try {
       invoked = await this.#nonceQueue.runExternalWrite(
@@ -1203,6 +1503,9 @@ export class ChainWhisperMessagingBridge {
         },
       );
     } catch (error) {
+      if (autonomyReservation && this.#autonomy) {
+        await this.#autonomy.markUncertain(autonomyReservation.id);
+      }
       const reserved = await this.#journal.get(operationId);
       if (
         reserved &&
@@ -1229,6 +1532,9 @@ export class ChainWhisperMessagingBridge {
     try {
       safeInvokedResult = safeResult(invoked.result);
     } catch {
+      if (autonomyReservation && this.#autonomy) {
+        await this.#autonomy.markUncertain(autonomyReservation.id);
+      }
       await this.#journal.recordError(
         operationId,
         'MESSAGE_BROADCAST_UNCERTAIN',
@@ -1242,6 +1548,9 @@ export class ChainWhisperMessagingBridge {
     }
     const transactionHash = transactionHashFromResult(safeInvokedResult);
     if (!transactionHash) {
+      if (autonomyReservation && this.#autonomy) {
+        await this.#autonomy.markUncertain(autonomyReservation.id);
+      }
       await this.#journal.recordError(
         operationId,
         'MESSAGE_TRANSACTION_HASH_MISSING',
@@ -1260,10 +1569,23 @@ export class ChainWhisperMessagingBridge {
         transactionHash,
         0,
       )) ?? record;
+    if (autonomyReservation && this.#autonomy) {
+      const signed = await this.#autonomy.markSigned(
+        autonomyReservation.id,
+        transactionHash,
+      );
+      if (signed.allowed) {
+        autonomyReservation = signed.value;
+        await this.#autonomy.markPending(autonomyReservation.id);
+      }
+    }
     let receipt;
     try {
       receipt = await this.#wallet.waitForTransaction(transactionHash);
     } catch {
+      if (autonomyReservation && this.#autonomy) {
+        await this.#autonomy.markUncertain(autonomyReservation.id);
+      }
       await this.#journal.recordError(
         operationId,
         'MESSAGE_BROADCAST_UNCERTAIN',
@@ -1284,6 +1606,9 @@ export class ChainWhisperMessagingBridge {
       });
     }
     if (receipt.status !== 'success') {
+      if (autonomyReservation && this.#autonomy) {
+        await this.#autonomy.markSettled(autonomyReservation.id);
+      }
       await this.#journal.recordError(
         operationId,
         'MESSAGE_TRANSACTION_REVERTED',
@@ -1296,6 +1621,9 @@ export class ChainWhisperMessagingBridge {
       );
     }
     await this.#journal.updateStage(operationId, 'completed', 1);
+    if (autonomyReservation && this.#autonomy) {
+      await this.#autonomy.markSettled(autonomyReservation.id);
+    }
     return safeResult({
       status: 'completed',
       transactionHash,

@@ -13,13 +13,12 @@ import {
   getOrCreatePairingSecret,
   HttpJsonRpcReader,
   loadRuntimeManifest,
+  CHAINWHISPER_AGENT_TOOLS_VERSION,
   type ChainWhisperRuntimeManifestV1,
   type JsonRpcReader
 } from '../shared/index.js';
 import { SignedDomainEnvelopeFactory } from './envelopeFactory.js';
 import { ManifestExecutionPlanner } from './executionPlanner.js';
-
-const PACKAGE_VERSION = '0.1.0-beta.0';
 
 export interface PlanningServerOptions {
   manifest?: ChainWhisperRuntimeManifestV1;
@@ -121,7 +120,7 @@ const prompts: JsonMcpPrompt[] = [
       }
     ],
     render: (args) =>
-      `Prepare this request with the matching chainwhisper_prepare_* tool: ${args.request ?? ''}\nIf the request has no explicit orderType, call chainwhisper_order_types first, explain the exact cadence, access, terms visibility, liquidity visibility, and fill style, then let the user choose. Return editable missing details when needed. Never request a private key, mnemonic, AES key, access secret, ABI, calldata, or arbitrary contract address. The returned plan must still be confirmed and executed by chainwhisper-coti-signer.`
+      `Prepare this request with the matching chainwhisper_prepare_* tool: ${args.request ?? ''}\nIf the request has no explicit orderType, call chainwhisper_order_types first, explain the exact cadence, access, terms visibility, liquidity visibility, and fill style, then let the user choose. Return editable missing details when needed. Never request a private key, mnemonic, privacy key, access secret, ABI, calldata, or arbitrary contract address. The returned plan must be executed by chainwhisper-coti-signer under either one complete local confirmation or an exact active policyId.`
   }
 ];
 
@@ -155,9 +154,9 @@ export const createChainWhisperPlanningRuntime = async (
   const tools = createChainWhisperDomainTools(service);
   const definition: JsonMcpServerDefinition = {
     name: 'chainwhisper-mcp',
-    version: PACKAGE_VERSION,
+    version: CHAINWHISPER_AGENT_TOOLS_VERSION,
     instructions:
-      'ChainWhisper MCP is a keyless COTI Mainnet OTC and Privacy Portal planner. Use reads before preparation. Amounts are decimal strings, never JSON numbers. Price comparison does not need an amount; rank execution only when the tool confirms executable liquidity. Privacy Portal actions must name an allowlisted pair and public-to-private or private-to-public direction. Preparation validates only repository-allowlisted contracts and selectors and returns a paired ActionEnvelopeV1. It never signs, broadcasts, sends messages, or accepts wallet credentials, AES keys, mnemonics, access secrets, ABIs, calldata, arbitrary contracts, tokens, spenders, or admin actions. Missing optional terms are editable. Execute an envelope only through the separately registered local chainwhisper-coti-signer, which must elicit confirmation.',
+      'ChainWhisper MCP is a keyless COTI Mainnet OTC and Privacy Portal planner. Use reads before preparation. Amounts are decimal strings, never JSON numbers. Price comparison does not need an amount; rank execution only when the tool confirms executable liquidity. Privacy Portal actions must name an allowlisted pair and public-to-private or private-to-public direction. Preparation validates only repository-allowlisted contracts and selectors and returns a paired ActionEnvelopeV1. It never signs, broadcasts, sends messages, or accepts wallet credentials, privacy keys, mnemonics, access secrets, ABIs, calldata, arbitrary contracts, tokens, spenders, or admin actions. Missing optional terms are editable. Execute an envelope only through the separately registered local chainwhisper-coti-signer, using one complete local confirmation or an exact active policyId.',
     tools: tools.map(toMcpTool),
     resources: resourcesFor(manifest),
     prompts

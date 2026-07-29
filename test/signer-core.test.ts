@@ -13,6 +13,7 @@ import {
 } from '../src/shared/index.js';
 import {
   ActionEnvelopeVerifier,
+  AutonomyPolicyManager,
   ConfirmationGate,
   EncryptedSecretVault,
   LoadedSignerConfig,
@@ -172,7 +173,10 @@ class TestRuntimeState implements RuntimeStateReader {
 class TestElicitor implements FormElicitor {
   requests: ConfirmationRequest[] = [];
 
-  constructor(readonly supported = true) {}
+  constructor(
+    readonly supported = true,
+    readonly outcome: 'accepted' | 'declined' = 'accepted',
+  ) {}
 
   isSupported(): boolean {
     return this.supported;
@@ -180,9 +184,11 @@ class TestElicitor implements FormElicitor {
 
   async requestConfirmation(
     request: ConfirmationRequest,
-  ): Promise<{ outcome: 'accepted' }> {
+  ): Promise<
+    { outcome: 'accepted' } | { outcome: 'declined' }
+  > {
     this.requests.push(request);
-    return { outcome: 'accepted' };
+    return { outcome: this.outcome };
   }
 }
 
@@ -295,6 +301,7 @@ const createEngine = async (options: {
   elicitor?: TestElicitor;
   simulator?: TestSimulator;
   intentValidator?: MaterializedIntentValidator;
+  autonomy?: AutonomyPolicyManager;
 }) => {
   const stateDirectory = await mkdtemp(join(tmpdir(), 'cw-signer-core-'));
   const config = createConfig(stateDirectory);
@@ -327,11 +334,40 @@ const createEngine = async (options: {
         new StrictMaterializedIntentValidator(),
       journal,
       vault,
+      ...(options.autonomy ? { autonomy: options.autonomy } : {}),
     }),
   };
 };
 
 describe('local ChainWhisper signer core', () => {
+  it('returns a structured policy denial without opening a fallback confirmation', async () => {
+    const autonomy = {
+      reserve: async () => ({
+        allowed: false as const,
+        denial: {
+          code: 'ACTION_NOT_ALLOWED' as const,
+          message: 'Action is outside the bounded policy.',
+          policyId: 'policy-1',
+          field: 'action',
+        },
+      }),
+    } as unknown as AutonomyPolicyManager;
+    const setup = await createEngine({ autonomy });
+
+    await expect(
+      setup.engine.executeAction(createEnvelope('policy-denial'), 'policy-1'),
+    ).resolves.toMatchObject({
+      status: 'denied',
+      errorCode: 'AUTONOMY_ACTION_NOT_ALLOWED',
+      autonomyDenial: {
+        code: 'ACTION_NOT_ALLOWED',
+        policyId: 'policy-1',
+      },
+    });
+    expect(setup.elicitor.requests).toHaveLength(0);
+    expect(setup.wallet.prepared.size).toBe(0);
+  });
+
   it('rechecks runtime around confirmation and confirms every write', async () => {
     const setup = await createEngine({});
     setup.runtime.state.fees[
@@ -352,6 +388,40 @@ describe('local ChainWhisper signer core', () => {
     });
     expect(setup.runtime.reads).toBeGreaterThanOrEqual(3);
     expect(setup.simulator.calls).toBe(2);
+  });
+
+  it('authorizes a complete multi-step action with one confirmation', async () => {
+    const setup = await createEngine({});
+    const base = createEnvelope('complete-action-confirmation');
+    const envelope = resignEnvelope(base, {
+      steps: [
+        base.steps[0]!,
+        {
+          ...base.steps[0]!,
+          id: 'cancel-confirmed-sequence',
+          summary: 'Complete the confirmed sequence.'
+        }
+      ],
+      gasCap: '200000'
+    });
+
+    await expect(setup.engine.executeAction(envelope)).resolves.toMatchObject({
+      status: 'completed'
+    });
+    expect(setup.wallet.prepareCount).toBe(2);
+    expect(setup.elicitor.requests).toHaveLength(1);
+    expect(setup.elicitor.requests[0]).toMatchObject({
+      authorizationScope: 'complete-logical-action',
+      actionButtonLabel: 'Confirm complete order update',
+      stepCount: 2,
+      gasCap: '200000',
+      technicalDetails: [
+        { stepId: 'cancel' },
+        { stepId: 'cancel-confirmed-sequence' }
+      ]
+    });
+    expect(setup.elicitor.requests[0]?.stepDigests).toHaveLength(2);
+    expect(setup.simulator.calls).toBe(4);
   });
 
   it('re-simulates after confirmation and never signs changed state', async () => {
@@ -691,17 +761,15 @@ describe('local ChainWhisper signer core', () => {
     ).toHaveLength(43);
   });
 
-  it('ignores generic credential variables and requires signer-scoped names', async () => {
+  it('ignores generic credential variables and enters wallet setup mode', async () => {
     const stateDirectory = await mkdtemp(join(tmpdir(), 'cw-config-generic-'));
-    await expect(
-      loadSignerConfig({
-        PRIVATE_KEY: `0x${'11'.repeat(32)}`,
-        AES_KEY: `0x${'22'.repeat(32)}`,
-        CHAINWHISPER_SIGNER_VAULT_PASSPHRASE:
-          'a-long-test-vault-passphrase',
-        CHAINWHISPER_STATE_DIRECTORY: stateDirectory,
-      }),
-    ).rejects.toMatchObject({ code: 'CONFIGURATION_REQUIRED' });
+    const config = await loadSignerConfig({
+      PRIVATE_KEY: `0x${'11'.repeat(32)}`,
+      AES_KEY: `0x${'22'.repeat(32)}`,
+      CHAINWHISPER_STATE_DIRECTORY: stateDirectory,
+    });
+    expect(config.walletConfigured).toBe(false);
+    expect(config.configurationDiagnostic).toBe('wallet-setup-required');
   });
 
   it('rejects private artifact recipes before confirmation or signing', async () => {
@@ -760,5 +828,57 @@ describe('local ChainWhisper signer core', () => {
     await expect(
       setup.engine.discardOperation(operationId, REGISTRY_HASH),
     ).rejects.toMatchObject({ code: 'OPERATION_IN_PROGRESS' });
+  });
+
+  it('preserves recovery state when exact operation discard is declined', async () => {
+    const elicitor = new TestElicitor(true, 'declined');
+    const setup = await createEngine({ elicitor });
+    const operationId = 'declined-local-discard';
+    const secretReference = `${REGISTRY_HASH}:recovery-secret`;
+    await setup.journal.begin(operationId, REGISTRY_HASH);
+    await setup.vault.put(secretReference, 'local-recovery-value');
+
+    await expect(
+      setup.engine.discardOperation(operationId, REGISTRY_HASH),
+    ).rejects.toMatchObject({ code: 'CONFIRMATION_DECLINED' });
+    expect(elicitor.requests).toHaveLength(1);
+    expect(elicitor.requests[0]).toMatchObject({
+      operationId,
+      operationHash: REGISTRY_HASH,
+      action: 'discard_operation',
+      actionButtonLabel: 'Confirm discard and delete local data',
+      authorizationScope: 'complete-logical-action',
+    });
+    expect((await setup.journal.get(operationId))?.stage).toBe(
+      'validated',
+    );
+    expect(await setup.vault.get(secretReference)).toBe(
+      'local-recovery-value',
+    );
+  });
+
+  it('discards only the locally confirmed exact operation and its secret prefix', async () => {
+    const setup = await createEngine({});
+    const operationId = 'confirmed-local-discard';
+    const secretReference = `${REGISTRY_HASH}:recovery-secret`;
+    const unrelatedReference = `0x${'55'.repeat(32)}:recovery-secret`;
+    await setup.journal.begin(operationId, REGISTRY_HASH);
+    await setup.vault.put(secretReference, 'discard-this-value');
+    await setup.vault.put(unrelatedReference, 'preserve-this-value');
+
+    await expect(
+      setup.engine.discardOperation(operationId, REGISTRY_HASH),
+    ).resolves.toMatchObject({
+      operationId,
+      operationHash: REGISTRY_HASH,
+      status: 'discarded',
+    });
+    expect((await setup.journal.get(operationId))?.stage).toBe(
+      'discarded',
+    );
+    expect(await setup.vault.get(secretReference)).toBeNull();
+    expect(await setup.vault.get(unrelatedReference)).toBe(
+      'preserve-this-value',
+    );
   });
 });

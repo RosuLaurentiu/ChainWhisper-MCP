@@ -1,248 +1,254 @@
-# ChainWhisper MCP Public Beta
+# ChainWhisper MCP public beta release
 
-## Release scope
+This checklist releases the paired planner and signer as
+`@chainwhisper/agent-tools@0.1.0-beta.0`.
 
-This repository publishes the external ChainWhisper agent tools:
+Publishing the npm package does not deploy the ChainWhisper app and does not
+authorize a funded Mainnet transaction.
 
-- `chainwhisper-mcp`, the keyless planner.
-- `chainwhisper-coti-signer`, the local credential-holding signer.
+## Beta boundary
 
-They are distributed together as
-`@chainwhisper/agent-tools@0.1.0-beta.0`. The separate
-[ChainWhisper application](https://github.com/RosuLaurentiu/ChainWhisper)
-contains the in-app Agent area and setup interface. External MCP transactions
-do not pay the app Trade Agent request fee; they pay normal COTI gas and the
-current ChainWhisper contract fee.
+- One keyless planner MCP.
+- One local signer MCP with a persistent signer-owned Agent Control page.
+- One active Agent Wallet and signer process.
+- Manual signing, bounded autonomy up to 30 days, or full audited economic
+  autonomy up to 24 hours.
+- Desktop-local writes for the first beta. Headless environments are read-only
+  unless the signer-owned confirmation/policy surface is available.
+- No arbitrary calldata, transfers, contracts, selectors, administration, or
+  wallet credentials in MCP schemas.
+- Official COTI private messaging is embedded. Do not register its standalone
+  MCP.
+- The local-host beta boundary is explicit: use a dedicated, minimally funded
+  Agent Wallet.
 
-## App and external-agent signing flows
+## Repository settings required before tagging
 
-The app and external MCP use the same allowlisted ChainWhisper contracts, but
-the interaction model is different:
+- [ ] Confirm the repository is the standalone ChainWhisper MCP repository.
+- [ ] Enable private vulnerability reporting.
+- [ ] Enable Dependabot security updates.
+- [ ] Enable CodeQL default or the committed CodeQL workflow.
+- [ ] Require dependency review on pull requests.
+- [ ] Protect `main` and require the complete CI matrix.
+- [ ] Protect `v*` tags against deletion and unauthorized creation.
+- [ ] Require signed or otherwise reviewed release tags according to the
+      organization policy.
+- [ ] Create the protected `npm-beta` environment.
+- [ ] Require an environment reviewer.
+- [ ] Limit deployment branches/tags to protected release tags.
 
-- In the app, a user chooses terms in the ChainWhisper interface and approves
-  the resulting action through the app's wallet or ChainWhisper account flow.
-- With the MCP, the user may choose terms in conversation or authorize an agent
-  to research, draft, and decide them. Public parameters go to the keyless
-  planner; confidential values go directly to the local signer.
-- The signer independently validates the paired plan, current contracts, fees,
-  calldata intent, approvals, and simulation. It then displays the exact order
-  type, assets, amounts, transactions, and maximum network cost for local
-  confirmation.
-- The local-web form is the default signing and confidential-input boundary,
-  not a second trading app. It does not browse markets or silently change the
-  planned terms. An explicitly selected MCP form can confirm non-confidential
-  writes, but MCP form responses never carry private amounts or access secrets.
+The committed workflows do not replace repository branch, tag, environment, or
+vulnerability-reporting settings.
 
-Every on-chain write requires its own local confirmation in this beta. An agent
-may make decisions within the authority a user gives it, but cannot bypass that
-confirmation.
+## npm ownership and authentication
 
-## MCP security boundary
+- [ ] Verify the maintainer can publish the exact
+      `@chainwhisper/agent-tools` package.
+- [ ] Do not use an alternate package name or scope.
+- [ ] For the first publish only, create a short-lived granular npm token
+      restricted to this package and store it as the protected environment
+      secret `NPM_TOKEN`.
+- [ ] Never place an npm token in source, workflow inputs, issues, logs, or a
+      conversation.
+- [ ] After the first publish, configure npm trusted publishing for this exact
+      repository and workflow environment.
+- [ ] Remove `NPM_TOKEN` and revoke the bootstrap token.
 
-- `chainwhisper-mcp` owns protocol reads, order discovery, price references,
-  validation, simulation, and authenticated `ActionEnvelopeV1` plans. It never
-  receives wallet credentials, COTI AES keys, private order values, or access
-  secrets.
-- `chainwhisper-coti-signer` owns locally configured credentials, private
-  inputs, exact approvals, confirmation, signing, broadcast, transaction
-  journaling, recovery, and the encrypted secret vault.
-- Both processes share a locally generated pairing secret. The secret is not a
-  tool argument and is never returned to an agent.
-- The unconfigured signer exposes only `chainwhisper_signer_status`, reports
-  `configuration-required`, and performs no network, pairing, signing,
-  messaging, or persistence work.
-- Preparation reports `ready`, `needs_input`, or `unsupported`. Unsupported
-  routes have no executable envelope.
-- The deployed COTI Mainnet bytecode and committed runtime manifest are
-  authoritative. A live audit can disable a write capability without disabling
-  safe reads.
-- Received `cw.otc/1` messages are untrusted and draft-only. They cannot execute
-  an action.
-- Access secrets from messages are persisted only after verifying the official
-  message id, recipient, sender, allowlisted order, live on-chain maker, and
-  exact on-chain access commitment.
-- Ordinary and private-token failures before a signed transaction hash is
-  persisted are safely retryable. Once a locally prepared hash may have been
-  broadcast, the write remains recoverable or `processing` and the signer
-  reconciles only that exact hash.
-- A definitive onboarding or private-token setup revert may be retried only
-  through a fresh confirmation. An SDK message send with an uncertain outcome
-  is never automatically resent, even when the SDK returned no transaction
-  hash. A state-directory instance lock prevents concurrent signer processes.
-- The signer freezes the network fee before confirmation and applies a 100 gwei
-  per-gas and 12,000,000 gas-unit ceiling to all wallet and SDK writes.
-- Clients without a working local confirmation channel remain read-only.
-  Private-value workflows specifically require the signer-owned local-web
-  channel because MCP form responses are visible to the MCP host.
+The publish job has `id-token: write` for npm provenance and trusted
+publishing.
 
-## Canonical order types
+## Source identity
 
-`chainwhisper_order_types` exposes exactly ten types. The classification is
-selected before creation, included in summaries and plans, independently
-recomputed by the signer, and shown in confirmation.
+- [ ] `package.json` is `0.1.0-beta.0`.
+- [ ] `src/shared/version.ts` is the same version.
+- [ ] `CHANGELOG.md` contains the exact version and date.
+- [ ] The release commit is reviewed and contained in protected `main`.
+- [ ] The exact protected tag is `v0.1.0-beta.0`.
+- [ ] No package with that immutable version already exists on npm.
 
-| Order type | Access | Terms and liquidity |
-| --- | --- | --- |
-| `one-off.standard-public` | Public listing | Public terms and visible amounts |
-| `one-off.unlisted` | Unlisted link | Encrypted exact terms |
-| `one-off.direct` | Fixed recipient | Participant-bound encrypted exact terms |
-| `one-off.private-liquidity.public` | Public listing | Public price terms with hidden private-token liquidity |
-| `one-off.private-liquidity.unlisted` | Unlisted link | Encrypted terms with hidden private-token liquidity |
-| `one-off.private-liquidity.direct` | Fixed recipient | Participant-bound terms with hidden private-token liquidity |
-| `recurring.public` | Public | Reusable buy and sell sides with visible inventory |
-| `recurring.direct` | Fixed recipient | Reusable buy and sell sides with visible inventory |
-| `recurring.private-liquidity.public` | Public | Private-token inventory hidden; public-token inventory visible |
-| `recurring.private-liquidity.direct` | Fixed recipient | Private-token inventory hidden; public-token inventory visible |
+The release workflow rejects a tag/package/source mismatch, a non-beta
+version, a tag outside `main`, and an already published version.
 
-ChainWhisper has no unlisted recurring product. The MCP therefore does not
-expose `recurring.unlisted` or
-`recurring.private-liquidity.unlisted`. Recurring orders use public or
-fixed-recipient access.
+## Local release checks
 
-## Executable beta capabilities
-
-The execution surface is contract-, selector-, and recipe-allowlisted. It
-supports:
-
-- creation and fill for public, unlisted, and fixed-recipient one-off orders;
-- creation and fill for public, unlisted, and fixed-recipient
-  private-liquidity one-off orders;
-- public and fixed-recipient recurring creation, fill, edit, and inventory
-  settlement, including private-token inventory when the live runtime audit
-  enables the route;
-- Direct counterorders against supported Standard, Private, and Direct parents,
-  with live cross-escrow trust checks;
-- supported Standard, private-liquidity, Direct, and recurring edit recipes,
-  including exact approvals and signer-local confidential replacement terms;
-- allowlisted pause, resume, refresh, extend, cancel, decline, close,
-  reclaim-expired, and recurring inventory updates as applicable to the order;
-- exact Privacy Portal shielding and unshielding for the COTI, WETH, WBTC,
-  USDT, USDC.e, wADA, gCOTI, and WISP public/private pairs;
-- official COTI privacy onboarding and verified private-token account setup,
-  each with its own exact confirmation;
-- structured private order negotiation plus an allowlisted read/list/send
-  subset of the official COTI private-messaging SDK.
-
-The signer collects confidential amounts and access values locally. Private
-token assets are supported for both visible-amount and private-liquidity
-workflows when the wallet, token, escrow, balance, and encrypted approval checks
-all pass.
-
-Privacy Portal preparation pins the exact pair, direction, bridge, deployed
-bytecode, live state, limits, fee quote, and allowlisted selector. The bridge
-ABI necessarily exposes the conversion amount in public calldata, including
-when the input token is private.
-
-Administrative calls, arbitrary calldata, arbitrary contract or token
-addresses, standalone wallet transfers, and legacy p.WISP recovery remain
-outside the MCP execution surface.
-
-## Integrated private messaging
-
-Private negotiation is already part of `chainwhisper-coti-signer` through the
-official COTI private-messaging SDK. Do not register the SDK's standalone
-messaging MCP, and do not install a separate ChainWhisper skill.
-
-Structured `cw.otc/1` proposal, counter, acceptance, decline, status, and access
-messages may create or update a draft, but cannot call
-`chainwhisper_execute_action`. Access secrets stay in the encrypted signer
-vault and are shared only by local reference through encrypted messaging.
-
-## Readiness and verification gates
-
-- Disconnected in-app Agent guidance opens the existing account connection
-  flow.
-- Composer availability is derived from shared readiness state.
-- Focused Agent tests cover `prompt-needed`, `account-needed`, `ready`,
-  `loading`, `retryable`, and `error`.
-- Browser coverage includes Agent, wallet, create-order, recurring-order,
-  terminal, Privacy Portal, and mobile flows.
-- Agent Setup remains free and has no wallet, payment, signature, or WISP side
-  effects.
-- Package CI runs on Ubuntu with Node.js 20, 22, and 24, and on Windows with
-  Node.js 22.
-- The package gate builds and tests the MCP, checks the stdio surfaces, creates
-  the npm tarball, installs it into an external clean consumer, and starts both
-  npm-created command shims.
-- Automated release verification does not perform live signing, transaction
-  broadcast, privacy onboarding, private-token setup, or private-message writes.
-  Those checks require explicit authorization and an intentionally funded
-  wallet.
-
-## Verification commands
+Run from a clean checkout with Node.js 24:
 
 ```sh
+npm ci
+npm audit signatures
 npm run lint
 npm run build
-npm run test
+npm test
 npm run smoke
+npm run audit:dependencies
 npm run verify:tarball
+```
+
+Run the read-only COTI Mainnet checks:
+
+```sh
 npm run smoke:live
 npm run audit:runtime
 ```
 
-The live status and runtime-audit commands are read-only. Do not run funded
-signing or messaging diagnostics as part of an ordinary release check.
+Confirm:
 
-## Verification record
+- [ ] No test, smoke, or audit signed or broadcast a transaction.
+- [ ] The unconfigured signer started in `wallet-setup-required`.
+- [ ] `chainwhisper_open_control_panel` returned no URL or token.
+- [ ] The exact tarball installed and both npm-created shims started in a clean
+      consumer.
+- [ ] The production dependency audit reports no advisory.
+- [ ] Every ChainWhisper, onboarding, private-token, Privacy Portal, and
+      messaging bytecode attestation passed.
 
-Standalone extraction verified locally on July 29, 2026:
+## CI matrix
 
-- Lint and the strict TypeScript build passed.
-- The 24-file suite passed: 209 tests passed and three POSIX permission checks
-  remained intentionally skipped on Windows.
-- The previously timing-sensitive private-messaging suite passed three
-  additional focused runs without resource contention.
-- The standalone production dependency audit reported zero vulnerabilities.
-- The built stdio smoke passed without credentials, writes, signing, or private
-  messages.
-- The exact npm tarball was inspected, production-audited, installed outside
-  the repository, and started through both npm-created command shims.
-- The read-only COTI Mainnet audit passed at block `0x8224e2`: every committed
-  contract bytecode hash and selector set matched, and recurring writes remained
-  enabled.
-- The completed security review covered all 83 files in the MCP package
-  snapshot. Its release-blocking transaction recovery, fee binding, signer
-  concurrency, private-value boundary, artifact verification, and message
-  provenance findings were remediated in this hardening change.
+All nine jobs must pass:
 
-The final standalone GitHub CI matrix must attest the release commit before
-publication.
+| OS | Node 22 | Node 24 | Node 26 |
+| --- | --- | --- | --- |
+| Ubuntu | required | required | required |
+| Windows | required | required | required |
+| macOS | required | required | required |
 
-## Publishing prerequisites
+CI must run lint, strict TypeScript, tests, package smoke, and the appropriate
+artifact checks. No skipped platform job may be treated as release evidence.
 
-The manual `Publish ChainWhisper Agent Tools` GitHub Actions workflow is the
-documented release path.
+## Agent Control acceptance
 
-Before dispatch:
+- [ ] Existing-wallet import writes only the selected signer `.env`.
+- [ ] Generated wallet uses a cryptographic random source and displays the raw
+      key once for backup.
+- [ ] Address, COTI balance, copy actions, and funding instructions are clear.
+- [ ] Process environment overrides `.env`; `.env` overrides legacy JSON.
+- [ ] Default and custom `.env` paths reload correctly.
+- [ ] Unsafe paths, symlinks, junctions, file types, and POSIX permissions fail
+      closed.
+- [ ] Replacing a wallet requires local action, no pending operation, and no
+      active or paused policy.
+- [ ] Replacement makes the current signer read-only until restart.
+- [ ] Pairing and internal storage keys are generated automatically.
+- [ ] No user-facing setup asks for privacy key material or a storage
+      passphrase.
+- [ ] Privacy onboarding starts from Agent Control and stores recovered
+      material internally.
+- [ ] Private state, policies, recovery, and access secrets are wallet
+      namespaced.
+- [ ] One active browser session is enforced and opening another invalidates
+      the first.
+- [ ] Bootstrap, cookie, CSRF, Host/Origin, replay, CSP, frame, no-store, body
+      limit, and rate-limit tests pass.
+- [ ] There are no remote assets, analytics, telemetry, or app configuration.
+- [ ] Keyboard, screen-reader labels, focus states, reduced motion, and mobile
+      width are checked.
 
-1. Confirm package ownership and publish access for the `@chainwhisper` npm
-   scope.
-2. Create a protected GitHub Actions environment named `npm-beta`.
-3. Configure an npm automation or granular access token as the environment
-   secret `NPM_TOKEN`. Never put the token in the repository, a workflow input,
-   an issue, or a conversation.
-4. Require an environment reviewer if the repository plan supports it.
-5. Confirm CI is green for the exact release commit.
-6. Dispatch the workflow with the exact beta version in the package manifest,
-   currently `0.1.0-beta.0`.
+## Signing acceptance
 
-The workflow rejects a mismatched, non-beta, or previously published immutable
-version. It runs release verification, builds one tarball, installs and
-shim-tests that exact archive, records its SHA-256 checksum and CycloneDX SBOM,
-uploads them as retained evidence, and publishes the same tarball with the
-`beta` dist-tag and npm provenance.
+- [ ] A multi-step approval/reset/protocol operation produces exactly one
+      confirmation.
+- [ ] The order/action type is the primary heading.
+- [ ] Send/receive amounts, privacy, price, recurring inventory, recipient,
+      expiry, protocol fee, and maximum network cost are understandable.
+- [ ] Technical details contain every exact contract, selector, calldata
+      digest, gas ceiling, step digest, and operation hash.
+- [ ] The button names the complete action and the only alternative is
+      **Decline**.
+- [ ] Every step is re-attested, revalidated, and re-simulated after approval.
+- [ ] Changed calldata or an exceeded fee ceiling requires new authorization.
+- [ ] Private values are collected on the signer-owned page and never returned
+      to the agent.
+- [ ] `chainwhisper_discard_operation` requires the exact operation hash and
+      local confirmation.
 
-## Remaining public-beta gates
+## Autonomy acceptance
 
-- Require every package matrix job to pass on GitHub.
-- Review the uploaded tarball, checksum, and SBOM evidence before approving the
-  protected `npm-beta` environment.
-- Publish the pinned version only after the COTI Mainnet read-only runtime audit
-  passes for the release commit.
-- Install the published exact version in a clean environment and rerun
-  `chainwhisper_status` and `chainwhisper_signer_status` before authorizing any
-  funded beta test.
+- [ ] Bounded policy validation covers actions, assets, pairs, order types,
+      counterparties, bridge routes, messaging, private-amount disclosure,
+      price bands, amounts, fee limits, counts, and duration.
+- [ ] Full autonomy requires the dedicated-wallet warning and two explicit
+      acknowledgements.
+- [ ] Full policies expire in at most 24 hours; bounded policies in at most 30
+      days.
+- [ ] Policy activation is wallet/chain/manifest bound.
+- [ ] A local edit can narrow and never broaden a proposal.
+- [ ] `policyId` is optional for action and message writes.
+- [ ] A mismatch returns a structured denial without a fallback prompt.
+- [ ] Agent-provided private amounts require
+      `agentVisiblePrivateAmounts=true`.
+- [ ] Budgets reserve atomically before signing.
+- [ ] Concurrent reservations cannot overspend.
+- [ ] A pre-sign failure releases; signed, pending, or uncertain writes remain
+      consumed.
+- [ ] Exact step digests, operation hash, fee ceilings, and policy terms are
+      bound to the reservation.
+- [ ] Pause is immediate.
+- [ ] Resume and revocation require local action.
+- [ ] Discard, onboarding, token setup, wallet replacement, policy changes, and
+      secret deletion cannot execute autonomously.
 
-No ChainWhisper app deployment, transaction broadcast, or private-message write
-is implied by preparing the npm beta.
+## Protocol acceptance
+
+Use deterministic tests for:
+
+- [ ] all ten canonical public/private/recurring create routes;
+- [ ] fill, counter, edit, lifecycle, cancel, and recurring inventory routes;
+- [ ] public and private amount modes;
+- [ ] both Privacy Portal directions for every allowlisted pair;
+- [ ] private-token readiness and exact encrypted approval;
+- [ ] structured private messaging and untrusted received messages;
+- [ ] restart recovery, uncertain broadcast recovery, pause, and revoke.
+
+There is no unlisted recurring product. Do not add one in the MCP catalog.
+Privacy Portal amounts are public calldata under the deployed bridge ABI.
+
+## Disposable Mainnet canary
+
+This is a separately authorized release gate. It is never part of ordinary CI.
+
+- [ ] Use a new disposable Agent Wallet with the smallest useful amounts.
+- [ ] Record the exact release tarball checksum.
+- [ ] Fund only the required COTI and test assets.
+- [ ] Import or generate the wallet through Agent Control.
+- [ ] Complete privacy onboarding.
+- [ ] Enable the required private-token accounts.
+- [ ] Complete smallest-value public, private, and recurring order lifecycles.
+- [ ] Complete one smallest-value Privacy Portal action in each direction.
+- [ ] Send and read one structured encrypted message.
+- [ ] Restart and recover exact pending state.
+- [ ] Exercise pause and revoke.
+- [ ] Remove remaining funds after the canary.
+- [ ] Record only public transaction links and secret-safe diagnostics.
+
+## Immutable evidence and publish
+
+Push the exact protected tag. The workflow:
+
+1. checks out that tag with no publish credential;
+2. verifies tag, package, and source version identity;
+3. installs with `npm ci`;
+4. verifies dependency signatures;
+5. runs lint, build, tests, smoke, and production audit;
+6. builds and clean-installs one exact tarball;
+7. writes `runtime-audit.json`, `SHA256SUMS`, production-only
+   `sbom.cdx.json`, and `RELEASE_NOTES.md`;
+8. uploads the immutable evidence artifact;
+9. waits at protected `npm-beta`;
+10. downloads and re-verifies the same evidence;
+11. publishes the already-built tarball with the `beta` tag and provenance;
+12. verifies the registry version; and
+13. creates a GitHub prerelease with the tarball, checksum, SBOM, runtime
+    audit, and release notes.
+
+Do not rebuild inside the publish job.
+
+## Post-publish
+
+- [ ] Install the exact published version into a clean machine.
+- [ ] Register both stdio commands.
+- [ ] Restart the MCP connections.
+- [ ] Run only `chainwhisper_status` and `chainwhisper_signer_status`.
+- [ ] Compare the installed tarball checksum with the GitHub prerelease.
+- [ ] Confirm npm provenance and the `beta` dist-tag.
+- [ ] Configure trusted publishing and revoke the first-publish token.
+- [ ] Publish the release notes and beta security boundary.

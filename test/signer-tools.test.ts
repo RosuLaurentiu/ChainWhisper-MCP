@@ -33,6 +33,33 @@ const executeTool = (
 };
 
 describe('signer execute tool envelope handoff', () => {
+  it('publishes the complete Agent Control and autonomy surface without credential fields', () => {
+    const tools = createSignerTools({
+      messaging: { listTools: () => [] },
+    } as unknown as ChainWhisperSignerService);
+    const names = new Set(tools.map(({ name }) => name));
+    for (const name of [
+      'chainwhisper_open_control_panel',
+      'chainwhisper_autonomy_status',
+      'chainwhisper_request_autonomy',
+      'chainwhisper_pause_autonomy',
+      'chainwhisper_resume_autonomy',
+      'chainwhisper_revoke_autonomy',
+    ]) {
+      expect(names.has(name)).toBe(true);
+    }
+    const schemas = JSON.stringify(
+      tools.map(({ name, inputSchema }) => ({ name, inputSchema })),
+    );
+    expect(schemas).not.toMatch(
+      /"privateKey"\s*:|"aesKey"\s*:|"mnemonic"\s*:|"passphrase"\s*:|"accessSecret"\s*:/iu,
+    );
+    const execute = tools.find(
+      ({ name }) => name === 'chainwhisper_execute_action',
+    );
+    expect(JSON.stringify(execute?.inputSchema)).toContain('policyId');
+  });
+
   it('exposes a read-only confirmation-form diagnostic', async () => {
     const tools = createSignerTools({
       testConfirmationForm: async () => ({

@@ -26,6 +26,12 @@ const decimalSchema = {
   pattern: '^(?:0|[1-9][0-9]*)(?:\\.[0-9]+)?$',
   description: 'A base-10 decimal string. JSON numbers are not accepted.'
 };
+const privateAmountModeSchema = {
+  enum: ['signer-input', 'agent-provided'],
+  default: 'signer-input',
+  description:
+    'In signer-input mode, the signer collects those locally inside Agent Control. agent-provided binds agent-visible amounts into the envelope and can execute only under a matching local autonomy policy.'
+};
 const assetSchema = {
   anyOf: [
     { type: 'string', minLength: 1 },
@@ -323,7 +329,7 @@ export const createChainWhisperDomainTools = (
   {
       name: 'chainwhisper_prepare_create_trade',
       description:
-        'Validate and prepare an audited ChainWhisper one-off OTC order. Select an explicit orderType so public, unlisted, direct-recipient, and private-liquidity routes cannot be confused. Hidden amounts stay in the local signer. This tool never signs or submits.',
+        'Validate and prepare an audited ChainWhisper one-off OTC order. Select an explicit orderType so public, unlisted, direct-recipient, and private-liquidity routes cannot be confused. Confidential amounts default to local signer input; agent-provided mode requires a matching local autonomy policy. This tool never signs or submits.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -337,15 +343,16 @@ export const createChainWhisperDomainTools = (
         },
         offerAsset: assetSchema,
         requestAsset: assetSchema,
+        privateAmountMode: privateAmountModeSchema,
         offerAmount: {
           ...decimalSchema,
           description:
-            'Include only for a public amount. Omit for every private-liquidity orderType and when an unlisted or Direct order offers a private token; the signer collects confidential amounts locally.'
+            'Include public amounts. For confidential terms, omit in signer-input mode or include the exact amount in agent-provided mode.'
         },
         requestAmount: {
           ...decimalSchema,
           description:
-            'Include only for a public amount. Omit for every private-liquidity orderType and when an unlisted or Direct order requests a private token; the signer collects confidential amounts locally.'
+            'Include public amounts. For confidential terms, omit in signer-input mode or include the exact amount in agent-provided mode.'
         },
         recipient: addressSchema,
         expiresAt: { anyOf: [{ type: 'string', format: 'date-time' }, { type: 'null' }] },
@@ -367,7 +374,7 @@ export const createChainWhisperDomainTools = (
   {
       name: 'chainwhisper_prepare_create_recurring',
       description:
-        'Validate and prepare a public or fixed-recipient recurring ChainWhisper order with an explicit orderType. Visible and private-token inventory routes are supported. Prices use quote per base.',
+        'Validate and prepare a public or fixed-recipient recurring ChainWhisper order with an explicit orderType. Visible and private-token inventory routes are supported. Confidential inventory defaults to local signer input; agent-provided mode requires a matching local autonomy policy. Prices use quote per base.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -383,15 +390,16 @@ export const createChainWhisperDomainTools = (
         quoteAsset: assetSchema,
         buyPrice: decimalSchema,
         sellPrice: decimalSchema,
+        privateAmountMode: privateAmountModeSchema,
         buyQuoteLiquidity: {
           ...decimalSchema,
           description:
-            'Include when the quote-token inventory side is public. Omit when quoteAsset is private for a private-liquidity orderType; the signer collects that side locally.'
+            'Include public inventory. For private inventory, omit in signer-input mode or include it in agent-provided mode.'
         },
         sellBaseLiquidity: {
           ...decimalSchema,
           description:
-            'Include when the base-token inventory side is public. Omit when baseAsset is private for a private-liquidity orderType; the signer collects that side locally.'
+            'Include public inventory. For private inventory, omit in signer-input mode or include it in agent-provided mode.'
         },
         recipient: addressSchema
       }
@@ -401,7 +409,7 @@ export const createChainWhisperDomainTools = (
   {
     name: 'chainwhisper_prepare_fill',
     description:
-      'Prepare a fill for an existing trusted ChainWhisper order. Public visible amounts remain planner input. Only confidential hidden-liquidity or Direct private-token inputs are collected inside the signer.',
+      'Prepare a fill for an existing trusted ChainWhisper order. Confidential amounts default to Agent Control; agent-provided mode binds them into the envelope for a matching local autonomy policy.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -409,15 +417,16 @@ export const createChainWhisperDomainTools = (
       properties: {
         wallet: addressSchema,
         order: orderSchema,
+        privateAmountMode: privateAmountModeSchema,
         inputAmount: {
           ...decimalSchema,
           description:
-            'Planner input for publicly visible payment amounts, including private-token amounts on public Standard and explicitly labeled legacy Standard orders. Omit only for hidden-liquidity/private-inventory or Direct encrypted private-token payments; the signer collects those locally.'
+            'Include visible payments, including private-token amounts on public Standard and explicitly labeled legacy Standard orders. For an encrypted private-token payment, omit in signer-input mode or include it in agent-provided mode.'
         },
         minOutputAmount: {
           ...decimalSchema,
           description:
-            'Visible orders only. Confidential output limits stay inside the local signer.'
+            'Visible output limits only. Omit when the output asset is private because the deployed fill field is public calldata.'
         },
         recurringSide: {
           enum: ['buy', 'sell'],
@@ -431,7 +440,7 @@ export const createChainWhisperDomainTools = (
   {
     name: 'chainwhisper_prepare_counter',
     description:
-      'Prepare a canonical Direct counterorder against a trusted one-off order. Counter terms are recipient-bound to the original maker; confidential token amounts stay in the local signer. Existing recipient-bound Standard orders use an explicitly labeled legacy compatibility route and cannot be confused with newly created Direct orders.',
+      'Prepare a canonical Direct counterorder against a trusted one-off order. Counter terms are recipient-bound to the original maker. Confidential amounts default to Agent Control; agent-provided mode requires a matching local autonomy policy.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -439,15 +448,16 @@ export const createChainWhisperDomainTools = (
       properties: {
         wallet: addressSchema,
         order: orderSchema,
+        privateAmountMode: privateAmountModeSchema,
         offerAmount: {
           ...decimalSchema,
           description:
-            'Include for public assets and for visibly bound private-token amounts when superseding an explicitly labeled legacy Standard counter. Omit for confidential Direct counter amounts; the signer collects those locally.'
+            'Include public terms and visibly bound private-token amounts when superseding an explicitly labeled legacy Standard counter. For confidential Direct terms, omit in signer-input mode or include in agent-provided mode.'
         },
         requestAmount: {
           ...decimalSchema,
           description:
-            'Include for public assets and for visibly bound private-token amounts when superseding an explicitly labeled legacy Standard counter. Omit for confidential Direct counter amounts; the signer collects those locally.'
+            'Include public terms and visibly bound private-token amounts when superseding an explicitly labeled legacy Standard counter. For confidential Direct terms, omit in signer-input mode or include in agent-provided mode.'
         },
         expiresAt: { anyOf: [{ type: 'string', format: 'date-time' }, { type: 'null' }] }
       }
@@ -465,6 +475,7 @@ export const createChainWhisperDomainTools = (
       properties: {
         wallet: addressSchema,
         order: orderSchema,
+        privateAmountMode: privateAmountModeSchema,
         changes: {
           type: 'object',
           additionalProperties: false,

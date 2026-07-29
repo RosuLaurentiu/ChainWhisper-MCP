@@ -31,6 +31,7 @@ export interface ChainWhisperRuntimeManifestV1 {
   };
   registry: RuntimeContractManifestEntry;
   contracts: Record<string, RuntimeContractManifestEntry>;
+  attestations: Record<string, RuntimeContractManifestEntry>;
   tokens: Array<{
     symbol: string;
     kind: 'native' | 'erc20' | 'private-erc20';
@@ -118,6 +119,20 @@ export const loadRuntimeManifest = async (): Promise<ChainWhisperRuntimeManifest
   const contracts = Object.fromEntries(
     Object.entries(rawContracts).map(([name, entry]) => [name, validateEntry(name, entry)])
   );
+  const rawAttestations = parsed.attestations;
+  if (
+    !rawAttestations ||
+    typeof rawAttestations !== 'object' ||
+    Array.isArray(rawAttestations)
+  ) {
+    throw new Error('Runtime manifest contract attestations are missing.');
+  }
+  const attestations = Object.fromEntries(
+    Object.entries(rawAttestations).map(([name, entry]) => [
+      name,
+      validateEntry(`attestation.${name}`, entry)
+    ])
+  );
   const rawTokens = parsed.tokens;
   if (!Array.isArray(rawTokens) || rawTokens.length === 0) {
     throw new Error('Runtime manifest verified tokens are missing.');
@@ -139,10 +154,37 @@ export const loadRuntimeManifest = async (): Promise<ChainWhisperRuntimeManifest
     }
     return rawToken as ChainWhisperRuntimeManifestV1['tokens'][number];
   });
+  for (const required of [
+    'cotiAccountOnboarding',
+    'cotiPrivateMessaging',
+  ]) {
+    if (!attestations[required]) {
+      throw new Error(
+        `Runtime manifest is missing the ${required} write-target attestation.`,
+      );
+    }
+  }
+  const attestedAddresses = new Set(
+    Object.values(attestations).map(({ address }) =>
+      address.toLowerCase(),
+    ),
+  );
+  for (const token of tokens) {
+    if (
+      token.kind === 'private-erc20' &&
+      token.address &&
+      !attestedAddresses.has(token.address.toLowerCase())
+    ) {
+      throw new Error(
+        `Private token ${token.symbol} is not covered by a runtime bytecode attestation.`,
+      );
+    }
+  }
   return {
     ...(parsed as unknown as ChainWhisperRuntimeManifestV1),
     registry,
     contracts,
+    attestations,
     tokens
   };
 };
@@ -169,7 +211,14 @@ export const auditRuntimeManifest = async (
   }
   const entries: Array<[string, RuntimeContractManifestEntry]> = [
     ['registry', manifest.registry],
-    ...Object.entries(manifest.contracts)
+    ...Object.entries(manifest.contracts),
+    ...Object.entries(manifest.attestations).map(
+      ([name, entry]) =>
+        [`attestation.${name}`, entry] as [
+          string,
+          RuntimeContractManifestEntry
+        ]
+    )
   ];
   const contracts = await Promise.all(
     entries.map(async ([name, entry]): Promise<RuntimeAuditContractResult> => {

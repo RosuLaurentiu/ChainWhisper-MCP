@@ -10,6 +10,7 @@ import {
   type SendOrderMessageInput,
 } from './messaging.js';
 import { ChainWhisperSignerService } from './service.js';
+import type { AutonomyPolicyProposalV1 } from './autonomy.js';
 import type {
   Address,
   OtcNegotiationKind,
@@ -103,6 +104,222 @@ const operationSchema = {
   additionalProperties: false,
 };
 
+const exactOperationSchema = {
+  ...operationSchema,
+  required: ['operationId', 'operationHash'],
+};
+
+const autonomyAssetAmountSchema = {
+  type: 'object',
+  properties: {
+    asset: { type: 'string', minLength: 1 },
+    amount: { type: 'string', pattern: '^(?:0|[1-9][0-9]*)$' },
+  },
+  required: ['asset', 'amount'],
+  additionalProperties: false,
+};
+
+const autonomyPairSchema = {
+  type: 'object',
+  properties: {
+    sellAsset: { type: 'string', minLength: 1 },
+    buyAsset: { type: 'string', minLength: 1 },
+  },
+  required: ['sellAsset', 'buyAsset'],
+  additionalProperties: false,
+};
+
+const autonomyCommonProperties = {
+  version: { type: 'string', const: 'cw.autonomy-policy/1' },
+  wallet: { type: 'string', pattern: '^0x[0-9a-fA-F]{40}$' },
+  chainId: { type: 'integer', const: 2_632_500 },
+  manifestHash: { type: 'string', pattern: '^0x[0-9a-fA-F]{64}$' },
+  startsAt: { type: 'string', format: 'date-time' },
+  expiresAt: { type: 'string', format: 'date-time' },
+  agentVisiblePrivateAmounts: { type: 'boolean' },
+};
+
+const autonomyProposalSchema = {
+  oneOf: [
+    {
+      type: 'object',
+      properties: {
+        ...autonomyCommonProperties,
+        mode: { type: 'string', const: 'bounded' },
+        scope: {
+          type: 'object',
+          properties: {
+            allowedActions: {
+              type: 'array',
+              items: {
+                type: 'string',
+                enum: [
+                  'create_trade',
+                  'create_recurring',
+                  'fill',
+                  'counter',
+                  'edit',
+                  'order_update',
+                  'privacy_bridge',
+                  'send_order_message',
+                ],
+              },
+            },
+            allowedAssets: { type: 'array', items: { type: 'string' } },
+            allowedPairs: { type: 'array', items: autonomyPairSchema },
+            allowedOrderTypes: {
+              type: 'array',
+              items: { type: 'string' },
+            },
+            allowedCounterparties: {
+              type: 'array',
+              items: { type: 'string', pattern: '^0x[0-9a-fA-F]{40}$' },
+            },
+            allowedBridgeRoutes: {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: {
+                  pair: { type: 'string' },
+                  direction: {
+                    type: 'string',
+                    enum: ['public-to-private', 'private-to-public'],
+                  },
+                },
+                required: ['pair', 'direction'],
+                additionalProperties: false,
+              },
+            },
+            messaging: {
+              type: 'object',
+              properties: {
+                enabled: { type: 'boolean' },
+                counterparties: {
+                  type: 'array',
+                  items: {
+                    type: 'string',
+                    pattern: '^0x[0-9a-fA-F]{40}$',
+                  },
+                },
+              },
+              required: ['enabled', 'counterparties'],
+              additionalProperties: false,
+            },
+          },
+          required: [
+            'allowedActions',
+            'allowedAssets',
+            'allowedPairs',
+            'allowedOrderTypes',
+            'allowedCounterparties',
+            'allowedBridgeRoutes',
+            'messaging',
+          ],
+          additionalProperties: false,
+        },
+        limits: {
+          type: 'object',
+          properties: {
+            perActionSpend: {
+              type: 'array',
+              items: autonomyAssetAmountSchema,
+            },
+            cumulativeSpend: {
+              type: 'array',
+              items: autonomyAssetAmountSchema,
+            },
+            maximumNativeValuePerAction: {
+              type: 'string',
+              pattern: '^(?:0|[1-9][0-9]*)$',
+            },
+            maximumNativeValueCumulative: {
+              type: 'string',
+              pattern: '^(?:0|[1-9][0-9]*)$',
+            },
+            maximumNetworkFeePerAction: {
+              type: 'string',
+              pattern: '^(?:0|[1-9][0-9]*)$',
+            },
+            maximumNetworkFeeCumulative: {
+              type: 'string',
+              pattern: '^(?:0|[1-9][0-9]*)$',
+            },
+            maximumActions: { type: 'integer', minimum: 1 },
+            maximumMessages: { type: 'integer', minimum: 0 },
+            priceBands: {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: {
+                  ...autonomyPairSchema.properties,
+                  minimumBuyPerSellNumerator: {
+                    type: 'string',
+                    pattern: '^(?:0|[1-9][0-9]*)$',
+                  },
+                  minimumBuyPerSellDenominator: {
+                    type: 'string',
+                    pattern: '^[1-9][0-9]*$',
+                  },
+                  maximumBuyPerSellNumerator: {
+                    type: 'string',
+                    pattern: '^(?:0|[1-9][0-9]*)$',
+                  },
+                  maximumBuyPerSellDenominator: {
+                    type: 'string',
+                    pattern: '^[1-9][0-9]*$',
+                  },
+                },
+                required: [
+                  'sellAsset',
+                  'buyAsset',
+                  'minimumBuyPerSellNumerator',
+                  'minimumBuyPerSellDenominator',
+                  'maximumBuyPerSellNumerator',
+                  'maximumBuyPerSellDenominator',
+                ],
+                additionalProperties: false,
+              },
+            },
+          },
+          required: [
+            'perActionSpend',
+            'cumulativeSpend',
+            'maximumNativeValuePerAction',
+            'maximumNativeValueCumulative',
+            'maximumNetworkFeePerAction',
+            'maximumNetworkFeeCumulative',
+            'maximumActions',
+            'maximumMessages',
+            'priceBands',
+          ],
+          additionalProperties: false,
+        },
+      },
+      required: [
+        ...Object.keys(autonomyCommonProperties),
+        'mode',
+        'scope',
+        'limits',
+      ],
+      additionalProperties: false,
+    },
+    {
+      type: 'object',
+      properties: {
+        ...autonomyCommonProperties,
+        mode: { type: 'string', const: 'full' },
+        allowlistedEconomicSurface: { type: 'boolean', const: true },
+      },
+      required: [
+        ...Object.keys(autonomyCommonProperties),
+        'mode',
+        'allowlistedEconomicSurface',
+      ],
+      additionalProperties: false,
+    },
+  ],
+};
+
 export const createSignerTools = (
   service: ChainWhisperSignerService,
 ): JsonMcpTool[] => {
@@ -118,6 +335,109 @@ export const createSignerTools = (
       },
       annotations: { readOnlyHint: true },
       execute: () => service.getStatus(),
+    },
+    {
+      name: 'chainwhisper_open_control_panel',
+      description:
+        'Open the signer-owned local ChainWhisper Agent Control page. The agent never receives its URL, bootstrap token, session, wallet key, or other local secrets.',
+      inputSchema: {
+        type: 'object',
+        properties: {},
+        additionalProperties: false,
+      },
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+      execute: () => service.openControlPanel(),
+    },
+    {
+      name: 'chainwhisper_autonomy_status',
+      description:
+        'Read active local autonomy modes, lifecycle state, and remaining budgets without returning private amounts or signer secrets.',
+      inputSchema: {
+        type: 'object',
+        properties: {},
+        additionalProperties: false,
+      },
+      annotations: { readOnlyHint: true },
+      execute: () => service.autonomyStatus(),
+    },
+    {
+      name: 'chainwhisper_request_autonomy',
+      description:
+        'Request a bounded policy of up to 30 days or full audited economic autonomy of up to 24 hours. Activation always requires review in local Agent Control; a local edit may narrow but never broaden the request.',
+      inputSchema: {
+        type: 'object',
+        properties: { proposal: autonomyProposalSchema },
+        required: ['proposal'],
+        additionalProperties: false,
+      },
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: true,
+        idempotentHint: false,
+      },
+      execute: (raw) =>
+        service.requestAutonomy(
+          asRecord(asRecord(raw).proposal) as unknown as AutonomyPolicyProposalV1,
+        ),
+    },
+    {
+      name: 'chainwhisper_pause_autonomy',
+      description:
+        'Immediately pause every local autonomy policy. Pause is fail-closed and does not require signing or a confirmation prompt.',
+      inputSchema: {
+        type: 'object',
+        properties: {},
+        additionalProperties: false,
+      },
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: true,
+      },
+      execute: () => service.pauseAutonomy(),
+    },
+    {
+      name: 'chainwhisper_resume_autonomy',
+      description:
+        'Request local user approval to resume unchanged paused policies. The MCP call never resumes autonomy silently.',
+      inputSchema: {
+        type: 'object',
+        properties: {},
+        additionalProperties: false,
+      },
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: true,
+        idempotentHint: true,
+      },
+      execute: () => service.resumeAutonomy(),
+    },
+    {
+      name: 'chainwhisper_revoke_autonomy',
+      description:
+        'Request local user approval to permanently revoke one autonomy policy.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          policyId: { type: 'string', minLength: 1, maxLength: 128 },
+        },
+        required: ['policyId'],
+        additionalProperties: false,
+      },
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: true,
+        idempotentHint: true,
+      },
+      execute: (raw) =>
+        service.revokeAutonomy(
+          requiredString(asRecord(raw), 'policyId'),
+        ),
     },
     {
       name: 'chainwhisper_test_confirmation_form',
@@ -139,7 +459,7 @@ export const createSignerTools = (
     {
       name: 'chainwhisper_onboard_privacy',
       description:
-        "Onboard or recover the configured wallet's official COTI privacy AES key. If an on-chain write is required, the signer shows an exact confirmation form first. Secrets remain in the encrypted local signer vault.",
+        "Onboard or recover the configured Agent Wallet's official COTI privacy key. If an on-chain write is required, Agent Control shows the exact action first. Key material remains in encrypted signer-owned storage.",
       inputSchema: {
         type: 'object',
         properties: {},
@@ -214,6 +534,13 @@ export const createSignerTools = (
             description:
               'Signed ActionEnvelopeV1 returned by chainwhisper-mcp.',
           },
+          policyId: {
+            type: 'string',
+            minLength: 1,
+            maxLength: 128,
+            description:
+              'Optional active local autonomy policy. A mismatch returns a structured denial and never opens a fallback confirmation.',
+          },
         },
         required: ['envelope'],
         additionalProperties: false,
@@ -231,7 +558,14 @@ export const createSignerTools = (
             'A signed ActionEnvelopeV1 is required.',
           );
         }
-        return service.executeAction(signedEnvelopeInput(envelope));
+        const policyId =
+          typeof asRecord(raw).policyId === 'string'
+            ? asRecord(raw).policyId as string
+            : undefined;
+        return service.executeAction(
+          signedEnvelopeInput(envelope),
+          policyId,
+        );
       },
     },
     {
@@ -262,8 +596,8 @@ export const createSignerTools = (
     {
       name: 'chainwhisper_discard_operation',
       description:
-        'Discard an operation only when no transaction is pending, and remove its locally vaulted secrets.',
-      inputSchema: operationSchema,
+        'After an exact local confirmation, discard an operation only when no transaction is pending and remove its signer-local secrets. The exact operation hash is mandatory and autonomy policies cannot approve this action.',
+      inputSchema: exactOperationSchema,
       annotations: {
         readOnlyHint: false,
         destructiveHint: true,
@@ -273,7 +607,7 @@ export const createSignerTools = (
         const input = operationInput(asRecord(raw));
         return service.discardOperation(
           input.operationId,
-          input.operationHash,
+          requiredString(asRecord(raw), 'operationHash'),
         );
       },
     },
@@ -334,6 +668,11 @@ export const createSignerTools = (
             description:
               'Canonical signer-local generated access-secret reference. This is an identifier, never secret material.',
           },
+          policyId: {
+            type: 'string',
+            minLength: 1,
+            maxLength: 128,
+          },
         },
         required: ['to', 'kind', 'messageId'],
         additionalProperties: false,
@@ -370,6 +709,9 @@ export const createSignerTools = (
             : {}),
           ...(typeof input.accessSecretId === 'string'
             ? { accessSecretId: input.accessSecretId }
+            : {}),
+          ...(typeof input.policyId === 'string'
+            ? { policyId: input.policyId }
             : {}),
         } satisfies SendOrderMessageInput);
       },
@@ -439,10 +781,28 @@ export const createSignerTools = (
       name: tool.name,
       description: tool.description ?? 'Official COTI private messaging tool.',
       inputSchema:
-        (tool.inputSchema as Record<string, unknown> | undefined) ?? {
-          type: 'object',
-          properties: {},
-        },
+        tool.name.startsWith('send_')
+          ? {
+              type: 'object',
+              properties: {
+                to: {
+                  type: 'string',
+                  pattern: '^0x[0-9a-fA-F]{40}$',
+                },
+                plaintext: { type: 'string', minLength: 1 },
+                policyId: {
+                  type: 'string',
+                  minLength: 1,
+                  maxLength: 128,
+                },
+              },
+              required: ['to', 'plaintext'],
+              additionalProperties: false,
+            }
+          : (tool.inputSchema as Record<string, unknown> | undefined) ?? {
+              type: 'object',
+              properties: {},
+            },
       annotations: {
         readOnlyHint: !tool.name.startsWith('send_'),
         destructiveHint: false,

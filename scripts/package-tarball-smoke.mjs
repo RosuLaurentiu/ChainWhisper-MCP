@@ -24,6 +24,9 @@ import { fileURLToPath } from 'node:url';
 const scriptDirectory = dirname(fileURLToPath(import.meta.url));
 const packageRoot = resolve(scriptDirectory, '..');
 const repositoryRoot = packageRoot;
+const sourcePackageJson = JSON.parse(
+  await readFile(resolve(packageRoot, 'package.json'), 'utf8'),
+);
 
 const readCliOptions = () => {
   let packDestination;
@@ -189,7 +192,7 @@ try {
   assert.equal(packed.length, 1);
   const entry = packed[0];
   assert.equal(entry.name, '@chainwhisper/agent-tools');
-  assert.equal(entry.version, '0.1.0-beta.0');
+  assert.equal(entry.version, sourcePackageJson.version);
   assert.ok(typeof entry.filename === 'string' && entry.filename.endsWith('.tgz'));
 
   const packedPaths = new Set(
@@ -332,7 +335,7 @@ try {
     "import assert from 'node:assert/strict';",
     "import { access, mkdtemp, rm } from 'node:fs/promises';",
     "import { tmpdir } from 'node:os';",
-    "import { dirname, resolve, sep } from 'node:path';",
+    "import { delimiter, dirname, resolve, sep } from 'node:path';",
     "import process from 'node:process';",
     "import { fileURLToPath } from 'node:url';",
     "import { Client } from '@modelcontextprotocol/sdk/client/index.js';",
@@ -343,8 +346,10 @@ try {
     "const suffix = isWindows ? '.cmd' : '';",
     "const binDirectory = resolve(root, 'node_modules', '.bin');",
     "const stateDirectory = await mkdtemp(resolve(tmpdir(), 'chainwhisper-npm-shim-'));",
+    'const baseEnvironment = getDefaultEnvironment();',
     'const environment = {',
-    '  ...getDefaultEnvironment(),',
+    '  ...baseEnvironment,',
+    "  PATH: dirname(process.execPath) + delimiter + (baseEnvironment.PATH ?? ''),",
     '  CHAINWHISPER_STATE_DIRECTORY: stateDirectory,',
     '};',
     'for (const name of [',
@@ -379,8 +384,8 @@ try {
     '    { capabilities: {} },',
     '  );',
     '  try {',
-    '    await client.connect(transport, { timeout: 30_000 });',
-    '    const result = await client.listTools(undefined, { timeout: 30_000 });',
+    '    await client.connect(transport, { timeout: 90_000 });',
+    '    const result = await client.listTools(undefined, { timeout: 90_000 });',
     '    return result.tools.map((tool) => tool.name);',
     '  } catch (error) {',
     "    const detail = stderr.trim() ? '\\n' + stderr.trim() : '';",
@@ -392,7 +397,11 @@ try {
     '',
     'try {',
     "  const signerTools = await listToolsThroughShim('chainwhisper-coti-signer');",
-    "  assert.deepEqual(signerTools, ['chainwhisper_signer_status']);",
+    '  assert.deepEqual(signerTools, [',
+    "    'chainwhisper_signer_status',",
+    "    'chainwhisper_open_control_panel',",
+    "    'chainwhisper_autonomy_status',",
+    '  ]);',
     "  const plannerTools = await listToolsThroughShim('chainwhisper-mcp');",
     "  assert.ok(plannerTools.includes('chainwhisper_status'));",
     "  assert.ok(plannerTools.includes('chainwhisper_prepare_create_trade'));",

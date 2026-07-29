@@ -177,7 +177,20 @@ export const createJsonMcpServer = (definition: JsonMcpServerDefinition): Server
 };
 
 export const connectStdioMcpServer = async (server: Server): Promise<void> => {
+  const existingOnClose = server.onclose;
+  let resolveClosed: (() => void) | undefined;
+  const closed = new Promise<void>((resolve) => {
+    resolveClosed = resolve;
+  });
+  server.onclose = () => {
+    try {
+      existingOnClose?.();
+    } finally {
+      resolveClosed?.();
+    }
+  };
   await server.connect(new StdioServerTransport());
+  await closed;
 };
 
 export const writeFatalMcpError = (

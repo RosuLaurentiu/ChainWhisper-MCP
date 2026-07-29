@@ -73,6 +73,7 @@ export class PrivateTokenAccountService {
   readonly #simulator: TransactionSimulator;
   readonly #nonceQueue: NonceQueue;
   readonly #journal: OperationJournal;
+  readonly #assertRuntimeAttested: () => Promise<void>;
 
   constructor(options: {
     manifest: ChainWhisperRuntimeManifestV1;
@@ -83,6 +84,7 @@ export class PrivateTokenAccountService {
     simulator: TransactionSimulator;
     nonceQueue: NonceQueue;
     journal: OperationJournal;
+    assertRuntimeAttested?: () => Promise<void>;
   }) {
     this.#tokens = options.manifest.tokens
       .filter(
@@ -120,6 +122,8 @@ export class PrivateTokenAccountService {
     this.#simulator = options.simulator;
     this.#nonceQueue = options.nonceQueue;
     this.#journal = options.journal;
+    this.#assertRuntimeAttested =
+      options.assertRuntimeAttested ?? (async () => undefined);
   }
 
   #token(reference: string): PrivateToken {
@@ -216,6 +220,7 @@ export class PrivateTokenAccountService {
     if (current.ready) {
       return { ...current, transactionHash: null };
     }
+    await this.#assertRuntimeAttested();
     const aesKey = this.#cotiWallet.getUserOnboardInfo()?.aesKey;
     if (!isCotiAesKey(aesKey)) {
       throw new SignerError(
@@ -545,7 +550,7 @@ export class PrivateTokenAccountService {
     } catch {
       throw new SignerError(
         'PRIVATE_INPUT_UNAVAILABLE',
-        `The signer could not decrypt the private ${token.symbol} balance with this wallet's onboarded AES key.`,
+        `The signer could not decrypt the private ${token.symbol} balance with this wallet's onboarded privacy key.`,
       );
     }
     if (balance < amount) {

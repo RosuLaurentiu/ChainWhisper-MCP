@@ -35,6 +35,7 @@ import type {
   PrivacyBridgeIntent,
   PrivacyBridgeStatus,
   PrivacyBridgeStatusInput,
+  PrivateAmountMode,
   PrepareResult,
   RawPriceReference,
   ResolvedAsset,
@@ -170,6 +171,27 @@ const rejectSignerLocalAmount = (
       }
     ]
   );
+};
+
+const normalizePrivateAmountMode = (
+  value: unknown
+): PrivateAmountMode => {
+  if (value === undefined || value === null || value === '') {
+    return 'signer-input';
+  }
+  if (value !== 'signer-input' && value !== 'agent-provided') {
+    throw new DomainInputError(
+      'privateAmountMode must be signer-input or agent-provided.',
+      [
+        {
+          field: 'privateAmountMode',
+          message:
+            'Use signer-input for local entry, or agent-provided only when a local autonomy policy permits agent-visible private amounts.'
+        }
+      ]
+    );
+  }
+  return value;
 };
 
 const sanitizeAsset = (asset: ResolvedAsset): ResolvedAsset => ({
@@ -767,6 +789,7 @@ export class ChainWhisperDomainService {
         'access',
         'recipient',
         'amountVisibility',
+        'privateAmountMode',
         'expiresAt',
         'fillPolicy'
       ]);
@@ -785,6 +808,9 @@ export class ChainWhisperDomainService {
       const access = selectedAxes.access;
       const recipient = normalizeAddress(input.recipient, 'recipient', false);
       const amountVisibility = selectedAxes.amountVisibility;
+      const privateAmountMode = normalizePrivateAmountMode(
+        input.privateAmountMode
+      );
       const privateLiquidity = amountVisibility === 'private';
       const confidentialOffer =
         privateLiquidity ||
@@ -792,24 +818,28 @@ export class ChainWhisperDomainService {
       const confidentialRequest =
         privateLiquidity ||
         (access !== 'public' && requestAsset?.kind === 'private-erc20');
-      if (confidentialOffer) {
+      if (confidentialOffer && privateAmountMode === 'signer-input') {
         rejectSignerLocalAmount(
           input.offerAmount,
           'offerAmount',
           'Confidential offer amounts'
         );
       }
-      if (confidentialRequest) {
+      if (confidentialRequest && privateAmountMode === 'signer-input') {
         rejectSignerLocalAmount(
           input.requestAmount,
           'requestAmount',
           'Confidential request amounts'
         );
       }
-      const offerAmount = offerAsset && !confidentialOffer
+      const offerAmount =
+        offerAsset &&
+        (!confidentialOffer || privateAmountMode === 'agent-provided')
         ? normalizePositiveAmount(input.offerAmount, 'offerAmount', offerAsset.decimals)
         : null;
-      const requestAmount = requestAsset && !confidentialRequest
+      const requestAmount =
+        requestAsset &&
+        (!confidentialRequest || privateAmountMode === 'agent-provided')
         ? normalizePositiveAmount(input.requestAmount, 'requestAmount', requestAsset.decimals)
         : null;
       if (access === 'public' && recipient) {
@@ -848,6 +878,7 @@ export class ChainWhisperDomainService {
         access,
         recipient: access === 'direct' ? recipient : null,
         amountVisibility,
+        privateAmountMode,
         expiresAt: normalizeExpiry(input.expiresAt),
         fillPolicy,
         secretPolicy: secretPolicyFor(access, recipient)
@@ -864,13 +895,15 @@ export class ChainWhisperDomainService {
       requireMissing(missing, Boolean(requestAsset), 'requestAsset', 'Choose the asset to receive.');
       requireMissing(
         missing,
-        confidentialOffer || Boolean(offerAmount),
+        (confidentialOffer && privateAmountMode === 'signer-input') ||
+          Boolean(offerAmount),
         'offerAmount',
         'Enter the amount to sell.'
       );
       requireMissing(
         missing,
-        confidentialRequest || Boolean(requestAmount),
+        (confidentialRequest && privateAmountMode === 'signer-input') ||
+          Boolean(requestAmount),
         'requestAmount',
         'Enter the amount to receive.'
       );
@@ -983,7 +1016,8 @@ export class ChainWhisperDomainService {
         'sellBaseLiquidity',
         'access',
         'recipient',
-        'amountVisibility'
+        'amountVisibility',
+        'privateAmountMode'
       ]);
       const wallet = normalizeWallet(input.wallet);
       const baseAsset = await resolveAsset(this.#gateway, input.baseAsset, 'baseAsset', false);
@@ -993,17 +1027,28 @@ export class ChainWhisperDomainService {
       const access = selectedAxes.access;
       const recipient = normalizeAddress(input.recipient, 'recipient', false);
       const amountVisibility = selectedAxes.amountVisibility;
+      const privateAmountMode = normalizePrivateAmountMode(
+        input.privateAmountMode
+      );
       const privateLiquidity = amountVisibility === 'private';
       const buyPrice = normalizePositiveAmount(input.buyPrice, 'buyPrice', quoteAsset?.decimals ?? 78);
       const sellPrice = normalizePositiveAmount(input.sellPrice, 'sellPrice', quoteAsset?.decimals ?? 78);
-      if (privateLiquidity && quoteAsset?.kind === 'private-erc20') {
+      if (
+        privateLiquidity &&
+        quoteAsset?.kind === 'private-erc20' &&
+        privateAmountMode === 'signer-input'
+      ) {
         rejectSignerLocalAmount(
           input.buyQuoteLiquidity,
           'buyQuoteLiquidity',
           'Private quote-token recurring inventory'
         );
       }
-      if (privateLiquidity && baseAsset?.kind === 'private-erc20') {
+      if (
+        privateLiquidity &&
+        baseAsset?.kind === 'private-erc20' &&
+        privateAmountMode === 'signer-input'
+      ) {
         rejectSignerLocalAmount(
           input.sellBaseLiquidity,
           'sellBaseLiquidity',
@@ -1011,7 +1056,9 @@ export class ChainWhisperDomainService {
         );
       }
       const buyQuoteLiquidity =
-        privateLiquidity && quoteAsset?.kind === 'private-erc20'
+        privateLiquidity &&
+        quoteAsset?.kind === 'private-erc20' &&
+        privateAmountMode === 'signer-input'
         ? null
         : normalizePositiveAmount(
             input.buyQuoteLiquidity,
@@ -1019,7 +1066,9 @@ export class ChainWhisperDomainService {
             quoteAsset?.decimals ?? 78
           );
       const sellBaseLiquidity =
-        privateLiquidity && baseAsset?.kind === 'private-erc20'
+        privateLiquidity &&
+        baseAsset?.kind === 'private-erc20' &&
+        privateAmountMode === 'signer-input'
         ? null
         : normalizePositiveAmount(
             input.sellBaseLiquidity,
@@ -1061,6 +1110,7 @@ export class ChainWhisperDomainService {
         access,
         recipient: access === 'direct' ? recipient : null,
         amountVisibility,
+        privateAmountMode,
         secretPolicy: secretPolicyFor(access, recipient)
       };
       const missing: MissingDetail[] = [];
@@ -1077,7 +1127,8 @@ export class ChainWhisperDomainService {
       requireMissing(missing, Boolean(sellPrice), 'sellPrice', 'Enter the maker sell price in quote per base.');
       requireMissing(
         missing,
-        privateLiquidity || Boolean(buyQuoteLiquidity || sellBaseLiquidity),
+        (privateLiquidity && privateAmountMode === 'signer-input') ||
+          Boolean(buyQuoteLiquidity || sellBaseLiquidity),
         'liquidity',
         'Fund at least the buy or sell side.'
       );
@@ -1106,8 +1157,18 @@ export class ChainWhisperDomainService {
   async prepareFill(input: FillInput): Promise<ToolResult<PrepareResult>> {
     try {
       rejectSensitiveOrArbitraryInput(input);
-      assertAllowedKeys(input, ['wallet', 'order', 'inputAmount', 'minOutputAmount', 'recurringSide']);
+      assertAllowedKeys(input, [
+        'wallet',
+        'order',
+        'inputAmount',
+        'minOutputAmount',
+        'recurringSide',
+        'privateAmountMode'
+      ]);
       const wallet = normalizeWallet(input.wallet);
+      const privateAmountMode = normalizePrivateAmountMode(
+        input.privateAmountMode
+      );
       const order = await this.#resolveOrder(input.order);
       const legacyStandardRecipientBound =
         order.legacyCompatibility?.kind ===
@@ -1183,6 +1244,7 @@ export class ChainWhisperDomainService {
             );
       if (
         signerLocalPrivateAmount &&
+        privateAmountMode === 'signer-input' &&
         input.inputAmount !== undefined
       ) {
         throw new DomainInputError(
@@ -1201,12 +1263,12 @@ export class ChainWhisperDomainService {
         input.minOutputAmount !== undefined
       ) {
         throw new DomainInputError(
-          'Private-liquidity output limits must stay inside the local signer.',
+          'The deployed private fill route does not accept an encrypted output limit.',
           [
             {
               field: 'minOutputAmount',
               message:
-                'Remove this field from the public planner request.'
+                'Remove this field. Agent-provided private amounts remain encrypted on-chain; this contract field would be public calldata.'
             }
           ]
         );
@@ -1226,7 +1288,9 @@ export class ChainWhisperDomainService {
           ]
         );
       }
-      let normalizedInputAmount = signerLocalPrivateAmount
+      let normalizedInputAmount =
+        signerLocalPrivateAmount &&
+        privateAmountMode === 'signer-input'
         ? null
         : normalizePositiveAmount(
             input.inputAmount,
@@ -1278,7 +1342,8 @@ export class ChainWhisperDomainService {
         order,
         inputAmount: normalizedInputAmount,
         minOutputAmount:
-          signerLocalPrivateOutput
+          signerLocalPrivateOutput &&
+          privateAmountMode === 'signer-input'
             ? null
             : normalizePositiveAmount(
                 input.minOutputAmount,
@@ -1286,6 +1351,7 @@ export class ChainWhisperDomainService {
                 outputDecimals
               ),
         recurringSide,
+        privateAmountMode,
         secretPolicy:
           order.access === 'unlisted'
             ? secretPolicyFor('public', null, order.identity.handle)
@@ -1297,7 +1363,9 @@ export class ChainWhisperDomainService {
       requireMissing(missing, Boolean(wallet), 'wallet', 'Choose the local signer wallet.');
       requireMissing(
         missing,
-        signerLocalPrivateAmount || Boolean(intent.inputAmount),
+        (signerLocalPrivateAmount &&
+          privateAmountMode === 'signer-input') ||
+          Boolean(intent.inputAmount),
         'inputAmount',
         'Enter the amount to fill.'
       );
@@ -1316,8 +1384,18 @@ export class ChainWhisperDomainService {
   async prepareCounter(input: CounterInput): Promise<ToolResult<PrepareResult>> {
     try {
       rejectSensitiveOrArbitraryInput(input);
-      assertAllowedKeys(input, ['wallet', 'order', 'offerAmount', 'requestAmount', 'expiresAt']);
+      assertAllowedKeys(input, [
+        'wallet',
+        'order',
+        'offerAmount',
+        'requestAmount',
+        'expiresAt',
+        'privateAmountMode'
+      ]);
       const wallet = normalizeWallet(input.wallet);
+      const privateAmountMode = normalizePrivateAmountMode(
+        input.privateAmountMode
+      );
       const order = await this.#resolveOrder(input.order);
       if (order.kind === 'trade' && order.status !== 'open') {
         throw new DomainInputError(
@@ -1391,14 +1469,14 @@ export class ChainWhisperDomainService {
       const confidentialRequest =
         counterRequestAsset.kind === 'private-erc20' &&
         !legacyStandardCounterReplacement;
-      if (confidentialOffer) {
+      if (confidentialOffer && privateAmountMode === 'signer-input') {
         rejectSignerLocalAmount(
           input.offerAmount,
           'offerAmount',
           'Confidential counter offer amounts'
         );
       }
-      if (confidentialRequest) {
+      if (confidentialRequest && privateAmountMode === 'signer-input') {
         rejectSignerLocalAmount(
           input.requestAmount,
           'requestAmount',
@@ -1422,14 +1500,18 @@ export class ChainWhisperDomainService {
         order,
         offerAsset: counterOfferAsset,
         requestAsset: counterRequestAsset,
-        offerAmount: confidentialOffer
+        offerAmount:
+          confidentialOffer &&
+          privateAmountMode === 'signer-input'
           ? null
           : normalizePositiveAmount(
               input.offerAmount,
               'offerAmount',
               counterOfferAsset.decimals
             ),
-        requestAmount: confidentialRequest
+        requestAmount:
+          confidentialRequest &&
+          privateAmountMode === 'signer-input'
           ? null
           : normalizePositiveAmount(
               input.requestAmount,
@@ -1440,19 +1522,24 @@ export class ChainWhisperDomainService {
         recipient: order.maker,
         access: 'direct',
         amountVisibility: 'visible',
+        privateAmountMode,
         secretPolicy: { kind: 'recipient-bound', recipient: order.maker }
       };
       const missing: MissingDetail[] = [];
       requireMissing(missing, Boolean(wallet), 'wallet', 'Choose the local signer wallet.');
       requireMissing(
         missing,
-        confidentialOffer || Boolean(intent.offerAmount),
+        (confidentialOffer &&
+          privateAmountMode === 'signer-input') ||
+          Boolean(intent.offerAmount),
         'offerAmount',
         'Enter what the counterparty receives.'
       );
       requireMissing(
         missing,
-        confidentialRequest || Boolean(intent.requestAmount),
+        (confidentialRequest &&
+          privateAmountMode === 'signer-input') ||
+          Boolean(intent.requestAmount),
         'requestAmount',
         'Enter what you receive.'
       );
@@ -1478,7 +1565,12 @@ export class ChainWhisperDomainService {
   async prepareEdit(input: EditInput): Promise<ToolResult<PrepareResult>> {
     try {
       rejectSensitiveOrArbitraryInput(input);
-      assertAllowedKeys(input, ['wallet', 'order', 'changes']);
+      assertAllowedKeys(input, [
+        'wallet',
+        'order',
+        'changes',
+        'privateAmountMode'
+      ]);
       assertAllowedKeys(input.changes, [
         'offerAmount',
         'requestAmount',
@@ -1498,6 +1590,9 @@ export class ChainWhisperDomainService {
         'adjustPrivateLiquidity'
       ], 'input.changes');
       const wallet = normalizeWallet(input.wallet);
+      const privateAmountMode = normalizePrivateAmountMode(
+        input.privateAmountMode
+      );
       const order = await this.#resolveOrder(input.order);
       if (
         (
@@ -1534,10 +1629,13 @@ export class ChainWhisperDomainService {
       const changes = input.changes ?? {};
       const normalizedChanges: EditIntent['changes'] = {};
       if (changes.offerAmount !== undefined) {
-        if (
+        const confidentialOffer =
           order.amountVisibility === 'private' ||
           (order.orderType?.route === 'direct-escrow' &&
-            order.offerAsset.kind === 'private-erc20')
+            order.offerAsset.kind === 'private-erc20');
+        if (
+          confidentialOffer &&
+          privateAmountMode === 'signer-input'
         ) {
           throw new DomainInputError(
             'Confidential offer amounts must be entered in the local signer.',
@@ -1558,10 +1656,13 @@ export class ChainWhisperDomainService {
         )!;
       }
       if (changes.requestAmount !== undefined) {
-        if (
+        const confidentialRequest =
           order.amountVisibility === 'private' ||
           (order.orderType?.route === 'direct-escrow' &&
-            order.requestAsset.kind === 'private-erc20')
+            order.requestAsset.kind === 'private-erc20');
+        if (
+          confidentialRequest &&
+          privateAmountMode === 'signer-input'
         ) {
           throw new DomainInputError(
             'Confidential request amounts must be entered in the local signer.',
@@ -1647,7 +1748,8 @@ export class ChainWhisperDomainService {
             : order.recurring?.baseAsset;
           if (
             order.amountVisibility === 'private' &&
-            inventoryAsset?.kind === 'private-erc20'
+            inventoryAsset?.kind === 'private-erc20' &&
+            privateAmountMode === 'signer-input'
           ) {
             throw new DomainInputError(
               'Private recurring inventory changes must be entered in the local signer.',
@@ -1740,6 +1842,7 @@ export class ChainWhisperDomainService {
           : {}),
         wallet,
         order,
+        privateAmountMode,
         changes: normalizedChanges
       };
       const missing: MissingDetail[] = [];
@@ -1756,6 +1859,17 @@ export class ChainWhisperDomainService {
           normalizedChanges.replaceConfidentialTerms === true,
         'changes.replaceConfidentialTerms',
         'Set replaceConfidentialTerms to true so the complete replacement terms are collected inside the local signer.'
+      );
+      requireMissing(
+        missing,
+        !confidentialOneOff ||
+          privateAmountMode === 'signer-input' ||
+          Boolean(
+            normalizedChanges.offerAmount &&
+              normalizedChanges.requestAmount
+          ),
+        'changes.offerAmount',
+        'Agent-provided confidential replacements must include both complete resulting amounts.'
       );
       requireMissing(missing, Object.keys(normalizedChanges).length > 0, 'changes', 'Describe at least one order change.');
       if (order.kind === 'recurring') {

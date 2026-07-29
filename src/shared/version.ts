@@ -1,0 +1,1 @@
+export const CHAINWHISPER_AGENT_TOOLS_VERSION = '0.1.0-beta.0';

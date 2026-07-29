@@ -133,7 +133,7 @@ export class CotiSdkPrivateUint256Encoder
     if (!isCotiAesKey(aesKey)) {
       throw new SignerError(
         'PRIVATE_INPUT_UNAVAILABLE',
-        'The official COTI account AES key is unavailable. Run chainwhisper_onboard_privacy first.',
+        'The official COTI privacy account key is unavailable. Complete privacy onboarding in local Agent Control first.',
       );
     }
     return normalizePreparedInput(
@@ -585,7 +585,7 @@ export class VaultBackedPrivateInputMaterializer
       if (!decimalValue || !/^(?:0|[1-9][0-9]*)$/u.test(decimalValue)) {
         throw new SignerError(
           'PRIVATE_INPUT_UNAVAILABLE',
-          'A private uint256 value is not available in the local signer vault.',
+          'A private uint256 value is not available in signer-owned local storage.',
         );
       }
       const step = envelope.steps.find(
@@ -718,6 +718,21 @@ export class VaultBackedPrivateInputMaterializer
     if (value.source === 'recurring-buy-quote-liquidity') {
       const liquidity =
         envelope.intent.metadata?.buyQuoteLiquidity;
+      return typeof liquidity === 'string' ? liquidity : null;
+    }
+    const recurringEditField =
+      value.source === 'recurring-edit-add-base-liquidity'
+        ? 'addSellBaseLiquidity'
+        : value.source === 'recurring-edit-add-quote-liquidity'
+          ? 'addBuyQuoteLiquidity'
+          : value.source === 'recurring-edit-remove-base-liquidity'
+            ? 'removeSellBaseLiquidity'
+            : value.source === 'recurring-edit-remove-quote-liquidity'
+              ? 'removeBuyQuoteLiquidity'
+              : null;
+    if (recurringEditField) {
+      const liquidity =
+        envelope.intent.metadata?.[recurringEditField];
       return typeof liquidity === 'string' ? liquidity : null;
     }
     return null;
@@ -875,7 +890,7 @@ export class VaultBackedPrivateInputMaterializer
           id: definition.id,
           title: 'Private order access secret',
           description:
-            'Enter the 32-byte secret from the private order link. It stays inside the local encrypted signer vault.',
+            'Enter the 32-byte secret from the private order link. It stays inside encrypted signer-owned local storage.',
           kind: 'access-secret',
         });
         continue;
@@ -1326,7 +1341,7 @@ export class VaultBackedPrivateInputMaterializer
     if (!isCotiAesKey(aesKey)) {
       throw new SignerError(
         'PRIVATE_INPUT_UNAVAILABLE',
-        'The official wallet AES key is unavailable for private order recovery.',
+        'The official wallet privacy key is unavailable for private order recovery.',
       );
     }
     return encryptAesGcm(
@@ -1406,7 +1421,7 @@ export class VaultBackedPrivateInputMaterializer
     if (!isCotiAesKey(aesKey)) {
       throw new SignerError(
         'PRIVATE_INPUT_UNAVAILABLE',
-        'The official wallet AES key is unavailable for recurring order recovery.',
+        'The official wallet privacy key is unavailable for recurring order recovery.',
       );
     }
     return encryptAesGcm(

@@ -326,8 +326,73 @@ describe('embedded official COTI negotiation messaging', () => {
     ]);
     const send = tools[0]?.inputSchema as {
       properties?: Record<string, unknown>;
+      additionalProperties?: unknown;
     };
     expect(Object.keys(send.properties ?? {})).toEqual(['to', 'plaintext']);
+    expect(send.additionalProperties).toBe(false);
+
+    const expectedReadSchemas: Record<
+      string,
+      { properties: string[]; required: string[] }
+    > = {
+      read_private_agent_message: {
+        properties: ['messageId', 'decrypt'],
+        required: ['messageId'],
+      },
+      list_private_agent_inbox: {
+        properties: ['account', 'offset', 'limit', 'decrypt'],
+        required: ['account'],
+      },
+      list_sent_private_agent_messages: {
+        properties: ['account', 'offset', 'limit', 'decrypt'],
+        required: ['account'],
+      },
+      get_contract_config: {
+        properties: [],
+        required: [],
+      },
+      get_private_agent_inbox_stats: {
+        properties: ['account'],
+        required: ['account'],
+      },
+      get_message_metadata: {
+        properties: ['messageId'],
+        required: ['messageId'],
+      },
+    };
+    for (const tool of tools.slice(1)) {
+      const expected = expectedReadSchemas[tool.name];
+      expect(expected, `unexpected read tool ${tool.name}`).toBeDefined();
+      const schema = tool.inputSchema as {
+        type?: unknown;
+        properties?: Record<string, unknown>;
+        required?: unknown;
+        additionalProperties?: unknown;
+      };
+      expect(schema.type).toBe('object');
+      expect(Object.keys(schema.properties ?? {})).toEqual(
+        expected?.properties,
+      );
+      expect(schema.required ?? []).toEqual(expected?.required);
+      expect(schema.additionalProperties).toBe(false);
+    }
+    const firstReadSchema = tools[1]?.inputSchema as {
+      additionalProperties?: boolean;
+    };
+    firstReadSchema.additionalProperties = true;
+    expect(
+      (
+        setup.bridge.listTools()[1]?.inputSchema as {
+          additionalProperties?: boolean;
+        }
+      ).additionalProperties,
+    ).toBe(false);
+    await expect(
+      setup.bridge.invokeTool('send_message', {
+        to: RECIPIENT,
+        plaintext: 'The non-embedded standalone send alias stays blocked.',
+      }),
+    ).rejects.toMatchObject({ code: 'UNSUPPORTED_TOOL' });
 
     const signerTools = createSignerTools({
       messaging: { listTools: () => [] },
@@ -346,6 +411,112 @@ describe('embedded official COTI negotiation messaging', () => {
       description:
         'Canonical signer-local generated access-secret reference. This is an identifier, never secret material.',
     });
+  });
+
+  it('normalizes every actual official read alias before SDK forwarding', async () => {
+    const invocations: Array<{
+      toolName: string;
+      input: Record<string, unknown>;
+    }> = [];
+    const setup = await createBridge(async (toolName, input) => {
+      invocations.push({ toolName, input });
+      return {};
+    });
+    const mixedCaseAccount =
+      `0x${'Aa'.repeat(20)}` as Address;
+
+    await setup.bridge.invokeTool('read_private_agent_message', {
+      messageId: 7,
+    });
+    await setup.bridge.invokeTool('list_private_agent_inbox', {
+      account: mixedCaseAccount,
+    });
+    await setup.bridge.invokeTool('list_sent_private_agent_messages', {
+      account: mixedCaseAccount,
+      offset: 2,
+      limit: 5,
+      decrypt: false,
+    });
+    await setup.bridge.invokeTool('get_contract_config', {});
+    await setup.bridge.invokeTool('get_private_agent_inbox_stats', {
+      account: mixedCaseAccount,
+    });
+    await setup.bridge.invokeTool('get_message_metadata', {
+      messageId: '9',
+    });
+
+    expect(invocations).toEqual([
+      {
+        toolName: 'read_private_agent_message',
+        input: { messageId: '7', decrypt: true },
+      },
+      {
+        toolName: 'list_private_agent_inbox',
+        input: {
+          account: mixedCaseAccount.toLowerCase(),
+          offset: 0,
+          limit: 20,
+          decrypt: true,
+        },
+      },
+      {
+        toolName: 'list_sent_private_agent_messages',
+        input: {
+          account: mixedCaseAccount.toLowerCase(),
+          offset: 2,
+          limit: 5,
+          decrypt: false,
+        },
+      },
+      {
+        toolName: 'get_contract_config',
+        input: {},
+      },
+      {
+        toolName: 'get_private_agent_inbox_stats',
+        input: { account: mixedCaseAccount.toLowerCase() },
+      },
+      {
+        toolName: 'get_message_metadata',
+        input: { messageId: '9' },
+      },
+    ]);
+  });
+
+  it('rejects unknown and sensitive keys for every advertised read alias before forwarding', async () => {
+    const invoked = vi.fn(async () => ({}));
+    const setup = await createBridge(invoked);
+    const validInputs: Record<string, Record<string, unknown>> = {
+      read_private_agent_message: { messageId: '1' },
+      list_private_agent_inbox: { account: RECIPIENT },
+      list_sent_private_agent_messages: { account: RECIPIENT },
+      get_contract_config: {},
+      get_private_agent_inbox_stats: { account: RECIPIENT },
+      get_message_metadata: { messageId: '1' },
+    };
+    const advertisedReads = setup.bridge
+      .listTools()
+      .filter((tool) => !tool.name.startsWith('send_'));
+
+    expect(advertisedReads.map((tool) => tool.name)).toEqual(
+      Object.keys(validInputs),
+    );
+    for (const tool of advertisedReads) {
+      const valid = validInputs[tool.name]!;
+      await expect(
+        setup.bridge.invokeTool(tool.name, {
+          ...valid,
+          unexpectedMetadata: 'not forwarded',
+        }),
+      ).rejects.toMatchObject({ code: 'UNSAFE_MESSAGE' });
+      await expect(
+        setup.bridge.invokeTool(tool.name, {
+          ...valid,
+          privateKey: `0x${'ef'.repeat(32)}`,
+        }),
+      ).rejects.toMatchObject({ code: 'UNSAFE_MESSAGE' });
+    }
+    expect(invoked).not.toHaveBeenCalled();
   });
 
   it('hands a materialized generated secret through an exact message reference into an order-bound fill without exposing it', async () => {
@@ -1316,11 +1487,19 @@ describe('embedded official COTI negotiation messaging', () => {
       }),
     ).rejects.toMatchObject({ code: 'UNSAFE_MESSAGE' });
 
+    await expect(
+      setup.bridge.invokeTool('send_private_agent_message', {
+        to: RECIPIENT,
+        plaintext: 'Review ChainWhisper order 9.',
+        gasLimit: '1',
+        maxChunkBytes: 1,
+      }),
+    ).rejects.toMatchObject({ code: 'UNSAFE_MESSAGE' });
+    expect(invoked).toBeNull();
+
     await setup.bridge.invokeTool('send_private_agent_message', {
       to: RECIPIENT,
       plaintext: 'Review ChainWhisper order 9.',
-      gasLimit: '1',
-      maxChunkBytes: 1,
     });
     expect(invoked).toEqual({
       to: RECIPIENT,

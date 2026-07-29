@@ -665,6 +665,41 @@ describe('ChainWhisperDomainService preparation', () => {
     expect(gateway.buildExecutionPlan).toHaveBeenCalledOnce();
   });
 
+  it('binds explicitly agent-provided private amounts into the prepared intent', async () => {
+    const { gateway, service } = makeService();
+    const result = await service.prepareCreateTrade({
+      wallet: addresses.wallet,
+      orderType: 'one-off.private-liquidity.public',
+      offerAsset: 'p.BASE',
+      requestAsset: 'QUOTE',
+      offerAmount: '1.25',
+      requestAmount: '2.5',
+      privateAmountMode: 'agent-provided'
+    });
+
+    expect(result).toMatchObject({
+      ok: true,
+      data: {
+        status: 'ready',
+        intent: {
+          amountVisibility: 'private',
+          privateAmountMode: 'agent-provided',
+          offerAmount: '1.25',
+          requestAmount: '2.5'
+        },
+        missing: [],
+        envelope: { version: 'ActionEnvelopeV1' }
+      }
+    });
+    expect(gateway.buildExecutionPlan).toHaveBeenCalledWith(
+      expect.objectContaining({
+        privateAmountMode: 'agent-provided',
+        offerAmount: '1.25',
+        requestAmount: '2.5'
+      })
+    );
+  });
+
   it.each([
     ['one-off.unlisted', undefined],
     ['one-off.direct', addresses.recipient]

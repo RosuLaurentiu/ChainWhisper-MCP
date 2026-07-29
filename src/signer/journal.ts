@@ -76,6 +76,13 @@ export class OperationJournal {
     return record ? cloneRecord(record) : null;
   }
 
+  async list(): Promise<OperationJournalRecord[]> {
+    const state = await this.#store.read();
+    return Object.values(state.operations)
+      .map(cloneRecord)
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+  }
+
   async begin(
     operationId: string,
     operationHash: HexString,

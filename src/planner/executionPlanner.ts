@@ -139,6 +139,28 @@ const asOptionalAtomic = (
   }
 };
 
+const privateAmountIsAgentProvided = (
+  intent: { privateAmountMode?: 'signer-input' | 'agent-provided' }
+): boolean => intent.privateAmountMode === 'agent-provided';
+
+const privateAmountSource = (
+  intent: { privateAmountMode?: 'signer-input' | 'agent-provided' },
+  signedSource: Extract<
+    PlanPrivateArtifactValueSource,
+    | 'intent-sell-amount'
+    | 'intent-buy-amount'
+    | 'recurring-sell-base-liquidity'
+    | 'recurring-buy-quote-liquidity'
+    | 'recurring-edit-add-base-liquidity'
+    | 'recurring-edit-add-quote-liquidity'
+    | 'recurring-edit-remove-base-liquidity'
+    | 'recurring-edit-remove-quote-liquidity'
+  >
+): PlanPrivateArtifactValueSource =>
+  privateAmountIsAgentProvided(intent)
+    ? signedSource
+    : 'signer-elicitation';
+
 const assetTuple = (
   asset: ResolvedAsset,
   amount: bigint
@@ -600,18 +622,36 @@ export class ManifestExecutionPlanner {
       return unsupported('The trade plan is missing required editable terms.');
     }
     const privateLiquidity = intent.amountVisibility === 'private';
+    const confidentialOffer =
+      privateLiquidity ||
+      (
+        intent.access !== 'public' &&
+        intent.offerAsset.kind === 'private-erc20'
+      );
+    const confidentialRequest =
+      privateLiquidity ||
+      (
+        intent.access !== 'public' &&
+        intent.requestAsset.kind === 'private-erc20'
+      );
+    if (!confidentialOffer && !intent.offerAmount) {
+      return unsupported('The visible trade plan is missing its offer amount.');
+    }
+    if (!confidentialRequest && !intent.requestAmount) {
+      return unsupported('The visible trade plan is missing its request amount.');
+    }
     if (
-      !privateLiquidity &&
+      privateAmountIsAgentProvided(intent) &&
       (!intent.offerAmount || !intent.requestAmount)
     ) {
       return unsupported('The visible trade plan is missing required amounts.');
     }
-    const offerAmount = privateLiquidity
-      ? 0n
-      : asAtomic(intent.offerAmount!, intent.offerAsset);
-    const requestAmount = privateLiquidity
-      ? 0n
-      : asAtomic(intent.requestAmount!, intent.requestAsset);
+    const offerAmount = intent.offerAmount
+      ? asAtomic(intent.offerAmount, intent.offerAsset)
+      : 0n;
+    const requestAmount = intent.requestAmount
+      ? asAtomic(intent.requestAmount, intent.requestAsset)
+      : 0n;
 
     if (intent.amountVisibility === 'private') {
       if (intent.offerAsset.kind !== 'private-erc20') {
@@ -624,12 +664,20 @@ export class ManifestExecutionPlanner {
         contract,
         'createPrivateOrderWithRecoveryNote'
       );
+      const offerSource = privateAmountSource(
+        intent,
+        'intent-sell-amount'
+      );
+      const requestSource = privateAmountSource(
+        intent,
+        'intent-buy-amount'
+      );
       const privateApproval = await this.#approvalSteps(
         intent.wallet!,
         intent.offerAsset,
         contract.address as Address,
-        0n,
-        'signer-elicitation',
+        offerAmount,
+        offerSource,
         'hidden-offer-amount'
       );
       const unlisted = intent.access === 'unlisted';
@@ -642,13 +690,13 @@ export class ManifestExecutionPlanner {
         artifactValue(
           'hidden-offer-amount',
           'uint256',
-          'signer-elicitation',
+          offerSource,
           intent.offerAsset
         ),
         artifactValue(
           'hidden-request-amount',
           'uint256',
-          'signer-elicitation',
+          requestSource,
           intent.requestAsset
         ),
         ...(unlisted
@@ -657,13 +705,13 @@ export class ManifestExecutionPlanner {
               artifactValue(
                 'public-offer-term',
                 'uint256',
-                'signer-elicitation',
+                offerSource,
                 intent.offerAsset
               ),
               artifactValue(
                 'public-request-term',
                 'uint256',
-                'signer-elicitation',
+                requestSource,
                 intent.requestAsset
               )
             ]),
@@ -785,12 +833,20 @@ export class ManifestExecutionPlanner {
       if (intent.access === 'direct' && !intent.recipient) {
         return unsupported('Recipient-bound Direct creation needs a recipient.');
       }
+      const offerSource: PlanPrivateArtifactValueSource =
+        intent.offerAsset.kind === 'private-erc20'
+          ? privateAmountSource(intent, 'intent-sell-amount')
+          : 'intent-sell-amount';
+      const requestSource: PlanPrivateArtifactValueSource =
+        intent.requestAsset.kind === 'private-erc20'
+          ? privateAmountSource(intent, 'intent-buy-amount')
+          : 'intent-buy-amount';
       const steps = await this.#approvalSteps(
         intent.wallet!,
         intent.offerAsset,
         contract.address as Address,
         offerAmount,
-        'intent-sell-amount',
+        offerSource,
         'offer-amount'
       );
       const values: PlanPrivateArtifactGroup['values'] = [
@@ -798,13 +854,13 @@ export class ManifestExecutionPlanner {
         artifactValue(
           'offer-amount',
           'uint256',
-          'intent-sell-amount',
+          offerSource,
           intent.offerAsset
         ),
         artifactValue(
           'request-amount',
           'uint256',
-          'intent-buy-amount',
+          requestSource,
           intent.requestAsset
         )
       ];
@@ -1001,6 +1057,16 @@ export class ManifestExecutionPlanner {
     }
     if (
       privateInventory &&
+      privateAmountIsAgentProvided(intent) &&
+      baseLiquidity <= 0n &&
+      quoteLiquidity <= 0n
+    ) {
+      return unsupported(
+        'Agent-provided recurring inventory must fund at least one side.'
+      );
+    }
+    if (
+      privateInventory &&
       intent.baseAsset.kind !== 'private-erc20' &&
       intent.quoteAsset.kind !== 'private-erc20'
     ) {
@@ -1012,13 +1078,19 @@ export class ManifestExecutionPlanner {
     const quoteValueId = 'recurring-quote-inventory';
     const baseSource: PlanPrivateArtifactValueSource =
       intent.baseAsset.kind === 'private-erc20' && privateInventory
-        ? 'signer-elicitation'
+        ? privateAmountSource(
+            intent,
+            'recurring-sell-base-liquidity'
+          )
         : intent.sellBaseLiquidity
           ? 'recurring-sell-base-liquidity'
           : 'constant-zero';
     const quoteSource: PlanPrivateArtifactValueSource =
       intent.quoteAsset.kind === 'private-erc20' && privateInventory
-        ? 'signer-elicitation'
+        ? privateAmountSource(
+            intent,
+            'recurring-buy-quote-liquidity'
+          )
         : intent.buyQuoteLiquidity
           ? 'recurring-buy-quote-liquidity'
           : 'constant-zero';
@@ -1222,9 +1294,14 @@ export class ManifestExecutionPlanner {
         : intent.order.recurring.quoteAsset;
       const privateInventory =
         intent.order.amountVisibility === 'private';
-      const signerLocalInput =
+      const privateInput =
         privateInventory && inputAsset.kind === 'private-erc20';
-      if (!signerLocalInput && !intent.inputAmount) {
+      const signerLocalInput =
+        privateInput && !privateAmountIsAgentProvided(intent);
+      if (
+        (!privateInput || privateAmountIsAgentProvided(intent)) &&
+        !intent.inputAmount
+      ) {
         return unsupported('Enter the recurring fill input amount.');
       }
       const inputAmount = signerLocalInput
@@ -1246,13 +1323,15 @@ export class ManifestExecutionPlanner {
         inputAsset,
         contract.address as Address,
         inputAmount,
-        signerLocalInput ? 'signer-elicitation' : 'intent-sell-amount',
+        privateInput
+          ? privateAmountSource(intent, 'intent-sell-amount')
+          : 'intent-sell-amount',
         'recurring-fill-input'
       );
       const protocolArguments: unknown[] = privateInventory
         ? [
             intent.order.identity.localId,
-            signerLocalInput ? '0' : inputAmount.toString(),
+            privateInput ? '0' : inputAmount.toString(),
             EMPTY_IT_UINT256,
             minOutput.toString(),
             ZERO_BYTES32
@@ -1271,21 +1350,24 @@ export class ManifestExecutionPlanner {
                 recipe: 'private-recurring-fill-v1',
                 values: [
                   artifactValue(
-                    signerLocalInput
+                    privateInput
                       ? 'recurring-fill-input'
                       : 'recurring-fill-private-zero',
                     'uint256',
-                    signerLocalInput
-                      ? 'signer-elicitation'
+                    privateInput
+                      ? privateAmountSource(
+                          intent,
+                          'intent-sell-amount'
+                        )
                       : 'constant-zero',
                     inputAsset,
-                    !signerLocalInput
+                    !privateInput
                   )
                 ],
                 outputs: [
                   {
                     kind: 'itUint256',
-                    valueId: signerLocalInput
+                    valueId: privateInput
                       ? 'recurring-fill-input'
                       : 'recurring-fill-private-zero',
                     jsonPointer: '/arguments/2'
@@ -1293,7 +1375,7 @@ export class ManifestExecutionPlanner {
                 ],
                 context: {
                   side: intent.recurringSide,
-                  inputPrivate: signerLocalInput
+                  inputPrivate: privateInput
                 }
               }
             ]
@@ -1354,12 +1436,17 @@ export class ManifestExecutionPlanner {
       }
       const requestIsPrivate =
         intent.order.requestAsset.kind === 'private-erc20';
-      if (!requestIsPrivate && !intent.inputAmount) {
+      if (
+        (!requestIsPrivate || privateAmountIsAgentProvided(intent)) &&
+        !intent.inputAmount
+      ) {
         return unsupported(
           'Enter the exact Direct order payment amount.'
         );
       }
-      const inputAmount = requestIsPrivate
+      const inputAmount =
+        requestIsPrivate &&
+        !privateAmountIsAgentProvided(intent)
         ? 0n
         : asAtomic(intent.inputAmount!, intent.order.requestAsset);
       const steps = await this.#approvalSteps(
@@ -1367,7 +1454,9 @@ export class ManifestExecutionPlanner {
         intent.order.requestAsset,
         directContract.address as Address,
         inputAmount,
-        requestIsPrivate ? 'signer-elicitation' : 'intent-sell-amount',
+        requestIsPrivate
+          ? privateAmountSource(intent, 'intent-sell-amount')
+          : 'intent-sell-amount',
         requestIsPrivate ? 'request-amount' : undefined
       );
       const needsAccessSecret = intent.order.access === 'unlisted';
@@ -1388,7 +1477,7 @@ export class ManifestExecutionPlanner {
               artifactValue(
                 'request-amount',
                 'uint256',
-                'signer-elicitation',
+                privateAmountSource(intent, 'intent-sell-amount'),
                 intent.order.requestAsset
               )
             ]
@@ -1502,7 +1591,16 @@ export class ManifestExecutionPlanner {
       }
       const requestIsPrivate =
         intent.order.requestAsset.kind === 'private-erc20';
-      const inputAmount = requestIsPrivate
+      if (
+        requestIsPrivate &&
+        privateAmountIsAgentProvided(intent) &&
+        !intent.inputAmount
+      ) {
+        return unsupported('Enter the agent-provided private payment amount.');
+      }
+      const inputAmount =
+        requestIsPrivate &&
+        !privateAmountIsAgentProvided(intent)
         ? 0n
         : intent.inputAmount
           ? asAtomic(intent.inputAmount, intent.order.requestAsset)
@@ -1512,7 +1610,9 @@ export class ManifestExecutionPlanner {
         intent.order.requestAsset,
         privateContract.address as Address,
         inputAmount,
-        requestIsPrivate ? 'signer-elicitation' : 'intent-sell-amount',
+        requestIsPrivate
+          ? privateAmountSource(intent, 'intent-sell-amount')
+          : 'intent-sell-amount',
         requestIsPrivate ? 'request-amount' : undefined
       );
       const needsAccessSecret = intent.order.access === 'unlisted';
@@ -1529,7 +1629,7 @@ export class ManifestExecutionPlanner {
               artifactValue(
                 'request-amount',
                 'uint256',
-                'signer-elicitation',
+                privateAmountSource(intent, 'intent-sell-amount'),
                 intent.order.requestAsset
               )
             ]
@@ -1859,23 +1959,33 @@ export class ManifestExecutionPlanner {
 
     const offerPrivate = intent.offerAsset.kind === 'private-erc20';
     const requestPrivate = intent.requestAsset.kind === 'private-erc20';
-    if (!offerPrivate && !intent.offerAmount) {
+    if (
+      (!offerPrivate || privateAmountIsAgentProvided(intent)) &&
+      !intent.offerAmount
+    ) {
       return unsupported('Enter the public or native counter offer amount.');
     }
-    if (!requestPrivate && !intent.requestAmount) {
+    if (
+      (!requestPrivate || privateAmountIsAgentProvided(intent)) &&
+      !intent.requestAmount
+    ) {
       return unsupported('Enter the public or native counter request amount.');
     }
-    const offerAmount = offerPrivate
+    const offerAmount =
+      offerPrivate &&
+      !privateAmountIsAgentProvided(intent)
       ? 0n
       : asAtomic(intent.offerAmount!, intent.offerAsset);
-    const requestAmount = requestPrivate
+    const requestAmount =
+      requestPrivate &&
+      !privateAmountIsAgentProvided(intent)
       ? 0n
       : asAtomic(intent.requestAmount!, intent.requestAsset);
     const offerSource: PlanPrivateArtifactValueSource = offerPrivate
-      ? 'signer-elicitation'
+      ? privateAmountSource(intent, 'intent-sell-amount')
       : 'intent-sell-amount';
     const requestSource: PlanPrivateArtifactValueSource = requestPrivate
-      ? 'signer-elicitation'
+      ? privateAmountSource(intent, 'intent-buy-amount')
       : 'intent-buy-amount';
     const steps = await this.#approvalSteps(
       intent.wallet!,
@@ -2485,25 +2595,41 @@ export class ManifestExecutionPlanner {
       'expiresAt' in intent.changes
         ? intent.changes.expiresAt ?? null
         : intent.order.expiresAt;
+    const offerSource = privateAmountSource(
+      intent,
+      'intent-sell-amount'
+    );
+    const requestSource = privateAmountSource(
+      intent,
+      'intent-buy-amount'
+    );
+    const replacementOfferAmount =
+      privateAmountIsAgentProvided(intent) &&
+      intent.changes.offerAmount
+        ? asAtomic(
+            intent.changes.offerAmount,
+            intent.order.offerAsset
+          )
+        : 0n;
     const steps = await this.#approvalSteps(
       intent.wallet!,
       intent.order.offerAsset,
       contract.address as Address,
-      0n,
-      'signer-elicitation',
+      replacementOfferAmount,
+      offerSource,
       'hidden-offer-amount'
     );
     const values: PlanPrivateArtifactGroup['values'] = [
       artifactValue(
         'hidden-offer-amount',
         'uint256',
-        'signer-elicitation',
+        offerSource,
         intent.order.offerAsset
       ),
       artifactValue(
         'hidden-request-amount',
         'uint256',
-        'signer-elicitation',
+        requestSource,
         intent.order.requestAsset
       ),
       ...(!unlisted
@@ -2511,13 +2637,13 @@ export class ManifestExecutionPlanner {
             artifactValue(
               'public-offer-term',
               'uint256',
-              'signer-elicitation',
+              offerSource,
               intent.order.offerAsset
             ),
             artifactValue(
               'public-request-term',
               'uint256',
-              'signer-elicitation',
+              requestSource,
               intent.order.requestAsset
             )
           ]
@@ -2691,27 +2817,37 @@ export class ManifestExecutionPlanner {
       intent.changes.requestAmount ??
       intent.order.remainingRequestAmount ??
       intent.order.requestAmount;
-    if (!offerPrivate && !offerDecimal) {
+    if (
+      (!offerPrivate || privateAmountIsAgentProvided(intent)) &&
+      !offerDecimal
+    ) {
       return unsupported(
         'Enter the complete resulting public or native offer amount for the Direct replacement.'
       );
     }
-    if (!requestPrivate && !requestDecimal) {
+    if (
+      (!requestPrivate || privateAmountIsAgentProvided(intent)) &&
+      !requestDecimal
+    ) {
       return unsupported(
         'Enter the complete resulting public or native request amount for the Direct replacement.'
       );
     }
-    const offerAmount = offerPrivate
+    const offerAmount =
+      offerPrivate &&
+      !privateAmountIsAgentProvided(intent)
       ? 0n
       : asAtomic(offerDecimal!, intent.order.offerAsset);
-    const requestAmount = requestPrivate
+    const requestAmount =
+      requestPrivate &&
+      !privateAmountIsAgentProvided(intent)
       ? 0n
       : asAtomic(requestDecimal!, intent.order.requestAsset);
     const offerSource: PlanPrivateArtifactValueSource = offerPrivate
-      ? 'signer-elicitation'
+      ? privateAmountSource(intent, 'intent-sell-amount')
       : 'intent-sell-amount';
     const requestSource: PlanPrivateArtifactValueSource = requestPrivate
-      ? 'signer-elicitation'
+      ? privateAmountSource(intent, 'intent-buy-amount')
       : 'intent-buy-amount';
     const expiresAt =
       'expiresAt' in intent.changes
@@ -2975,15 +3111,30 @@ export class ManifestExecutionPlanner {
       privateInventory &&
       recurring.quoteAsset.kind === 'private-erc20';
     const adjustPrivate =
-      intent.changes.adjustPrivateLiquidity === true;
+      intent.changes.adjustPrivateLiquidity === true ||
+      (
+        privateAmountIsAgentProvided(intent) &&
+        (
+          intent.changes.addSellBaseLiquidity !== undefined ||
+          intent.changes.addBuyQuoteLiquidity !== undefined ||
+          intent.changes.removeSellBaseLiquidity !== undefined ||
+          intent.changes.removeBuyQuoteLiquidity !== undefined
+        )
+      );
     const addBaseSource: PlanPrivateArtifactValueSource = basePrivate
       ? adjustPrivate
-        ? 'signer-elicitation'
+        ? privateAmountSource(
+            intent,
+            'recurring-edit-add-base-liquidity'
+          )
         : 'constant-zero'
       : 'recurring-sell-base-liquidity';
     const addQuoteSource: PlanPrivateArtifactValueSource = quotePrivate
       ? adjustPrivate
-        ? 'signer-elicitation'
+        ? privateAmountSource(
+            intent,
+            'recurring-edit-add-quote-liquidity'
+          )
         : 'constant-zero'
       : 'recurring-buy-quote-liquidity';
     const steps = [
@@ -2991,7 +3142,9 @@ export class ManifestExecutionPlanner {
         intent.wallet!,
         recurring.baseAsset,
         contract.address as Address,
-        basePrivate ? 0n : addBase,
+        basePrivate && !privateAmountIsAgentProvided(intent)
+          ? 0n
+          : addBase,
         addBaseSource,
         'recurring-edit-add-base',
         basePrivate
@@ -3000,7 +3153,9 @@ export class ManifestExecutionPlanner {
         intent.wallet!,
         recurring.quoteAsset,
         contract.address as Address,
-        quotePrivate ? 0n : addQuote,
+        quotePrivate && !privateAmountIsAgentProvided(intent)
+          ? 0n
+          : addQuote,
         addQuoteSource,
         'recurring-edit-add-quote',
         quotePrivate
@@ -3020,7 +3175,10 @@ export class ManifestExecutionPlanner {
               'recurring-edit-remove-base',
               'uint256',
               adjustPrivate
-                ? 'signer-elicitation'
+                ? privateAmountSource(
+                    intent,
+                    'recurring-edit-remove-base-liquidity'
+                  )
                 : 'constant-zero',
               recurring.baseAsset,
               true
@@ -3040,7 +3198,10 @@ export class ManifestExecutionPlanner {
               'recurring-edit-remove-quote',
               'uint256',
               adjustPrivate
-                ? 'signer-elicitation'
+                ? privateAmountSource(
+                    intent,
+                    'recurring-edit-remove-quote-liquidity'
+                  )
                 : 'constant-zero',
               recurring.quoteAsset,
               true

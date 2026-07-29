@@ -11,6 +11,7 @@ export type Address = `0x${string}`;
 export type DecimalString = string;
 export type OrderAccess = 'public' | 'unlisted' | 'direct';
 export type AmountVisibility = 'visible' | 'private';
+export type PrivateAmountMode = 'signer-input' | 'agent-provided';
 export type AssetKind = 'native' | 'erc20' | 'private-erc20';
 export type OrderKind = 'trade' | 'recurring';
 export type OrderRole = 'all' | 'maker' | 'recipient' | 'filler';
@@ -262,6 +263,7 @@ export type CreateTradeIntent = {
   access: OrderAccess;
   recipient: Address | null;
   amountVisibility: AmountVisibility;
+  privateAmountMode?: PrivateAmountMode;
   expiresAt: string | null;
   fillPolicy: FillPolicy;
   secretPolicy: SecretPolicy;
@@ -280,6 +282,7 @@ export type CreateRecurringIntent = {
   access: OrderAccess;
   recipient: Address | null;
   amountVisibility: AmountVisibility;
+  privateAmountMode?: PrivateAmountMode;
   secretPolicy: SecretPolicy;
 };
 
@@ -291,6 +294,7 @@ export type FillIntent = {
   inputAmount: DecimalString | null;
   minOutputAmount: DecimalString | null;
   recurringSide: 'buy' | 'sell' | null;
+  privateAmountMode?: PrivateAmountMode;
   secretPolicy: SecretPolicy;
 };
 
@@ -307,6 +311,7 @@ export type CounterIntent = {
   recipient: Address;
   access: 'direct';
   amountVisibility: AmountVisibility;
+  privateAmountMode?: PrivateAmountMode;
   secretPolicy: SecretPolicy;
 };
 
@@ -315,6 +320,7 @@ export type EditIntent = {
   orderType?: OrderClassificationV1;
   wallet: Address | null;
   order: SafeOrderSummary;
+  privateAmountMode?: PrivateAmountMode;
   changes: {
     offerAmount?: DecimalString;
     requestAmount?: DecimalString;
@@ -426,6 +432,10 @@ export type PlanPrivateArtifactValueSource =
   | 'trusted-order-visible-amount'
   | 'recurring-sell-base-liquidity'
   | 'recurring-buy-quote-liquidity'
+  | 'recurring-edit-add-base-liquidity'
+  | 'recurring-edit-add-quote-liquidity'
+  | 'recurring-edit-remove-base-liquidity'
+  | 'recurring-edit-remove-quote-liquidity'
   | 'signer-elicitation'
   | 'local-order-vault'
   | 'generated-local'
@@ -580,6 +590,7 @@ export type CreateTradeInput = {
   access?: OrderAccess;
   recipient?: string;
   amountVisibility?: AmountVisibility;
+  privateAmountMode?: PrivateAmountMode;
   expiresAt?: string | null;
   fillPolicy?: Partial<FillPolicy>;
 };
@@ -596,6 +607,7 @@ export type CreateRecurringInput = {
   access?: OrderAccess;
   recipient?: string;
   amountVisibility?: AmountVisibility;
+  privateAmountMode?: PrivateAmountMode;
 };
 
 export type FillInput = {
@@ -604,6 +616,7 @@ export type FillInput = {
   inputAmount?: DecimalString;
   minOutputAmount?: DecimalString;
   recurringSide?: 'buy' | 'sell';
+  privateAmountMode?: PrivateAmountMode;
 };
 
 export type CounterInput = {
@@ -612,12 +625,14 @@ export type CounterInput = {
   offerAmount?: DecimalString;
   requestAmount?: DecimalString;
   expiresAt?: string | null;
+  privateAmountMode?: PrivateAmountMode;
 };
 
 export type EditInput = {
   wallet?: string;
   order: OrderIdentityInput;
   changes?: EditIntent['changes'];
+  privateAmountMode?: PrivateAmountMode;
 };
 
 export type OrderUpdateInput = {
