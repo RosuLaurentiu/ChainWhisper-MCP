@@ -10,7 +10,14 @@ import {
   writeFile,
 } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { basename, dirname, isAbsolute, resolve, sep } from 'node:path';
+import {
+  basename,
+  dirname,
+  isAbsolute,
+  relative,
+  resolve,
+  sep,
+} from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 
@@ -39,9 +46,12 @@ const readCliOptions = () => {
 const isWithin = (parent, child) => {
   const resolvedParent = resolve(parent);
   const resolvedChild = resolve(child);
+  const relativePath = relative(resolvedParent, resolvedChild);
   return (
-    resolvedChild === resolvedParent ||
-    resolvedChild.startsWith(`${resolvedParent}${sep}`)
+    relativePath === '' ||
+    (!isAbsolute(relativePath) &&
+      relativePath !== '..' &&
+      !relativePath.startsWith(`..${sep}`))
   );
 };
 
@@ -265,9 +275,12 @@ try {
     'agent-tools',
   );
   await access(installedPackage);
+  const installedNodeModulesRealPath = await realpath(
+    resolve(consumerDirectory, 'node_modules'),
+  );
   const installedPackageRealPath = await realpath(installedPackage);
   assert.ok(
-    isWithin(resolve(consumerDirectory, 'node_modules'), installedPackageRealPath),
+    isWithin(installedNodeModulesRealPath, installedPackageRealPath),
     'npm linked the package from outside the isolated consumer.',
   );
 
