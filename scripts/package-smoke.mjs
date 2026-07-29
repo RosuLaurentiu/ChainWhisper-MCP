@@ -86,7 +86,20 @@ assert.equal(
   packageJson.bin?.['chainwhisper-coti-signer'],
   './dist/bin/chainwhisper-coti-signer.js',
 );
-assert.deepEqual(packageJson.files, ['dist', 'runtime', 'README.md']);
+assert.deepEqual(packageJson.files, [
+  'dist',
+  'runtime',
+  'README.md',
+  'CHANGELOG.md',
+  'SECURITY.md',
+  'LICENSE',
+]);
+assert.deepEqual(packageJson.scripts, {
+  'audit:runtime': 'node dist/bin/audit-runtime.js',
+  prepack: 'tsc -p tsconfig.json',
+  prepublishOnly:
+    'tsc -p tsconfig.json && vitest run test && node scripts/package-smoke.mjs && node scripts/package-tarball-smoke.mjs',
+});
 
 const plannerBinary = resolve(packageRoot, packageJson.bin['chainwhisper-mcp']);
 const signerBinary = resolve(
@@ -98,6 +111,9 @@ for (const path of [
   signerBinary,
   resolve(packageRoot, 'runtime/coti-mainnet.v1.json'),
   resolve(packageRoot, 'README.md'),
+  resolve(packageRoot, 'CHANGELOG.md'),
+  resolve(packageRoot, 'SECURITY.md'),
+  resolve(packageRoot, 'LICENSE'),
   ...Object.values(packageJson.exports).map((path) =>
     resolve(packageRoot, path),
   ),

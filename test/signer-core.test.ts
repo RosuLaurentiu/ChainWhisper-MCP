@@ -192,6 +192,8 @@ class TestWallet implements WalletTransport {
   pendingNonce = 4;
   receiptStatus: TransactionReceipt['status'] = 'success';
   throwAfterAccept = false;
+  throwPrepareOnce = false;
+  hideTransactions = false;
   readonly transactions = new Map<string, { hash: HexString; nonce: number }>();
   readonly prepared = new Map<string, { hash: HexString; nonce: number }>();
 
@@ -211,6 +213,10 @@ class TestWallet implements WalletTransport {
     request: TransactionRequest,
   ): Promise<{ hash: HexString; signedTransaction: HexString }> {
     this.prepareCount += 1;
+    if (this.throwPrepareOnce) {
+      this.throwPrepareOnce = false;
+      throw new Error('transaction preparation failed');
+    }
     const hash = `0x${(request.nonce + 1).toString(16).padStart(64, '0')}` as HexString;
     const signedTransaction = `0x${(request.nonce + 11)
       .toString(16)
@@ -233,12 +239,14 @@ class TestWallet implements WalletTransport {
   async getTransaction(
     hash: HexString,
   ): Promise<{ hash: HexString; nonce: number } | null> {
+    if (this.hideTransactions) return null;
     return this.transactions.get(hash) ?? null;
   }
 
   async findTransactionByNonce(
     nonce: number,
   ): Promise<{ hash: HexString; nonce: number } | null> {
+    if (this.hideTransactions) return null;
     return (
       [...this.transactions.values()].find(
         (transaction) => transaction.nonce === nonce,
@@ -249,6 +257,7 @@ class TestWallet implements WalletTransport {
   async getTransactionReceipt(
     hash: HexString,
   ): Promise<TransactionReceipt | null> {
+    if (this.hideTransactions) return null;
     return this.transactions.has(hash)
       ? {
           transactionHash: hash,
@@ -408,6 +417,159 @@ describe('local ChainWhisper signer core', () => {
     expect(wallet.broadcastCount).toBe(1);
   });
 
+  it('keeps a locally prepared hash in processing while RPC visibility is uncertain', async () => {
+    const setup = await createEngine({});
+    const operationId = 'uncertain-prepared-hash';
+    const transactionHash = `0x${'77'.repeat(32)}` as HexString;
+    await setup.journal.begin(operationId, REGISTRY_HASH);
+    await setup.journal.reserveNonce(operationId, 9, 0);
+    await setup.journal.recordPreparedTransaction(
+      operationId,
+      9,
+      transactionHash,
+      0,
+    );
+
+    await expect(
+      setup.engine.recoverOperation(operationId, REGISTRY_HASH),
+    ).resolves.toMatchObject({
+      status: 'processing',
+      transactionHashes: [transactionHash],
+    });
+    await expect(
+      setup.engine.recoverOperation(operationId, REGISTRY_HASH),
+    ).resolves.toMatchObject({ status: 'processing' });
+    expect(await setup.journal.get(operationId)).toMatchObject({
+      stage: 'prepared-broadcast',
+      nextStepIndex: 0,
+    });
+  });
+
+  it('retries a nonce-only state without adopting another wallet transaction', async () => {
+    const setup = await createEngine({});
+    const operationId = 'uncertain-reserved-nonce';
+    const unrelatedHash = `0x${'99'.repeat(32)}` as HexString;
+    setup.wallet.transactions.set(unrelatedHash, {
+      hash: unrelatedHash,
+      nonce: 9,
+    });
+    await setup.journal.begin(operationId, REGISTRY_HASH);
+    await setup.journal.reserveNonce(operationId, 9, 0);
+
+    await expect(
+      setup.engine.recoverOperation(operationId, REGISTRY_HASH),
+    ).resolves.toMatchObject({
+      status: 'retryable',
+      transactionHashes: [],
+    });
+    expect(await setup.journal.get(operationId)).toMatchObject({
+      stage: 'validated',
+      nextStepIndex: 0,
+      transactionHashes: [],
+    });
+  });
+
+  it('returns a nonce-only preparation failure to a safely retryable stage', async () => {
+    const wallet = new TestWallet();
+    wallet.throwPrepareOnce = true;
+    const setup = await createEngine({ wallet });
+    const envelope = createEnvelope('retry-preparation-failure');
+
+    await expect(setup.engine.executeAction(envelope)).resolves.toMatchObject({
+      status: 'retryable',
+      transactionHashes: [],
+    });
+    expect(await setup.journal.get(envelope.operationId)).toMatchObject({
+      stage: 'validated',
+      nonces: [],
+      transactionHashes: [],
+    });
+
+    await expect(setup.engine.executeAction(envelope)).resolves.toMatchObject({
+      status: 'completed',
+    });
+    expect(wallet.prepareCount).toBe(2);
+    expect(wallet.broadcastCount).toBe(1);
+    expect(setup.elicitor.requests).toHaveLength(2);
+  });
+
+  it('advances a prepared step when its receipt proves a successful broadcast', async () => {
+    const setup = await createEngine({});
+    const operationId = 'successful-prepared-write';
+    const transactionHash = `0x${'88'.repeat(32)}` as HexString;
+    setup.wallet.transactions.set(transactionHash, {
+      hash: transactionHash,
+      nonce: 9,
+    });
+    await setup.journal.begin(operationId, REGISTRY_HASH);
+    await setup.journal.reserveNonce(operationId, 9, 0);
+    await setup.journal.recordPreparedTransaction(
+      operationId,
+      9,
+      transactionHash,
+      0,
+    );
+
+    await expect(
+      setup.engine.recoverOperation(operationId, REGISTRY_HASH),
+    ).resolves.toMatchObject({
+      status: 'retryable',
+      transactionHashes: [transactionHash],
+    });
+    expect(await setup.journal.get(operationId)).toMatchObject({
+      stage: 'validated',
+      nextStepIndex: 1,
+      receipts: [
+        {
+          transactionHash,
+          status: 'success',
+          blockNumber: 20,
+        },
+      ],
+    });
+  });
+
+  it('advances from the latest successful retry without being blocked by an earlier revert', async () => {
+    const setup = await createEngine({});
+    const operationId = 'successful-retry-after-revert';
+    const revertedHash = `0x${'81'.repeat(32)}` as HexString;
+    const successfulHash = `0x${'82'.repeat(32)}` as HexString;
+    await setup.journal.begin(operationId, REGISTRY_HASH);
+    await setup.journal.recordPreparedTransaction(
+      operationId,
+      9,
+      revertedHash,
+      0,
+    );
+    await setup.journal.recordReceipt(operationId, {
+      transactionHash: revertedHash,
+      status: 'reverted',
+      blockNumber: 20,
+    });
+    await setup.journal.recordPreparedTransaction(
+      operationId,
+      10,
+      successfulHash,
+      0,
+    );
+    await setup.journal.recordReceipt(operationId, {
+      transactionHash: successfulHash,
+      status: 'success',
+      blockNumber: 21,
+    });
+
+    await expect(
+      setup.engine.recoverOperation(operationId, REGISTRY_HASH),
+    ).resolves.toMatchObject({
+      status: 'retryable',
+      transactionHashes: [revertedHash, successfulHash],
+    });
+    expect(await setup.journal.get(operationId)).toMatchObject({
+      stage: 'validated',
+      nextStepIndex: 1,
+    });
+  });
+
   it('recovers provider acceptance when the broadcast response is lost', async () => {
     const wallet = new TestWallet();
     wallet.throwAfterAccept = true;
@@ -420,6 +582,27 @@ describe('local ChainWhisper signer core', () => {
     expect((await setup.journal.get('lost-response'))?.stage).toBe(
       'completed',
     );
+  });
+
+  it('does not resubmit after a lost response when the prepared hash is not yet visible', async () => {
+    const wallet = new TestWallet();
+    wallet.throwAfterAccept = true;
+    wallet.hideTransactions = true;
+    const setup = await createEngine({ wallet });
+    const envelope = createEnvelope('lost-response-not-visible');
+
+    await expect(setup.engine.executeAction(envelope)).resolves.toMatchObject({
+      status: 'processing',
+    });
+    await expect(setup.engine.executeAction(envelope)).resolves.toMatchObject({
+      status: 'processing',
+    });
+    expect(wallet.prepareCount).toBe(1);
+    expect(wallet.broadcastCount).toBe(1);
+    expect(await setup.journal.get(envelope.operationId)).toMatchObject({
+      stage: 'broadcast',
+      transactionHashes: [expect.any(String)],
+    });
   });
 
   it('rejects a changed fee recipient and non-manifest selector even when re-signed', async () => {

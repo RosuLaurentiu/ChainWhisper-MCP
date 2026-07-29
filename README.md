@@ -18,13 +18,35 @@ wallet private key, COTI AES key, or an order access secret.
 
 The signer holds credentials configured outside the conversation. It rejects
 unpaired, expired, changed, unsimulated, or non-allowlisted plans. Every write
-requires MCP form elicitation. Clients without elicitation remain read-only.
-Private values are elicited directly into the signer process, committed to the
-paired envelope, and never returned to the planner.
+requires an exact signer-owned form confirmation through the configured MCP or
+local-web channel. Clients without a working confirmation channel remain
+read-only. Private values are elicited directly into the signer process,
+committed to the paired envelope, and never returned to the planner.
 
 Both processes share a locally generated pairing secret in the ChainWhisper
 state directory. The pairing secret is not a tool argument and is never returned
 to the model.
+
+## App flow and external-agent flow
+
+The ChainWhisper app and this package reach the same allowlisted contracts, but
+their interaction models are different:
+
+- In the app, the user chooses order terms in the ChainWhisper interface and
+  approves the resulting action through the app's wallet or ChainWhisper account
+  flow.
+- With an external agent, the user can choose the terms in conversation or
+  authorize the agent to draft or decide them. The keyless planner turns those
+  non-secret terms into an exact action envelope.
+- The local signer independently verifies that envelope, collects only the
+  confidential values that cannot enter the conversation, and presents the
+  exact order type, assets, amounts, fees, and transactions for confirmation.
+- The confirmation page is a signing boundary, not a second trading app. It
+  does not browse markets or silently change the order terms.
+
+An agent may research liquidity and make decisions within the authority the
+user gives it, but the public beta still requires a separate local confirmation
+for every on-chain write. No autonomous policy can bypass that confirmation.
 
 ## Installation
 
@@ -82,8 +104,11 @@ between that browser page and the local signer; they are not MCP tool arguments
 and are not returned to the agent. Every write still needs a separately checked
 and submitted confirmation. The listener closes after the response or timeout.
 
-`mcp` remains the default channel for clients that reliably surface MCP
-elicitation. Restart the signer MCP after changing channels. Run
+`local-web` is the public-beta default because MCP form responses are visible
+to the MCP host. The optional `mcp` channel can confirm non-confidential writes,
+but it never collects private amounts or access secrets; a workflow that needs
+those values must use `local-web`. Restart the signer MCP after changing
+channels. Run
 `chainwhisper_test_confirmation_form` before the first live write; the
 diagnostic cannot prepare, sign, or broadcast a transaction.
 
@@ -95,13 +120,21 @@ returned by official account onboarding/recovery, not a randomly generated
 32-byte secret. If the configured value is not a valid COTI account key, the
 signer starts with private transactions disabled. Use
 `chainwhisper_onboard_privacy`; it requires an exact form confirmation before
-the official SDK performs an on-chain onboarding write and stores the recovered
-AES key only in the encrypted signer vault.
+the signer uses the official COTI onboarding primitives for the on-chain write
+and stores the recovered AES key only in the encrypted signer vault. RSA
+recovery material and the exact signed transaction are encrypted before
+broadcast. If the RPC result is uncertain, retrying the tool reconciles or
+rebroadcasts only those same signed bytes; it never creates a replacement
+onboarding transaction automatically. If that exact transaction receives a
+definitive reverted receipt, the RSA recovery material is retained and the
+next attempt requires a fresh confirmation and pending nonce.
 
 The signer also accepts a local JSON file selected with
 `CHAINWHISPER_SIGNER_CONFIG_FILE`. Keep that file outside the repository and
-restrict it to the local user. The documented `CHAINWHISPER_SIGNER_*` names are
-preferred over generic wallet environment names.
+restrict it to the local user (`chmod 600` on POSIX systems). Symbolic links and
+group- or world-accessible signer configuration files are rejected. The
+documented `CHAINWHISPER_SIGNER_*` names are preferred over generic wallet
+environment names.
 
 Optional configuration:
 
@@ -117,14 +150,26 @@ Optional configuration:
 - `CHAINWHISPER_SIGNER_EXPIRY_SKEW_MS`
 
 The package creates the shared pairing file and state directory with restricted
-local permissions when they do not exist. If either MCP entry uses a custom
+local permissions when they do not exist. Existing POSIX state directories must
+be private to the user (`chmod 700`), and existing pairing files must use
+`chmod 600`; symbolic links are rejected. If either MCP entry uses a custom
 state directory or pairing file, configure the same location for both entries.
+
+Only one configured signer process may use a state directory at a time. The
+signer leaves an instance lock in place after an unclean termination and never
+guesses that it is stale. Confirm that no signer process is running before
+removing only `signer.instance.lock` from that exact state directory, then
+restart the signer.
 
 An unconfigured signer starts safely with only
 `chainwhisper_signer_status`. It reports `configuration-required` and exposes no
 write or messaging tools. Configure credentials outside the conversation and
 restart the MCP process to enable the full signer surface. A configured client
-without MCP form elicitation is still unable to write.
+without a working configured confirmation channel is still unable to write.
+
+After registration or any upgrade, restart both MCP connections and run
+`chainwhisper_status` and `chainwhisper_signer_status`. Those checks are
+read-only: they do not sign, broadcast, onboard privacy, or send a message.
 
 ## Keyless planner tools
 
@@ -149,12 +194,32 @@ liquidity was actually checked.
 Preparation tools return editable missing details instead of failing a useful
 draft. They do not sign, submit, or send a message.
 
-`chainwhisper_order_types` is the canonical decision catalog. It explains all
-10 one-off and recurring types by access model, terms visibility, liquidity or
+`chainwhisper_order_types` is the canonical decision catalog. It explains the
+ten one-off and recurring types by access model, terms visibility, liquidity or
 inventory visibility, and fill style. New create requests select an explicit
 `orderType`, and that same classification is returned in order summaries,
 signed into the action envelope, independently recomputed by the signer, and
 shown in every confirmation.
+
+The ten canonical types are:
+
+| Order type | Access | Terms and liquidity |
+| --- | --- | --- |
+| `one-off.standard-public` | Public listing | Public terms and visible amounts |
+| `one-off.unlisted` | Unlisted link | Encrypted exact terms revealed to an authorized participant |
+| `one-off.direct` | Fixed recipient | Encrypted exact terms revealed to the participants |
+| `one-off.private-liquidity.public` | Public listing | Public price terms with hidden private-token liquidity |
+| `one-off.private-liquidity.unlisted` | Unlisted link | Encrypted terms with hidden private-token liquidity |
+| `one-off.private-liquidity.direct` | Fixed recipient | Participant-bound terms with hidden private-token liquidity |
+| `recurring.public` | Public | Reusable buy and sell sides with visible inventory |
+| `recurring.direct` | Fixed recipient | Reusable buy and sell sides with visible inventory |
+| `recurring.private-liquidity.public` | Public | Private-token inventory hidden; public-token inventory visible |
+| `recurring.private-liquidity.direct` | Fixed recipient | Private-token inventory hidden; public-token inventory visible |
+
+There is no unlisted recurring product in ChainWhisper and therefore no
+`recurring.unlisted` or `recurring.private-liquidity.unlisted` MCP type. The MCP
+does not invent product variants that are absent from the app's canonical
+catalog.
 
 Recipient-bound Standard orders created before the canonical taxonomy are
 reported and confirmed as
@@ -212,11 +277,9 @@ recipe. The bridge ABI necessarily exposes the conversion amount in public
 calldata even when the input token is private. Legacy p.WISP recovery, arbitrary
 bridge addresses, arbitrary tokens, and arbitrary calldata are not exposed.
 
-Unlisted recurring orders remain intentionally unsupported. The deployed
-reusable fill ABI would reveal their reusable access secret in public calldata.
-Public or fixed-recipient recurring access remains available. Administrative
-methods, arbitrary calldata, and standalone wallet transfers cannot fall
-through the MCP surface.
+Recurring orders use public or fixed-recipient access. Administrative methods,
+arbitrary calldata, and standalone wallet transfers cannot fall through the MCP
+surface.
 
 ## Local signer and messaging tools
 
@@ -230,6 +293,8 @@ through the MCP surface.
 - `chainwhisper_recover_operation`
 - `chainwhisper_discard_operation`
 - `chainwhisper_send_order_message`
+- `chainwhisper_list_order_messages`
+- `chainwhisper_read_order_message`
 - An allowlisted read/list/send subset of the official COTI private-messaging
   SDK tools.
 
@@ -242,6 +307,17 @@ recipient, and exact order identity. The recipient explicitly reads that
 encrypted access message before filling. The signer then binds the secret to
 that wallet and order without returning it to either agent; conflicting
 operation, wallet, escrow, order, or secret bindings are rejected.
+The signer also verifies the official message id, recipient, sender, and live
+on-chain maker, then requires the secret to match the order's exact live
+`accessHash` commitment before persisting it. This makes
+`chainwhisper_read_order_message` a security-sensitive local state update even
+though it does not broadcast a transaction.
+
+The official messaging SDK does not expose the exact prepared transaction
+before every send. If a send becomes uncertain without returning a transaction
+hash, the operation remains fail-closed and `processing`; the signer never
+adopts another wallet transaction by nonce and never automatically resends the
+message.
 
 Private-term recovery and offboarding remain local signer operations. Raw
 private amounts, decrypted order terms, keys, and access secrets are never
@@ -269,8 +345,12 @@ token.
 If wallet token setup is missing, call
 `chainwhisper_enable_private_token` with a verified symbol or token address.
 That idempotent setup is an on-chain write and requires its own exact form
-confirmation. A missing escrow encryption address is a protocol deployment
-configuration issue; the signer rejects before approving the token.
+confirmation. A failure before a signed transaction hash is persisted is
+safely retryable. A definitive reverted setup can be attempted again only
+after a new confirmation, and setup is not marked complete until the token
+reports the expected wallet encryption address. A missing escrow encryption
+address is a protocol deployment configuration issue; the signer rejects
+before approving the token.
 
 The embedded messaging integration follows the official
 [COTI Private Messaging Quickstart](https://docs.coti.io/coti-documentation/private-messaging/quickstart#mcp-server)
@@ -315,11 +395,22 @@ cross-step values fail before confirmation, signing, or broadcast.
 External MCP writes pay ordinary COTI gas and the current ChainWhisper contract
 fee. They do not pay the in-app Trade Agent WISP request fee.
 
+Before an ordinary planned write is confirmed, the signer freezes the exact
+legacy or EIP-1559 fee quote and displays its maximum total COTI cost. A
+signer-wide 100 gwei per-gas and 12,000,000 gas-unit ceiling also covers
+official-SDK onboarding and private-message writes. Quotes above the ceiling,
+missing fee fields, or wallet-side changes fail before signing.
+
 The signer journal stores only operation hashes, stages, nonces, transaction
 hashes, receipts, and safe error codes. It does not store prompts, decrypted
 messages, private amounts, keys, or raw access secrets. Unlisted access secrets
 are kept only in the encrypted local vault and may be shared only through COTI
 encrypted messaging.
+
+Hash-bound prepared writes with an uncertain RPC outcome remain `processing`;
+retrying reconciles the same hash and never silently prepares a replacement
+transaction. Failures before a signed hash is persisted are safe to revalidate
+and retry.
 
 ## Repository verification
 
@@ -329,9 +420,10 @@ tool/resource surface and the signer's configuration-required status. It does
 not call a chain provider, sign, broadcast, or send a message.
 
 The tarball gate then creates the actual npm archive with lifecycle scripts
-disabled, checks its allowlisted contents, unpacks it into an isolated
-`node_modules` layout, and repeats the stdio smoke against both binaries from
-that packed copy. This gate is network-free; `build:mcp` must run first.
+disabled, checks its allowlisted contents, performs a real npm install in an
+external temporary consumer, and repeats the stdio smoke through both
+npm-created command shims. `build:mcp` must run first. The clean install may
+resolve package dependencies through the configured npm registry.
 
 ```sh
 npm run build:mcp
@@ -349,3 +441,26 @@ npm run audit:runtime --workspace @chainwhisper/agent-tools
 
 Live signing and private-message smoke tests are intentionally excluded. They
 require explicitly funded test wallets and separate authorization.
+
+## Publishing the beta
+
+The repository's `Publish ChainWhisper Agent Tools` workflow is the only
+documented release path. Before dispatching it:
+
+1. Confirm the `@chainwhisper` npm scope can publish the package.
+2. Create a protected GitHub Actions environment named `npm-beta`.
+3. Add an npm automation or granular access token as the environment secret
+   `NPM_TOKEN`. Never place the token in the repository, a workflow input, an
+   issue, or a conversation.
+4. Require an environment reviewer if the repository plan supports it.
+5. Dispatch the workflow with the exact prerelease version from `package.json`,
+   currently `0.1.0-beta.0`.
+
+The workflow rejects a version mismatch, a non-beta version, or an already
+published immutable version. It verifies the package and live runtime, produces
+one tarball, installs and shim-tests that exact archive, records its SHA-256
+checksum and CycloneDX SBOM as retained artifacts, then publishes the same
+tarball with the `beta` dist-tag and npm provenance.
+
+See [CHANGELOG.md](./CHANGELOG.md), [SECURITY.md](./SECURITY.md), and
+[LICENSE](./LICENSE) before publishing or deploying the package.

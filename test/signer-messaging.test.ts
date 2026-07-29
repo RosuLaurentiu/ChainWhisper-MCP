@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { describe, expect, it, vi } from 'vitest';
-import { encodeFunctionData, parseAbi } from 'viem';
+import { encodeFunctionData, keccak256, parseAbi } from 'viem';
 
 import type { SignedActionEnvelopeV1 } from '../src/shared/index.js';
 import {
@@ -24,6 +24,7 @@ import {
   type ConfirmationRequest,
   type FormElicitor,
   type HexString,
+  type OrderMakerReader,
   type PrivateValueElicitor,
   type SendOrderMessageInput,
   type TransactionReceipt,
@@ -50,8 +51,19 @@ const ACCESS_DATA = encodeFunctionData({
   args: [ZERO_BYTES32],
 });
 
+const orderAccessReader = (
+  secret: HexString,
+  maker: Address = WALLET,
+): OrderMakerReader => ({
+  readOrderAccess: async () => ({
+    maker,
+    accessHash: keccak256(secret),
+  }),
+});
+
 class MessagingWallet implements WalletTransport {
   receiptStatus: TransactionReceipt['status'] = 'success';
+  waitError: Error | null = null;
   readonly transactions = new Map<string, { hash: HexString; nonce: number }>();
   readonly #address: Address;
 
@@ -100,6 +112,7 @@ class MessagingWallet implements WalletTransport {
       : null;
   }
   async waitForTransaction(hash: HexString): Promise<TransactionReceipt> {
+    if (this.waitError) throw this.waitError;
     return { transactionHash: hash, status: this.receiptStatus };
   }
 }
@@ -123,6 +136,7 @@ const createBridge = async (
     input: Record<string, unknown>,
   ) => Promise<unknown>,
   walletAddress: Address = WALLET,
+  orderMakers: OrderMakerReader | null = null,
 ) => {
   const stateDirectory = await mkdtemp(join(tmpdir(), 'cw-message-'));
   const wallet = new MessagingWallet(walletAddress);
@@ -146,7 +160,30 @@ const createBridge = async (
       nonceQueue,
       journal,
       vault,
+      ...(orderMakers ? { orderMakers } : {}),
     }),
+  };
+};
+
+const officialReadResult = (input: {
+  id: string;
+  from?: Address;
+  to: Address;
+  plaintext: string;
+}): Record<string, unknown> => {
+  const ciphertext = { value: [] };
+  return {
+    message: {
+      id: input.id,
+      from: input.from ?? WALLET,
+      to: input.to,
+      timestamp: '1',
+      epoch: '1',
+      chunkCount: '1',
+      ciphertext,
+    },
+    chunks: [ciphertext],
+    plaintext: input.plaintext,
   };
 };
 
@@ -394,13 +431,26 @@ describe('embedded official COTI negotiation messaging', () => {
       gasCap: '8000000',
       counterparty: RECIPIENT,
       summary: `Share access for ChainWhisper order ${ESCROW}:9`,
-      expectedResult: `One encrypted COTI access message is sent to ${RECIPIENT} for the exact ChainWhisper order ${ESCROW}:9.`,
     });
+    expect(maker.elicitor.requests[0]?.expectedResult).toContain(
+      `One encrypted COTI access message is sent to ${RECIPIENT} for the exact ChainWhisper order ${ESCROW}:9.`,
+    );
+    expect(maker.elicitor.requests[0]?.expectedResult).not.toContain(
+      String(secret),
+    );
 
     let incomingPlaintext = sentPlaintext;
     const receiver = await createBridge(
-      async () => ({ plaintext: incomingPlaintext }),
+      async (toolName) =>
+        toolName === 'read_message'
+          ? officialReadResult({
+              id: '42',
+              to: RECIPIENT,
+              plaintext: incomingPlaintext,
+            })
+          : { plaintext: incomingPlaintext },
       RECIPIENT,
+      orderAccessReader(secret as HexString),
     );
     const listed = await receiver.bridge.listOrderNegotiations({
       account: RECIPIENT,
@@ -483,7 +533,7 @@ describe('embedded official COTI negotiation messaging', () => {
     ).rejects.toMatchObject({ code: 'UNSAFE_MESSAGE' });
     expect(
       await receiver.vault.get(
-        `${OPERATION_HASH}:received-access-secret`,
+        'message:42:received-access-secret',
       ),
     ).toBe(secret);
     const afterConflict = await createMaterializer(
@@ -515,46 +565,33 @@ describe('embedded official COTI negotiation messaging', () => {
         accessSecret: secondSecret,
       },
     } as const;
-    const setup = await createBridge(async (_toolName, input) => {
-      const messageId = String(input.messageId) as keyof typeof messages;
-      const message = messages[messageId];
-      if (!message) throw new Error('Unexpected message id.');
-      return {
-        plaintext: JSON.stringify({
+    const setup = await createBridge(
+      async (_toolName, input) => {
+        const messageId = String(input.messageId) as keyof typeof messages;
+        const message = messages[messageId];
+        if (!message) throw new Error('Unexpected message id.');
+        const plaintext = JSON.stringify({
           protocol: 'cw.otc/1',
           kind: 'access',
           messageId,
           createdAt: '2026-07-28T12:00:00.000Z',
           order: { escrowContract: ESCROW, localId: '9' },
           ...message,
-        }),
-      };
-    }, RECIPIENT);
+        });
+        return officialReadResult({
+          id: messageId,
+          to: RECIPIENT,
+          plaintext,
+        });
+      },
+      RECIPIENT,
+      orderAccessReader(firstSecret),
+    );
     const orderReference = orderAccessSecretReference(
       RECIPIENT,
       ESCROW,
       '9',
     );
-
-    // This barrier makes the old get-then-put implementation deterministically
-    // observe an absent binding in both reads before either write can proceed.
-    const originalGet = setup.vault.get.bind(setup.vault);
-    let concurrentOrderReads = 0;
-    let releaseOrderReads: () => void = () => undefined;
-    const bothOrderReads = new Promise<void>((resolve) => {
-      releaseOrderReads = resolve;
-    });
-    const getSpy = vi
-      .spyOn(setup.vault, 'get')
-      .mockImplementation(async (reference) => {
-        const value = await originalGet(reference);
-        if (reference === orderReference) {
-          concurrentOrderReads += 1;
-          if (concurrentOrderReads === 2) releaseOrderReads();
-          await bothOrderReads;
-        }
-        return value;
-      });
 
     const outcomes = await Promise.all(
       (['41', '42'] as const).map(async (messageId) => {
@@ -574,7 +611,6 @@ describe('embedded official COTI negotiation messaging', () => {
         }
       }),
     );
-    getSpy.mockRestore();
 
     const winners = outcomes.filter(
       (outcome) => outcome.status === 'fulfilled',
@@ -603,12 +639,12 @@ describe('embedded official COTI negotiation messaging', () => {
     });
     expect(
       await setup.vault.get(
-        `${winningMessage.operationHash}:received-access-secret`,
+        `message:${winner.messageId}:received-access-secret`,
       ),
     ).toBe(winningMessage.accessSecret);
     expect(
       await setup.vault.get(
-        `${losingMessage.operationHash}:received-access-secret`,
+        `message:${loser.messageId}:received-access-secret`,
       ),
     ).toBeNull();
 
@@ -636,6 +672,314 @@ describe('embedded official COTI negotiation messaging', () => {
     expect(encryptedVault).not.toContain(secondSecret);
   });
 
+  it('binds access only when the outer COTI message and live order maker prove provenance', async () => {
+    const secret = `0x${'de'.repeat(32)}` as HexString;
+    const plaintext = JSON.stringify({
+      protocol: 'cw.otc/1',
+      kind: 'access',
+      messageId: 'maker-proof',
+      createdAt: '2026-07-28T12:00:00.000Z',
+      order: { escrowContract: ESCROW, localId: '9' },
+      operationHash: OPERATION_HASH,
+      accessSecret: secret,
+    });
+    const readOrderAccess = vi.fn(async () => ({
+      maker: WALLET,
+      accessHash: keccak256(secret),
+    }));
+    const setup = await createBridge(
+      async () =>
+        officialReadResult({
+          id: '42',
+          to: RECIPIENT,
+          plaintext,
+        }),
+      RECIPIENT,
+      { readOrderAccess },
+    );
+
+    const result = await setup.bridge.readOrderNegotiation('42');
+    expect(JSON.stringify(result)).not.toContain(secret);
+    expect(readOrderAccess).toHaveBeenCalledWith({
+      escrowContract: ESCROW,
+      localId: '9',
+    });
+    const stored = await setup.vault.get(
+      orderAccessSecretReference(RECIPIENT, ESCROW, '9'),
+    );
+    expect(stored && decodeStoredAccessSecret(stored)?.secret).toBe(
+      secret,
+    );
+  });
+
+  it('rejects forged or incomplete access-message provenance without mutating the order vault', async () => {
+    const secret = `0x${'df'.repeat(32)}` as HexString;
+    const plaintext = JSON.stringify({
+      protocol: 'cw.otc/1',
+      kind: 'access',
+      messageId: 'forged-proof',
+      createdAt: '2026-07-28T12:00:00.000Z',
+      order: { escrowContract: ESCROW, localId: '9' },
+      operationHash: OPERATION_HASH,
+      accessSecret: secret,
+    });
+    const cases: Array<{
+      name: string;
+      result: Record<string, unknown>;
+      orderMakers: OrderMakerReader | null;
+      code: string;
+    }> = [
+      {
+        name: 'wrong outer message id',
+        result: officialReadResult({
+          id: '41',
+          to: RECIPIENT,
+          plaintext,
+        }),
+        orderMakers: orderAccessReader(secret),
+        code: 'UNSAFE_MESSAGE',
+      },
+      {
+        name: 'wrong outer recipient',
+        result: officialReadResult({
+          id: '42',
+          to: WALLET,
+          plaintext,
+        }),
+        orderMakers: orderAccessReader(secret),
+        code: 'UNSAFE_MESSAGE',
+      },
+      {
+        name: 'forged outer sender',
+        result: officialReadResult({
+          id: '42',
+          from: ESCROW,
+          to: RECIPIENT,
+          plaintext,
+        }),
+        orderMakers: orderAccessReader(secret),
+        code: 'UNSAFE_MESSAGE',
+      },
+      {
+        name: 'missing outer metadata',
+        result: { plaintext },
+        orderMakers: orderAccessReader(secret),
+        code: 'UNSAFE_MESSAGE',
+      },
+      {
+        name: 'maker reader unavailable',
+        result: officialReadResult({
+          id: '42',
+          to: RECIPIENT,
+          plaintext,
+        }),
+        orderMakers: null,
+        code: 'STALE_STATE',
+      },
+      {
+        name: 'secret does not match the live access commitment',
+        result: officialReadResult({
+          id: '42',
+          to: RECIPIENT,
+          plaintext,
+        }),
+        orderMakers: orderAccessReader(
+          `0x${'ee'.repeat(32)}` as HexString,
+        ),
+        code: 'UNSAFE_MESSAGE',
+      },
+    ];
+
+    for (const candidate of cases) {
+      const setup = await createBridge(
+        async () => candidate.result,
+        RECIPIENT,
+        candidate.orderMakers,
+      );
+      await expect(
+        setup.bridge.readOrderNegotiation('42'),
+        candidate.name,
+      ).rejects.toMatchObject({ code: candidate.code });
+      expect(
+        await setup.vault.get(
+          orderAccessSecretReference(RECIPIENT, ESCROW, '9'),
+        ),
+        candidate.name,
+      ).toBeNull();
+      expect(await setup.vault.get('message:42:received-access-secret'))
+        .toBeNull();
+    }
+  });
+
+  it('keeps a plain untrusted read usable without provenance or vault mutation', async () => {
+    const plaintext = JSON.stringify({
+      protocol: 'cw.otc/1',
+      kind: 'proposal',
+      messageId: 'plain-proposal',
+      createdAt: '2026-07-28T12:00:00.000Z',
+      order: { escrowContract: ESCROW, localId: '9' },
+      body: { note: 'Review this proposal.' },
+    });
+    const setup = await createBridge(
+      async () => ({ plaintext }),
+      RECIPIENT,
+      null,
+    );
+
+    const result = await setup.bridge.readOrderNegotiation('42');
+    expect(result).toMatchObject({
+      trust: 'untrusted',
+      mayDraft: true,
+      mayExecute: false,
+    });
+    expect(await setup.vault.get(
+      orderAccessSecretReference(RECIPIENT, ESCROW, '9'),
+    )).toBeNull();
+  });
+
+  it('never re-sends or adopts an unrelated transaction after an official SDK send becomes uncertain', async () => {
+    let sends = 0;
+    const setup = await createBridge(async (toolName) => {
+      if (toolName === 'send_private_agent_message') {
+        sends += 1;
+        throw new Error('RPC disconnected after accepting the send');
+      }
+      return {};
+    });
+    const input: SendOrderMessageInput = {
+      to: RECIPIENT,
+      kind: 'status',
+      messageId: 'uncertain-send',
+      body: { status: 'reviewing' },
+    };
+
+    const first = await setup.bridge.sendOrderMessage(input);
+    setup.wallet.transactions.set(TX_HASH, {
+      hash: TX_HASH,
+      nonce: 8,
+    });
+    const second = await setup.bridge.sendOrderMessage(input);
+    expect(first).toMatchObject({
+      status: 'processing',
+      errorCode: 'MESSAGE_BROADCAST_UNCERTAIN',
+    });
+    expect(second).toMatchObject({
+      status: 'processing',
+      errorCode: 'MESSAGE_BROADCAST_UNCERTAIN',
+    });
+    expect(sends).toBe(1);
+    expect(setup.elicitor.requests).toHaveLength(1);
+    expect(
+      await setup.journal.get(
+        `message-${setup.elicitor.requests[0]!.operationHash.slice(2, 18)}`,
+      ),
+    ).toMatchObject({
+      stage: 'awaiting-broadcast',
+      nonces: [8],
+      transactionHashes: [],
+    });
+  });
+
+  it('never re-sends a missing-hash or temporarily invisible recorded send', async () => {
+    for (const result of [{}, { transactionHash: TX_HASH }]) {
+      let sends = 0;
+      const setup = await createBridge(async () => {
+        sends += 1;
+        return result;
+      });
+      if ('transactionHash' in result) {
+        setup.wallet.waitError = new Error('receipt temporarily unavailable');
+      }
+      const input: SendOrderMessageInput = {
+        to: RECIPIENT,
+        kind: 'status',
+        messageId:
+          'transactionHash' in result ? 'invisible-hash' : 'missing-hash',
+        body: { status: 'reviewing' },
+      };
+
+      expect(await setup.bridge.sendOrderMessage(input)).toMatchObject({
+        status: 'processing',
+        errorCode: 'MESSAGE_BROADCAST_UNCERTAIN',
+      });
+      expect(await setup.bridge.sendOrderMessage(input)).toMatchObject({
+        status: 'processing',
+        errorCode: 'MESSAGE_BROADCAST_UNCERTAIN',
+      });
+      expect(sends).toBe(1);
+      expect(setup.elicitor.requests).toHaveLength(1);
+    }
+  });
+
+  it('bounds outbound plaintext and hostile provider result traversal', async () => {
+    let sends = 0;
+    const outbound = await createBridge(async () => {
+      sends += 1;
+      return { transactionHash: TX_HASH };
+    });
+    await expect(
+      outbound.bridge.invokeTool('send_private_agent_message', {
+        to: RECIPIENT,
+        plaintext: 'x'.repeat(16 * 1_024 + 1),
+      }),
+    ).rejects.toMatchObject({ code: 'UNSAFE_MESSAGE' });
+    expect(sends).toBe(0);
+
+    let deep: unknown = { plaintext: 'safe' };
+    for (let index = 0; index < 30; index += 1) {
+      deep = { nested: deep };
+    }
+    const deepResult = await createBridge(async () => deep);
+    await expect(
+      deepResult.bridge.listOrderNegotiations({ account: RECIPIENT }),
+    ).rejects.toMatchObject({ code: 'UNSAFE_MESSAGE' });
+
+    const hugeResult = await createBridge(async () => ({
+      plaintext: 'x'.repeat(64 * 1_024 + 1),
+    }));
+    await expect(
+      hugeResult.bridge.listOrderNegotiations({ account: RECIPIENT }),
+    ).rejects.toMatchObject({ code: 'UNSAFE_MESSAGE' });
+
+    const tooManyCandidates = Object.fromEntries(
+      Array.from({ length: 33 }, (_, index) => [
+        `candidate-${index}`,
+        `0x${index.toString(16).padStart(64, '0')}`,
+      ]),
+    );
+    const candidateResult = await createBridge(
+      async () => tooManyCandidates,
+    );
+    await expect(
+      candidateResult.bridge.listOrderNegotiations({
+        account: RECIPIENT,
+      }),
+    ).rejects.toMatchObject({ code: 'UNSAFE_MESSAGE' });
+  });
+
+  it('shows a bounded raw-message preview and content hash before sending', async () => {
+    const setup = await createBridge(async () => ({
+      transactionHash: TX_HASH,
+    }));
+    await setup.bridge.invokeTool('send_private_agent_message', {
+      to: RECIPIENT,
+      plaintext: 'Review ChainWhisper order 9 before accepting.',
+    });
+
+    expect(setup.elicitor.requests[0]).toMatchObject({
+      counterparty: RECIPIENT,
+    });
+    expect(setup.elicitor.requests[0]?.summary).toContain(
+      'Review ChainWhisper order 9 before accepting.',
+    );
+    expect(setup.elicitor.requests[0]?.expectedResult).toContain(
+      'Content preview: "Review ChainWhisper order 9 before accepting."',
+    );
+    expect(setup.elicitor.requests[0]?.expectedResult).toMatch(
+      /Plaintext SHA-256: 0x[0-9a-f]{64}/u,
+    );
+  });
+
   it('keeps a pending private-message transaction in processing', async () => {
     const setup = await createBridge(async () => {
       return { transactionHash: TX_HASH };
@@ -655,8 +999,7 @@ describe('embedded official COTI negotiation messaging', () => {
 
   it('marks prompt-injected cw.otc/1 content untrusted and scrubs nested secret material', async () => {
     const secret = `0x${'cd'.repeat(32)}`;
-    const setup = await createBridge(async () => ({
-      plaintext: JSON.stringify({
+    const plaintext = JSON.stringify({
         protocol: 'cw.otc/1',
         kind: 'access',
         messageId: '42',
@@ -668,8 +1011,17 @@ describe('embedded official COTI negotiation messaging', () => {
           rawSecret: secret,
         },
         accessSecret: secret,
-      }),
-    }));
+      });
+    const setup = await createBridge(
+      async () =>
+        officialReadResult({
+          id: '42',
+          to: RECIPIENT,
+          plaintext,
+        }),
+      RECIPIENT,
+      orderAccessReader(secret as HexString),
+    );
     const result = await setup.bridge.readOrderNegotiation('42');
     expect(result).toMatchObject({
       trust: 'untrusted',
@@ -677,17 +1029,12 @@ describe('embedded official COTI negotiation messaging', () => {
       mayExecute: false,
     });
     expect(JSON.stringify(result)).not.toContain(secret);
-    expect(
-      await setup.vault.getAccessSecret(
-        `${OPERATION_HASH}:received-access-secret`,
-        {
-          operationHash: OPERATION_HASH,
-          recipient: RECIPIENT,
-          escrowContract: ESCROW,
-          localId: '9',
-        },
-      ),
-    ).toBeNull();
+    const stored = await setup.vault.get(
+      orderAccessSecretReference(RECIPIENT, ESCROW, '9'),
+    );
+    expect(stored && decodeStoredAccessSecret(stored)?.secret).toBe(
+      secret,
+    );
   });
 
   it('deep-scrubs an access secret aliased through every MCP-visible identifier and nested result channel', async () => {

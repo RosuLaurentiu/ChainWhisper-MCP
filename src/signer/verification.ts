@@ -793,6 +793,121 @@ const assertSupportedPrivateArtifacts = (
         );
       }
     }
+    const signedAccess =
+      envelope.intent.orderType?.access ?? envelope.intent.accessMode;
+    if (
+      [
+        'direct-order-v1',
+        'direct-edit-v1',
+        'private-liquidity-v1',
+        'private-liquidity-edit-v1',
+      ].includes(group.recipe) &&
+      group.context?.access !== signedAccess
+    ) {
+      throw new SignerError(
+        'ENVELOPE_TAMPERED',
+        'The private artifact access context does not match the signed order type.',
+      );
+    }
+    const expectedOutputs = new Set(allowedOutputs[signature]);
+    const discardOutputs = (...keys: string[]): void => {
+      for (const key of keys) expectedOutputs.delete(key);
+    };
+    const sellIsPrivate =
+      envelope.intent.sellAsset?.kind === 'private-erc20';
+    const buyIsPrivate =
+      envelope.intent.buyAsset?.kind === 'private-erc20';
+    if (
+      signature ===
+      'createDirectTrade((uint8,address),(uint8,address),(uint256,uint256),((uint256,uint256),bytes),((uint256,uint256),bytes),address,uint64,bytes32,bytes32,((uint256,uint256),bytes),bytes)'
+    ) {
+      if (!sellIsPrivate) discardOutputs('itUint256:/arguments/3');
+      if (!buyIsPrivate) discardOutputs('itUint256:/arguments/4');
+    } else if (
+      signature ===
+        'createDirectCounterTrade(uint256,(uint8,address),(uint8,address),(uint256,uint256),((uint256,uint256),bytes),((uint256,uint256),bytes),uint64,bytes32,bytes32,((uint256,uint256),bytes),bytes)' ||
+      signature ===
+        'counterTradeAndCloseCounteredTrade(uint256,(uint8,address),(uint8,address),(uint256,uint256),((uint256,uint256),bytes),((uint256,uint256),bytes),uint64,bytes32,bytes32,((uint256,uint256),bytes),bytes)' ||
+      signature ===
+        'editDirectTrade(uint256,(uint8,address),(uint8,address),(uint256,uint256),((uint256,uint256),bytes),((uint256,uint256),bytes),address,uint64,bytes32,bytes32,((uint256,uint256),bytes),bytes)'
+    ) {
+      if (!sellIsPrivate) discardOutputs('itUint256:/arguments/4');
+      if (!buyIsPrivate) discardOutputs('itUint256:/arguments/5');
+    } else if (
+      signature ===
+      'createDirectCounterTradeForParent(address,uint256,address,(uint8,address),(uint8,address),(uint256,uint256),((uint256,uint256),bytes),((uint256,uint256),bytes),uint64,bytes32,bytes32,((uint256,uint256),bytes),bytes)'
+    ) {
+      if (!sellIsPrivate) discardOutputs('itUint256:/arguments/6');
+      if (!buyIsPrivate) discardOutputs('itUint256:/arguments/7');
+    } else if (
+      signature ===
+      'createPrivateOrderWithRecoveryNote((uint8,address,uint256),(uint8,address,uint256),address,uint64,bool,bytes32,bytes32,((uint256,uint256),bytes),((uint256,uint256),bytes),((uint256,uint256),bytes),bytes,((uint256,uint256),bytes),bytes)'
+    ) {
+      if (signedAccess === 'unlisted') {
+        discardOutputs(
+          'uint256:/arguments/0/2',
+          'uint256:/arguments/1/2',
+        );
+      } else {
+        discardOutputs(
+          'keccak256:/arguments/5',
+          'terms-hash-v1:/arguments/6',
+          'itUint256:/arguments/8',
+          'itUint256:/arguments/9',
+          'itUint256:/arguments/11',
+          'direct-terms-v1:/arguments/12',
+        );
+      }
+    } else if (
+      signature ===
+      'cancelAndReplacePrivateOrderWithRecoveryNote(uint256,(uint8,address,uint256),(uint8,address,uint256),address,uint64,bool,bytes32,bytes32,((uint256,uint256),bytes),((uint256,uint256),bytes),((uint256,uint256),bytes),bytes,((uint256,uint256),bytes),bytes)'
+    ) {
+      if (signedAccess === 'unlisted') {
+        discardOutputs(
+          'uint256:/arguments/1/2',
+          'uint256:/arguments/2/2',
+        );
+      } else {
+        discardOutputs(
+          'keccak256:/arguments/6',
+          'terms-hash-v1:/arguments/7',
+          'itUint256:/arguments/9',
+          'itUint256:/arguments/10',
+          'itUint256:/arguments/12',
+          'direct-terms-v1:/arguments/13',
+        );
+      }
+    } else if (
+      signature ===
+      'editOrder(uint256,(uint256,uint256),(uint256,uint256),uint256,uint256,((uint256,uint256),bytes),((uint256,uint256),bytes),uint256,uint256,((uint256,uint256),bytes),((uint256,uint256),bytes))'
+    ) {
+      if (!sellIsPrivate) {
+        discardOutputs(
+          'itUint256:/arguments/5',
+          'itUint256:/arguments/9',
+        );
+      }
+      if (!buyIsPrivate) {
+        discardOutputs(
+          'itUint256:/arguments/6',
+          'itUint256:/arguments/10',
+        );
+      }
+    }
+    const actualOutputs = new Set(
+      group.outputs.map(
+        (output) => `${output.kind}:${output.jsonPointer}`,
+      ),
+    );
+    if (
+      actualOutputs.size !== expectedOutputs.size ||
+      [...expectedOutputs].some((key) => !actualOutputs.has(key))
+    ) {
+      throw new SignerError(
+        'ENVELOPE_INVALID',
+        'A committed private artifact recipe is incomplete for its signed call.',
+      );
+    }
     for (const value of group.values) {
       const {
         commitment: _valueCommitment,

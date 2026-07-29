@@ -28,6 +28,7 @@ import {
   OperationJournal,
   PrivacyOnboardingService,
   PrivateTokenAccountService,
+  RpcAllowlistedOrderMakerReader,
   RpcStandardOrderFactsReader,
   SignerEngine,
   StrictMaterializedIntentValidator,
@@ -36,10 +37,12 @@ import {
   createOfficialMessagingInvoker,
   createSignerTools,
   buildPublicSignerStatus,
+  acquireSignerInstanceLock,
   loadSignerConfig,
   SignerError,
   LocalWebFormElicitor,
   type Address,
+  type LoadedSignerConfig,
 } from '../signer/index.js';
 
 const createConfigurationRequiredServer = () => {
@@ -88,6 +91,19 @@ const main = async (): Promise<void> => {
     }
     throw error;
   }
+  const instanceLock = await acquireSignerInstanceLock(
+    config.stateDirectory,
+  );
+  try {
+    await runConfiguredSigner(config);
+  } finally {
+    await instanceLock.release();
+  }
+};
+
+const runConfiguredSigner = async (
+  config: LoadedSignerConfig,
+): Promise<void> => {
   const manifest = await loadRuntimeManifest();
   const rpc = new HttpJsonRpcReader(config.rpcUrl);
   const feeReader = new ContractRuntimeFeeReader({
@@ -183,6 +199,10 @@ const main = async (): Promise<void> => {
   const messaging = new ChainWhisperMessagingBridge({
     invoke: createOfficialMessagingInvoker(runtime.messagingClient),
     wallet: runtime.transport,
+    orderMakers: new RpcAllowlistedOrderMakerReader({
+      rpc,
+      manifest,
+    }),
     messagingContract: getDefaultPrivateMessagingContractAddress(
       'mainnet',
     ) as Address,

@@ -94,6 +94,10 @@ export type ConfirmationRequest = {
   orderTypeLabel?: string | null;
   assets: string[];
   amounts: string[];
+  details?: Array<{
+    label: string;
+    value: string;
+  }>;
   counterparty: Address | null;
   spender?: Address | null;
   fee: string;
@@ -172,6 +176,14 @@ export type TransactionReceipt = {
   blockNumber?: number;
 };
 
+export type TransactionFeeQuote = {
+  model: 'eip1559' | 'legacy';
+  maximumNetworkFeeWei: string;
+  maximumNetworkFeeCoti: string;
+  maximumFeePerGasWei: string;
+  maximumPriorityFeePerGasWei?: string;
+};
+
 export interface WalletTransport {
   getAddress(): Promise<Address>;
   getChainId(): Promise<number>;
@@ -196,7 +208,10 @@ export interface TransactionSimulator {
   simulate(
     request: Omit<TransactionRequest, 'nonce'>,
     wallet: Address,
-  ): Promise<{ ok: true } | { ok: false; errorCode: string }>;
+  ): Promise<
+    | { ok: true; feeQuote?: TransactionFeeQuote }
+    | { ok: false; errorCode: string }
+  >;
 }
 
 export interface MaterializedIntentValidator {

@@ -7,6 +7,7 @@ import {
   type McpToolName,
   type PrivateMessagingClient,
 } from '@coti-io/coti-sdk-private-messaging';
+import { keccak256 } from 'viem';
 
 import {
   canonicalize,
@@ -17,9 +18,11 @@ import {
   type HexString,
 } from '../shared/index.js';
 import { ConfirmationGate } from './confirmation.js';
+import { maximumNetworkFeeDisplay } from './cotiRuntime.js';
 import { SignerError } from './errors.js';
 import { OperationJournal } from './journal.js';
 import { NonceQueue } from './nonceQueue.js';
+import type { OrderMakerReader } from './orderMaker.js';
 import {
   ORDER_ACCESS_SECRET_ID,
   decodeStoredAccessSecret,
@@ -73,6 +76,153 @@ const SAFE_NEGOTIATION_MESSAGE_ID_PATTERN =
 const SENSITIVE_MESSAGE_VALUE = '[sensitive message withheld]' as const;
 const sensitiveMessageKey = (index: number): string =>
   `[sensitive-key-${index}-withheld]`;
+const MAX_OUTBOUND_PLAINTEXT_BYTES = 16 * 1_024;
+const MAX_INBOUND_RESULT_STRING_BYTES = 64 * 1_024;
+const MAX_INBOUND_RESULT_TOTAL_STRING_BYTES = 512 * 1_024;
+const MAX_INBOUND_RESULT_NODES = 20_000;
+const MAX_TRAVERSAL_DEPTH = 16;
+const MAX_RAW_SECRET_CANDIDATES = 32;
+const MAX_OUTBOUND_VAULT_SECRET_CANDIDATES = 2;
+const MAX_CACHED_SECRET_CANDIDATES = 256;
+const MAX_CONFIRMATION_PREVIEW_CHARACTERS = 240;
+const MAX_UINT256 = (1n << 256n) - 1n;
+
+type TreeLimits = {
+  maxDepth: number;
+  maxNodes: number;
+  maxStringBytes: number;
+  maxTotalStringBytes: number;
+};
+
+const INBOUND_TREE_LIMITS: TreeLimits = {
+  maxDepth: MAX_TRAVERSAL_DEPTH,
+  maxNodes: MAX_INBOUND_RESULT_NODES,
+  maxStringBytes: MAX_INBOUND_RESULT_STRING_BYTES,
+  maxTotalStringBytes: MAX_INBOUND_RESULT_TOTAL_STRING_BYTES,
+};
+
+const OUTBOUND_TREE_LIMITS: TreeLimits = {
+  maxDepth: 6,
+  maxNodes: 128,
+  maxStringBytes: MAX_OUTBOUND_PLAINTEXT_BYTES,
+  maxTotalStringBytes: MAX_OUTBOUND_PLAINTEXT_BYTES * 2,
+};
+
+const unsafeMessageLimit = (): never => {
+  throw new SignerError(
+    'UNSAFE_MESSAGE',
+    'Private message content exceeds the signer safety limits.',
+  );
+};
+
+const assertBoundedTree = (
+  root: unknown,
+  limits: TreeLimits,
+): void => {
+  const pending: Array<{
+    value: unknown;
+    depth: number;
+    leaving?: boolean;
+  }> = [
+    { value: root, depth: 0 },
+  ];
+  const seen = new WeakSet<object>();
+  const active = new WeakSet<object>();
+  let nodes = 0;
+  let stringBytes = 0;
+
+  while (pending.length) {
+    const current = pending.pop();
+    if (!current) break;
+    if (
+      current.leaving &&
+      current.value &&
+      typeof current.value === 'object'
+    ) {
+      active.delete(current.value);
+      continue;
+    }
+    nodes += 1;
+    if (nodes > limits.maxNodes || current.depth > limits.maxDepth) {
+      unsafeMessageLimit();
+    }
+    if (typeof current.value === 'string') {
+      const bytes = Buffer.byteLength(current.value, 'utf8');
+      stringBytes += bytes;
+      if (
+        bytes > limits.maxStringBytes ||
+        stringBytes > limits.maxTotalStringBytes
+      ) {
+        unsafeMessageLimit();
+      }
+      continue;
+    }
+    if (!current.value || typeof current.value !== 'object') continue;
+    if (active.has(current.value)) unsafeMessageLimit();
+    if (seen.has(current.value)) continue;
+    seen.add(current.value);
+    active.add(current.value);
+    pending.push({
+      value: current.value,
+      depth: current.depth,
+      leaving: true,
+    });
+
+    const keys = Array.isArray(current.value)
+      ? (() => {
+          if (current.value.length > limits.maxNodes - nodes) {
+            unsafeMessageLimit();
+          }
+          return current.value.map((_, index) => String(index));
+        })()
+      : Object.keys(current.value as Record<string, unknown>);
+    if (keys.length > limits.maxNodes - nodes) unsafeMessageLimit();
+    for (const key of keys) {
+      const value = Array.isArray(current.value)
+        ? current.value[Number(key)]
+        : (current.value as Record<string, unknown>)[key];
+      const keyBytes = Buffer.byteLength(key, 'utf8');
+      stringBytes += keyBytes;
+      if (
+        keyBytes > limits.maxStringBytes ||
+        stringBytes > limits.maxTotalStringBytes
+      ) {
+        unsafeMessageLimit();
+      }
+      pending.push({ value, depth: current.depth + 1 });
+    }
+  }
+};
+
+const isCanonicalUint256 = (value: string): boolean => {
+  if (!/^(?:0|[1-9][0-9]{0,77})$/u.test(value)) return false;
+  return BigInt(value) <= MAX_UINT256;
+};
+
+const canonicalMessageId = (value: unknown): string | null => {
+  if (typeof value === 'bigint') {
+    const normalized = value.toString();
+    return isCanonicalUint256(normalized) ? normalized : null;
+  }
+  if (
+    typeof value === 'number' &&
+    Number.isSafeInteger(value) &&
+    value >= 0
+  ) {
+    return String(value);
+  }
+  return typeof value === 'string' && isCanonicalUint256(value)
+    ? value
+    : null;
+};
+
+const addRawSecretCandidate = (
+  output: Set<string>,
+  candidate: string,
+): void => {
+  output.add(candidate.toLowerCase());
+  if (output.size > MAX_RAW_SECRET_CANDIDATES) unsafeMessageLimit();
+};
 
 const normalizeMessageKey = (key: string): string =>
   key.toLowerCase().replace(/[^a-z0-9]/gu, '');
@@ -94,6 +244,12 @@ const transactionHashFromResult = (value: unknown): HexString | null => {
 const parseJsonContainer = (value: string): unknown | null => {
   const trimmed = value.trim();
   if (
+    Buffer.byteLength(trimmed, 'utf8') >
+    MAX_INBOUND_RESULT_STRING_BYTES
+  ) {
+    unsafeMessageLimit();
+  }
+  if (
     !(
       (trimmed.startsWith('{') && trimmed.endsWith('}')) ||
       (trimmed.startsWith('[') && trimmed.endsWith(']'))
@@ -101,34 +257,43 @@ const parseJsonContainer = (value: string): unknown | null => {
   ) {
     return null;
   }
+  let parsed: unknown;
   try {
-    return JSON.parse(trimmed) as unknown;
+    parsed = JSON.parse(trimmed) as unknown;
   } catch {
     return null;
   }
+  assertBoundedTree(parsed, INBOUND_TREE_LIMITS);
+  return parsed;
 };
 
 const collectRaw32ByteValues = (
   value: unknown,
   output = new Set<string>(),
+  depth = 0,
 ): Set<string> => {
+  if (depth > MAX_TRAVERSAL_DEPTH) unsafeMessageLimit();
   if (typeof value === 'string') {
     for (const match of value.matchAll(RAW_32_BYTE_HEX_GLOBAL_PATTERN)) {
-      output.add(match[0].toLowerCase());
+      addRawSecretCandidate(output, match[0]);
     }
     const parsed = parseJsonContainer(value);
-    if (parsed !== null) collectRaw32ByteValues(parsed, output);
+    if (parsed !== null) {
+      collectRaw32ByteValues(parsed, output, depth + 1);
+    }
     return output;
   }
   if (Array.isArray(value)) {
-    for (const entry of value) collectRaw32ByteValues(entry, output);
+    for (const entry of value) {
+      collectRaw32ByteValues(entry, output, depth + 1);
+    }
     return output;
   }
   const record = asRecord(value);
   if (record) {
     for (const [key, entry] of Object.entries(record)) {
-      collectRaw32ByteValues(key, output);
-      collectRaw32ByteValues(entry, output);
+      collectRaw32ByteValues(key, output, depth + 1);
+      collectRaw32ByteValues(entry, output, depth + 1);
     }
   }
   return output;
@@ -137,23 +302,29 @@ const collectRaw32ByteValues = (
 const collectExplicitAccessSecrets = (
   value: unknown,
   output = new Set<string>(),
+  depth = 0,
 ): Set<string> => {
+  if (depth > MAX_TRAVERSAL_DEPTH) unsafeMessageLimit();
   if (typeof value === 'string') {
     const parsed = parseJsonContainer(value);
-    if (parsed !== null) collectExplicitAccessSecrets(parsed, output);
+    if (parsed !== null) {
+      collectExplicitAccessSecrets(parsed, output, depth + 1);
+    }
     return output;
   }
   if (Array.isArray(value)) {
-    for (const entry of value) collectExplicitAccessSecrets(entry, output);
+    for (const entry of value) {
+      collectExplicitAccessSecrets(entry, output, depth + 1);
+    }
     return output;
   }
   const record = asRecord(value);
   if (!record) return output;
   for (const [key, entry] of Object.entries(record)) {
     if (isExplicitAccessSecretKey(key)) {
-      collectRaw32ByteValues(entry, output);
+      collectRaw32ByteValues(entry, output, depth + 1);
     }
-    collectExplicitAccessSecrets(entry, output);
+    collectExplicitAccessSecrets(entry, output, depth + 1);
   }
   return output;
 };
@@ -246,7 +417,7 @@ const parseNegotiation = (
     orderRecord &&
     (!isHexAddress(orderRecord.escrowContract) ||
       typeof orderRecord.localId !== 'string' ||
-      !/^(?:0|[1-9][0-9]*)$/u.test(orderRecord.localId))
+      !isCanonicalUint256(orderRecord.localId))
   ) {
     return null;
   }
@@ -300,7 +471,8 @@ const scrubPlainMessageValue = (
       (isExplicitAccessSecretKey(key) ||
         containsAccessSecretAlias(key, accessSecrets))) ||
     (typeof value === 'string' &&
-      containsAccessSecretAlias(value, accessSecrets)) ||
+      (containsAccessSecretAlias(value, accessSecrets) ||
+        RAW_32_BYTE_HEX_PATTERN.test(value))) ||
     containsSensitiveMaterial(value)
   ) {
     return SENSITIVE_MESSAGE_VALUE;
@@ -316,7 +488,8 @@ const scrubPlainMessageValue = (
     Object.entries(record).map(([entryKey, entry], index) => {
       const safeKey =
         isExplicitAccessSecretKey(entryKey) ||
-        containsAccessSecretAlias(entryKey, accessSecrets)
+        containsAccessSecretAlias(entryKey, accessSecrets) ||
+        RAW_32_BYTE_HEX_PATTERN.test(entryKey)
         ? sensitiveMessageKey(index)
         : entryKey;
       return [
@@ -362,6 +535,36 @@ const scrubNegotiationBody = (
       ];
     }),
   );
+};
+
+const safeConfirmationPreview = (
+  plaintext: string,
+  accessSecrets: ReadonlySet<string>,
+): string => {
+  const parsed = parseJsonContainer(plaintext);
+  const scrubbed =
+    parsed === null
+      ? scrubAccessSecretAliases(plaintext, accessSecrets)
+      : scrubAccessSecretAliases(parsed, accessSecrets);
+  const text =
+    typeof scrubbed === 'string'
+      ? scrubbed
+      : JSON.stringify(scrubbed);
+  const printable = [...text]
+    .map((character) => {
+      const codePoint = character.codePointAt(0) ?? 0;
+      return codePoint <= 31 || codePoint === 127 ? ' ' : character;
+    })
+    .join('');
+  const normalized = printable
+    .replace(/\s+/gu, ' ')
+    .trim();
+  const characters = [...normalized];
+  return characters.length <= MAX_CONFIRMATION_PREVIEW_CHARACTERS
+    ? normalized
+    : `${characters
+        .slice(0, MAX_CONFIRMATION_PREVIEW_CHARACTERS)
+        .join('')}…`;
 };
 
 export type SendOrderMessageInput = {
@@ -459,6 +662,8 @@ export class ChainWhisperMessagingBridge {
   readonly #nonceQueue: NonceQueue;
   readonly #journal: OperationJournal;
   readonly #vault: EncryptedSecretVault;
+  readonly #orderMakers: OrderMakerReader | null;
+  readonly #vaultSecretCandidateCache = new Map<string, boolean>();
 
   constructor(options: {
     tools?: readonly McpToolDefinition[];
@@ -469,6 +674,7 @@ export class ChainWhisperMessagingBridge {
     nonceQueue: NonceQueue;
     journal: OperationJournal;
     vault: EncryptedSecretVault;
+    orderMakers?: OrderMakerReader;
   }) {
     this.#tools = options.tools ?? PRIVATE_MESSAGING_MCP_TOOLS;
     this.#invoke = options.invoke;
@@ -478,6 +684,7 @@ export class ChainWhisperMessagingBridge {
     this.#nonceQueue = options.nonceQueue;
     this.#journal = options.journal;
     this.#vault = options.vault;
+    this.#orderMakers = options.orderMakers ?? null;
   }
 
   listTools(): OfficialMessagingTool[] {
@@ -524,8 +731,18 @@ export class ChainWhisperMessagingBridge {
       );
     }
     if (SEND_TOOLS.has(toolName as McpToolName)) {
+      const outbound = {
+        to: input.to,
+        plaintext: input.plaintext,
+      };
+      assertBoundedTree(outbound, OUTBOUND_TREE_LIMITS);
       if (
-        containsSensitiveMaterial(input) ||
+        !isHexAddress(outbound.to) ||
+        typeof outbound.plaintext !== 'string' ||
+        !outbound.plaintext ||
+        Buffer.byteLength(outbound.plaintext, 'utf8') >
+          MAX_OUTBOUND_PLAINTEXT_BYTES ||
+        containsSensitiveMaterial(outbound.plaintext) ||
         (typeof input.plaintext === 'string' &&
           RAW_32_BYTE_HEX_PATTERN.test(input.plaintext))
       ) {
@@ -536,7 +753,7 @@ export class ChainWhisperMessagingBridge {
       }
       return this.#send(
         toolName as McpToolName,
-        { to: input.to, plaintext: input.plaintext },
+        outbound,
         false,
       );
     }
@@ -545,6 +762,7 @@ export class ChainWhisperMessagingBridge {
   }
 
   async sendOrderMessage(input: SendOrderMessageInput): Promise<unknown> {
+    assertBoundedTree(input, OUTBOUND_TREE_LIMITS);
     if (
       Object.keys(input).some(
         (key) => !ALLOWED_SEND_ORDER_MESSAGE_KEYS.has(key),
@@ -559,7 +777,7 @@ export class ChainWhisperMessagingBridge {
           (key) => !ALLOWED_ORDER_REFERENCE_KEYS.has(key),
         ) ||
           !isHexAddress(input.order.escrowContract) ||
-          !/^(?:0|[1-9][0-9]*)$/u.test(input.order.localId))) ||
+          !isCanonicalUint256(input.order.localId))) ||
       (input.operationHash !== undefined &&
         (!isHexData(input.operationHash) ||
           input.operationHash.length !== 66)) ||
@@ -688,14 +906,36 @@ export class ChainWhisperMessagingBridge {
   }
 
   async #rejectStoredAccessSecretAliases(value: unknown): Promise<void> {
-    for (const candidate of collectRaw32ByteValues(value)) {
-      if (await this.#vault.hasAccessSecretValue(candidate)) {
+    const candidates = collectRaw32ByteValues(value);
+    if (
+      candidates.size >
+      MAX_OUTBOUND_VAULT_SECRET_CANDIDATES
+    ) {
+      unsafeMessageLimit();
+    }
+    for (const candidate of candidates) {
+      if (await this.#isStoredAccessSecret(candidate)) {
         throw new SignerError(
           'UNSAFE_MESSAGE',
           'A message identifier or negotiation field aliases signer-local access-secret material.',
         );
       }
     }
+  }
+
+  async #isStoredAccessSecret(candidate: string): Promise<boolean> {
+    const normalized = candidate.toLowerCase();
+    const cached = this.#vaultSecretCandidateCache.get(normalized);
+    if (cached === true) return true;
+    const stored = await this.#vault.hasAccessSecretValue(normalized);
+    if (stored && (
+      this.#vaultSecretCandidateCache.size >=
+      MAX_CACHED_SECRET_CANDIDATES
+    )) {
+      this.#vaultSecretCandidateCache.clear();
+    }
+    if (stored) this.#vaultSecretCandidateCache.set(normalized, true);
+    return stored;
   }
 
   async listOrderNegotiations(input: {
@@ -723,7 +963,7 @@ export class ChainWhisperMessagingBridge {
   }
 
   async readOrderNegotiation(messageId: string): Promise<unknown> {
-    if (!/^(?:0|[1-9][0-9]*)$/u.test(messageId)) {
+    if (!isCanonicalUint256(messageId)) {
       throw new SignerError(
         'UNSAFE_MESSAGE',
         'A numeric COTI message id is required.',
@@ -734,7 +974,7 @@ export class ChainWhisperMessagingBridge {
         messageId,
         decrypt: true,
       }),
-      true,
+      { requestedMessageId: messageId },
     );
   }
 
@@ -749,10 +989,15 @@ export class ChainWhisperMessagingBridge {
   ): Promise<unknown> {
     const recipient = input.to;
     const plaintext = input.plaintext;
+    const plaintextBytes =
+      typeof plaintext === 'string'
+        ? Buffer.byteLength(plaintext, 'utf8')
+        : 0;
     if (
       !isHexAddress(recipient) ||
       typeof plaintext !== 'string' ||
-      !plaintext
+      !plaintext ||
+      plaintextBytes > MAX_OUTBOUND_PLAINTEXT_BYTES
     ) {
       throw new SignerError(
         'UNSAFE_MESSAGE',
@@ -774,8 +1019,14 @@ export class ChainWhisperMessagingBridge {
         'The signer-local access message could not be safely isolated.',
       );
     }
-    const safeResult = (value: unknown): unknown =>
-      scrubAccessSecretAliases(value, outputAccessSecrets);
+    const safeResult = (value: unknown): unknown => {
+      assertBoundedTree(value, INBOUND_TREE_LIMITS);
+      return scrubAccessSecretAliases(value, outputAccessSecrets);
+    };
+    const contentPreview = safeConfirmationPreview(
+      plaintext,
+      outputAccessSecrets,
+    );
     if (!this.#confirmation.isWriteAvailable) {
       throw new SignerError(
         'ELICITATION_UNSUPPORTED',
@@ -783,13 +1034,38 @@ export class ChainWhisperMessagingBridge {
       );
     }
     const wallet = await this.#wallet.getAddress();
+    const negotiationForIdempotency = parseNegotiation(plaintext);
+    const messageContentHash = negotiationForIdempotency
+      ? sha256Hex(
+          canonicalize({
+            protocol: negotiationForIdempotency.protocol,
+            kind: negotiationForIdempotency.kind,
+            messageId: negotiationForIdempotency.messageId,
+            ...(negotiationForIdempotency.order
+              ? { order: negotiationForIdempotency.order }
+              : {}),
+            ...(negotiationForIdempotency.operationHash
+              ? {
+                  operationHash:
+                    negotiationForIdempotency.operationHash,
+                }
+              : {}),
+            ...(negotiationForIdempotency.body
+              ? { body: negotiationForIdempotency.body }
+              : {}),
+            ...(negotiationForIdempotency.accessSecret
+              ? { accessSecret: negotiationForIdempotency.accessSecret }
+              : {}),
+          }),
+        )
+      : sha256Hex(plaintext);
     const operationHash = sha256Hex(
       canonicalize({
         protocol: 'cw.message/1',
         wallet,
         contract: this.#messagingContract,
         recipient,
-        plaintextHash: sha256Hex(plaintext),
+        messageContentHash,
       }),
     );
     const operationId = `message-${operationHash.slice(2, 18)}`;
@@ -800,63 +1076,71 @@ export class ChainWhisperMessagingBridge {
         transactionHashes: [...record.transactionHashes],
       });
     }
+    if (record.stage === 'discarded') {
+      throw new SignerError(
+        'OPERATION_DISCARDED',
+        'This private-message operation was discarded and will not be sent.',
+      );
+    }
+    if (record.stage === 'failed') {
+      throw new SignerError(
+        'TRANSACTION_FAILED',
+        'This private-message operation failed and will not be sent again automatically.',
+      );
+    }
     if (
       record.stage === 'awaiting-broadcast' ||
       record.stage === 'prepared-broadcast' ||
       record.stage === 'broadcast'
     ) {
-      let pending = false;
       for (const transactionHash of record.transactionHashes) {
-        const receipt = await this.#wallet.getTransactionReceipt(
-          transactionHash,
-        );
+        const receipt = await this.#wallet
+          .getTransactionReceipt(transactionHash)
+          .catch(() => null);
         if (receipt?.status === 'success') {
           await this.#journal.recordReceipt(operationId, receipt);
           await this.#journal.updateStage(operationId, 'completed', 1);
           return safeResult({ status: 'completed', transactionHash });
         }
-        if (
-          !receipt &&
-          (await this.#wallet.getTransaction(transactionHash))
-        ) {
-          pending = true;
+        if (receipt?.status === 'reverted') {
+          await this.#journal.recordReceipt(operationId, receipt);
+          await this.#journal.recordError(
+            operationId,
+            'MESSAGE_TRANSACTION_REVERTED',
+            false,
+          );
+          await this.#journal.updateStage(operationId, 'failed', 0);
+          throw new SignerError(
+            'TRANSACTION_FAILED',
+            'Encrypted private message transaction reverted and will not be sent again automatically.',
+          );
         }
       }
-      if (!record.transactionHashes.length) {
-        for (const nonce of record.nonces) {
-          const transaction =
-            await this.#wallet.findTransactionByNonce(nonce);
-          if (transaction) {
-            record =
-              (await this.#journal.recordBroadcast(
-                operationId,
-                nonce,
-                transaction.hash,
-                0,
-              )) ?? record;
-            const receipt = await this.#wallet.getTransactionReceipt(
-              transaction.hash,
-            );
-            if (receipt?.status === 'success') {
-              await this.#journal.recordReceipt(operationId, receipt);
-              await this.#journal.updateStage(operationId, 'completed', 1);
-              return safeResult({
-                status: 'completed',
-                transactionHash: transaction.hash,
-              });
-            }
-            pending = true;
-          }
-        }
+      // The official SDK does not expose the exact prepared transaction or
+      // calldata before broadcasting. A nonce alone cannot prove that a later
+      // transaction is this message, so a missing SDK transaction hash must
+      // remain fail-closed instead of adopting an unrelated wallet write.
+      if (
+        !record.errorCodes.includes(
+          'MESSAGE_BROADCAST_UNCERTAIN',
+        )
+      ) {
+        await this.#journal.recordError(
+          operationId,
+          'MESSAGE_BROADCAST_UNCERTAIN',
+          true,
+        );
       }
-      if (pending) {
-        return safeResult({
-          status: 'processing',
-          transactionHashes: [...record.transactionHashes],
-        });
-      }
-      await this.#journal.updateStage(operationId, 'validated', 0);
+      return safeResult({
+        status: 'processing',
+        transactionHashes: [...record.transactionHashes],
+        errorCode: 'MESSAGE_BROADCAST_UNCERTAIN',
+      });
     }
+    const plaintextHash = sha256Hex(plaintext);
+    const maximumNetworkFee = maximumNetworkFeeDisplay(
+      DEFAULT_ENCRYPTED_MESSAGE_GAS_LIMIT,
+    );
     const confirmation: ConfirmationRequest = {
       operationId,
       operationHash,
@@ -868,25 +1152,41 @@ export class ChainWhisperMessagingBridge {
       action: 'send_order_message',
       assets: [],
       amounts: [],
+      details: [
+        {
+          label: 'Message content preview',
+          value: contentPreview,
+        },
+        {
+          label: 'Plaintext SHA-256',
+          value: plaintextHash,
+        },
+        {
+          label: 'Maximum network fee',
+          value: `${maximumNetworkFee.coti} COTI (${maximumNetworkFee.wei} wei)`,
+        },
+      ],
       counterparty: recipient,
       fee: 'Normal COTI gas; no in-app WISP request fee',
       nativeValue: '0',
       gasCap: String(DEFAULT_ENCRYPTED_MESSAGE_GAS_LIMIT),
       expectedResult:
-        confirmationContext?.expectedResult ??
-        `One encrypted COTI private message (${Buffer.byteLength(
-          plaintext,
-          'utf8',
-        )} bytes, ${Math.max(
+        `${
+          confirmationContext?.expectedResult ??
+          `One encrypted COTI private message (${plaintextBytes} bytes, ${Math.max(
           1,
           Math.ceil(
-            Buffer.byteLength(plaintext, 'utf8') /
-              DEFAULT_MAX_MESSAGE_CHUNK_BYTES,
+              plaintextBytes / DEFAULT_MAX_MESSAGE_CHUNK_BYTES,
           ),
-        )} encrypted chunk(s)) is sent in one transaction.`,
+          )} encrypted chunk(s)) is sent in one transaction.`
+        } Content preview: ${JSON.stringify(
+          contentPreview,
+        )}. Plaintext SHA-256: ${plaintextHash}.`,
       summary:
         confirmationContext?.summary ??
-        'Send encrypted cw.otc/1 negotiation message',
+        `Send encrypted private message: ${JSON.stringify(
+          contentPreview,
+        )}`,
     };
     await this.#journal.updateStage(
       operationId,
@@ -894,11 +1194,52 @@ export class ChainWhisperMessagingBridge {
       0,
     );
     await this.#confirmation.confirm(confirmation);
-    const invoked = await this.#nonceQueue.runExternalWrite(async (nonce) => {
-      await this.#journal.reserveNonce(operationId, nonce, 0);
-      return this.#invoke(toolName, input);
-    });
-    const safeInvokedResult = safeResult(invoked.result);
+    let invoked: { nonce: number; result: unknown };
+    try {
+      invoked = await this.#nonceQueue.runExternalWrite(
+        async (nonce) => {
+          await this.#journal.reserveNonce(operationId, nonce, 0);
+          return this.#invoke(toolName, input);
+        },
+      );
+    } catch (error) {
+      const reserved = await this.#journal.get(operationId);
+      if (
+        reserved &&
+        [
+          'awaiting-broadcast',
+          'prepared-broadcast',
+          'broadcast',
+        ].includes(reserved.stage)
+      ) {
+        await this.#journal.recordError(
+          operationId,
+          'MESSAGE_BROADCAST_UNCERTAIN',
+          true,
+        );
+        return safeResult({
+          status: 'processing',
+          transactionHashes: [...reserved.transactionHashes],
+          errorCode: 'MESSAGE_BROADCAST_UNCERTAIN',
+        });
+      }
+      throw error;
+    }
+    let safeInvokedResult: unknown;
+    try {
+      safeInvokedResult = safeResult(invoked.result);
+    } catch {
+      await this.#journal.recordError(
+        operationId,
+        'MESSAGE_BROADCAST_UNCERTAIN',
+        true,
+      );
+      return safeResult({
+        status: 'processing',
+        transactionHashes: [],
+        errorCode: 'MESSAGE_BROADCAST_UNCERTAIN',
+      });
+    }
     const transactionHash = transactionHashFromResult(safeInvokedResult);
     if (!transactionHash) {
       await this.#journal.recordError(
@@ -906,10 +1247,11 @@ export class ChainWhisperMessagingBridge {
         'MESSAGE_TRANSACTION_HASH_MISSING',
         true,
       );
-      throw new SignerError(
-        'TRANSACTION_FAILED',
-        'COTI messaging did not return a transaction hash.',
-      );
+      return safeResult({
+        status: 'processing',
+        transactionHashes: [],
+        errorCode: 'MESSAGE_BROADCAST_UNCERTAIN',
+      });
     }
     record =
       (await this.#journal.recordBroadcast(
@@ -918,7 +1260,21 @@ export class ChainWhisperMessagingBridge {
         transactionHash,
         0,
       )) ?? record;
-    const receipt = await this.#wallet.waitForTransaction(transactionHash);
+    let receipt;
+    try {
+      receipt = await this.#wallet.waitForTransaction(transactionHash);
+    } catch {
+      await this.#journal.recordError(
+        operationId,
+        'MESSAGE_BROADCAST_UNCERTAIN',
+        true,
+      );
+      return safeResult({
+        status: 'processing',
+        transactionHashes: [...record.transactionHashes],
+        errorCode: 'MESSAGE_BROADCAST_UNCERTAIN',
+      });
+    }
     record =
       (await this.#journal.recordReceipt(operationId, receipt)) ?? record;
     if (receipt.status === 'pending') {
@@ -931,11 +1287,12 @@ export class ChainWhisperMessagingBridge {
       await this.#journal.recordError(
         operationId,
         'MESSAGE_TRANSACTION_REVERTED',
-        true,
+        false,
       );
+      await this.#journal.updateStage(operationId, 'failed', 0);
       throw new SignerError(
         'TRANSACTION_FAILED',
-        'Encrypted private message transaction reverted.',
+        'Encrypted private message transaction reverted and will not be sent again automatically.',
       );
     }
     await this.#journal.updateStage(operationId, 'completed', 1);
@@ -948,20 +1305,14 @@ export class ChainWhisperMessagingBridge {
 
   async #markIncomingUntrusted(
     value: unknown,
-    bindOrderAccess = false,
+    readContext?: { requestedMessageId: string },
   ): Promise<unknown> {
+    assertBoundedTree(value, INBOUND_TREE_LIMITS);
     const accessSecrets = collectExplicitAccessSecrets(value);
-    for (const candidate of collectRaw32ByteValues(value)) {
-      if (
-        !accessSecrets.has(candidate) &&
-        (await this.#vault.hasAccessSecretValue(candidate))
-      ) {
-        accessSecrets.add(candidate);
-      }
+    collectRaw32ByteValues(value);
+    if (readContext) {
+      await this.#bindVerifiedReadAccessSecret(value, readContext);
     }
-    const recipient = bindOrderAccess
-      ? await this.#wallet.getAddress()
-      : null;
     const transform = async (
       entry: unknown,
       key?: string,
@@ -969,71 +1320,6 @@ export class ChainWhisperMessagingBridge {
       const negotiation = parseNegotiation(entry);
       if (negotiation) {
         const { accessSecret, ...message } = negotiation;
-        if (accessSecret) {
-          const reference = negotiation.operationHash
-            ? `${negotiation.operationHash}:received-access-secret`
-            : `message:${negotiation.messageId}:received-access-secret`;
-          if (
-            bindOrderAccess &&
-            recipient &&
-            negotiation.operationHash &&
-            negotiation.order
-          ) {
-            const orderReference = orderAccessSecretReference(
-              recipient,
-              negotiation.order.escrowContract,
-              negotiation.order.localId,
-            );
-            const exactRecord = encodeStoredAccessSecret({
-              version: 1,
-              operationHash: negotiation.operationHash,
-              recipient,
-              escrowContract: negotiation.order.escrowContract,
-              localId: negotiation.order.localId,
-              secret: accessSecret as HexString,
-            });
-            const binding = await this.#vault.putIfAbsent(
-              orderReference,
-              exactRecord,
-              {
-                kind: 'received-access-secret',
-                binding: {
-                  operationHash: negotiation.operationHash,
-                  recipient,
-                  escrowContract: negotiation.order.escrowContract,
-                  localId: negotiation.order.localId,
-                },
-              },
-            );
-            const decoded = decodeStoredAccessSecret(binding.value);
-            if (
-              !decoded ||
-              decoded.operationHash.toLowerCase() !==
-                negotiation.operationHash.toLowerCase() ||
-              decoded.recipient?.toLowerCase() !==
-                recipient.toLowerCase() ||
-              decoded.escrowContract.toLowerCase() !==
-                negotiation.order.escrowContract.toLowerCase() ||
-              decoded.localId !== negotiation.order.localId ||
-              decoded.secret.toLowerCase() !==
-                accessSecret.toLowerCase()
-            ) {
-              throw new SignerError(
-                'UNSAFE_MESSAGE',
-                'A different access secret is already bound to this wallet and order.',
-              );
-            }
-          }
-          await this.#vault.put(reference, accessSecret, {
-            kind: 'received-access-secret',
-            binding: {
-              operationHash: negotiation.operationHash,
-              ...(recipient ? { recipient } : {}),
-              escrowContract: negotiation.order?.escrowContract,
-              localId: negotiation.order?.localId,
-            },
-          });
-        }
         const result: UntrustedNegotiationMessage = {
           protocol: 'cw.otc/1',
           trust: 'untrusted',
@@ -1072,7 +1358,8 @@ export class ChainWhisperMessagingBridge {
           Object.entries(record).map(
             async ([entryKey, nested], index) => [
               isExplicitAccessSecretKey(entryKey) ||
-              containsAccessSecretAlias(entryKey, accessSecrets)
+              containsAccessSecretAlias(entryKey, accessSecrets) ||
+              RAW_32_BYTE_HEX_PATTERN.test(entryKey)
                 ? sensitiveMessageKey(index)
                 : entryKey,
               await transform(nested, entryKey),
@@ -1091,6 +1378,140 @@ export class ChainWhisperMessagingBridge {
       mayExecute: false,
       data: await transform(value),
     };
+  }
+
+  async #bindVerifiedReadAccessSecret(
+    value: unknown,
+    readContext: { requestedMessageId: string },
+  ): Promise<void> {
+    const result = asRecord(value);
+    const negotiation = parseNegotiation(result?.plaintext);
+    if (!negotiation?.accessSecret) return;
+    if (!negotiation.operationHash || !negotiation.order) {
+      throw new SignerError(
+        'UNSAFE_MESSAGE',
+        'The access message is not bound to an exact ChainWhisper order.',
+      );
+    }
+
+    const outerMessage = asRecord(result?.message);
+    const outerId = canonicalMessageId(outerMessage?.id);
+    const recipient = await this.#wallet.getAddress();
+    const sender = outerMessage?.from;
+    const outerRecipient = outerMessage?.to;
+    if (
+      outerId !== readContext.requestedMessageId ||
+      !isHexAddress(sender) ||
+      !isHexAddress(outerRecipient) ||
+      outerRecipient.toLowerCase() !== recipient.toLowerCase()
+    ) {
+      throw new SignerError(
+        'UNSAFE_MESSAGE',
+        'COTI message provenance does not match the requested message and local wallet.',
+      );
+    }
+    if (!this.#orderMakers) {
+      throw new SignerError(
+        'STALE_STATE',
+        'The signer cannot verify the live maker for this access message.',
+      );
+    }
+    let orderAccess;
+    try {
+      orderAccess = await this.#orderMakers.readOrderAccess(
+        negotiation.order,
+      );
+    } catch {
+      throw new SignerError(
+        'STALE_STATE',
+        'The signer could not verify the live maker for this access message.',
+      );
+    }
+    if (
+      !orderAccess ||
+      !isHexAddress(orderAccess.maker) ||
+      orderAccess.maker.toLowerCase() !== sender.toLowerCase()
+    ) {
+      throw new SignerError(
+        'UNSAFE_MESSAGE',
+        'The COTI message sender is not the live maker of this allowlisted order.',
+      );
+    }
+    if (
+      keccak256(negotiation.accessSecret as HexString).toLowerCase() !==
+      orderAccess.accessHash.toLowerCase()
+    ) {
+      throw new SignerError(
+        'UNSAFE_MESSAGE',
+        'The received access secret does not match the live order access commitment.',
+      );
+    }
+
+    const exactBinding = {
+      operationHash: negotiation.operationHash,
+      recipient,
+      escrowContract: negotiation.order.escrowContract,
+      localId: negotiation.order.localId,
+    };
+    const orderReference = orderAccessSecretReference(
+      recipient,
+      negotiation.order.escrowContract,
+      negotiation.order.localId,
+    );
+    const exactRecord = encodeStoredAccessSecret({
+      version: 1,
+      ...exactBinding,
+      secret: negotiation.accessSecret as HexString,
+    });
+    const binding = await this.#vault.putIfAbsent(
+      orderReference,
+      exactRecord,
+      {
+        kind: 'received-access-secret',
+        binding: exactBinding,
+      },
+    );
+    const decoded = decodeStoredAccessSecret(binding.value);
+    if (
+      !decoded ||
+      decoded.operationHash.toLowerCase() !==
+        negotiation.operationHash.toLowerCase() ||
+      decoded.recipient?.toLowerCase() !== recipient.toLowerCase() ||
+      decoded.escrowContract.toLowerCase() !==
+        negotiation.order.escrowContract.toLowerCase() ||
+      decoded.localId !== negotiation.order.localId ||
+      decoded.secret.toLowerCase() !==
+        negotiation.accessSecret.toLowerCase()
+    ) {
+      throw new SignerError(
+        'UNSAFE_MESSAGE',
+        'A different access secret is already bound to this wallet and order.',
+      );
+    }
+
+    const messageReference =
+      `message:${readContext.requestedMessageId}:received-access-secret`;
+    const messageBinding = await this.#vault.putIfAbsent(
+      messageReference,
+      negotiation.accessSecret,
+      {
+        kind: 'received-access-secret',
+        binding: exactBinding,
+      },
+    );
+    if (
+      messageBinding.value.toLowerCase() !==
+      negotiation.accessSecret.toLowerCase()
+    ) {
+      throw new SignerError(
+        'UNSAFE_MESSAGE',
+        'A different access secret is already bound to this verified message operation.',
+      );
+    }
+    this.#vaultSecretCandidateCache.set(
+      negotiation.accessSecret.toLowerCase(),
+      true,
+    );
   }
 }
 

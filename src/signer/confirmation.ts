@@ -4,6 +4,7 @@ import type {
   ConfirmationRequest,
   FormElicitor,
   MaterializedActionStep,
+  TransactionFeeQuote,
 } from './types.js';
 import type { SignedActionEnvelopeV1 } from '../shared/index.js';
 import { orderClassificationLabel } from '../shared/index.js';
@@ -31,6 +32,27 @@ const assetLabel = (
   asset: SignedActionEnvelopeV1['intent']['sellAsset'],
 ): string | null => asset?.symbol ?? asset?.reference ?? asset?.address ?? null;
 
+const privateAmountLabel = (id: string): string => {
+  const normalized = id.toLowerCase();
+  if (
+    normalized.includes('offer') ||
+    normalized.includes('sell') ||
+    normalized.includes('input')
+  ) {
+    return 'Private send amount';
+  }
+  if (
+    normalized.includes('request') ||
+    normalized.includes('buy') ||
+    normalized.includes('output')
+  ) {
+    return 'Private receive amount';
+  }
+  if (normalized.includes('inventory')) return 'Private inventory';
+  if (normalized.includes('allowance')) return 'Exact private allowance';
+  return 'Private signer amount';
+};
+
 const LEGACY_STANDARD_ORDER_TYPE_LABEL =
   'Legacy one-off / fixed recipient / public terms';
 
@@ -38,11 +60,13 @@ export const buildActionConfirmation = (
   envelope: SignedActionEnvelopeV1,
   step: MaterializedActionStep,
   stepIndex: number,
+  feeQuote?: TransactionFeeQuote,
 ): ConfirmationRequest => {
-  const assets = [
-    assetLabel(envelope.intent.sellAsset),
-    assetLabel(envelope.intent.buyAsset),
-  ].filter((asset): asset is string => Boolean(asset));
+  const sellAsset = assetLabel(envelope.intent.sellAsset);
+  const buyAsset = assetLabel(envelope.intent.buyAsset);
+  const assets = [sellAsset, buyAsset].filter(
+    (asset): asset is string => Boolean(asset),
+  );
   const amounts = [
     envelope.intent.sellAmount,
     envelope.intent.buyAmount,
@@ -50,6 +74,54 @@ export const buildActionConfirmation = (
       (entry) => `${entry.amount} ${entry.symbol} (${entry.id})`,
     ),
   ].filter((amount): amount is string => Boolean(amount));
+  const details: NonNullable<ConfirmationRequest['details']> = [];
+  if (envelope.intent.sellAmount && sellAsset) {
+    details.push({
+      label: 'You send',
+      value: `${envelope.intent.sellAmount} ${sellAsset}`,
+    });
+  } else if (sellAsset) {
+    details.push({ label: 'Sell asset', value: sellAsset });
+  }
+  if (envelope.intent.buyAmount && buyAsset) {
+    details.push({
+      label: 'You receive',
+      value: `${envelope.intent.buyAmount} ${buyAsset}`,
+    });
+  } else if (buyAsset) {
+    details.push({ label: 'Buy asset', value: buyAsset });
+  }
+  for (const entry of step.privateDisplayAmounts ?? []) {
+    details.push({
+      label: `${privateAmountLabel(entry.id)} (${entry.id})`,
+      value: `${entry.amount} ${entry.symbol}`,
+    });
+  }
+  if (step.approval?.spender) {
+    details.push({
+      label: 'Allowance spender',
+      value: step.approval.spender,
+    });
+  }
+  if (feeQuote) {
+    details.push({
+      label: 'Maximum network fee',
+      value: `${feeQuote.maximumNetworkFeeCoti} COTI (${feeQuote.maximumNetworkFeeWei} wei)`,
+    });
+    details.push({
+      label:
+        feeQuote.model === 'eip1559'
+          ? 'Maximum fee per gas'
+          : 'Gas price',
+      value: `${feeQuote.maximumFeePerGasWei} wei`,
+    });
+    if (feeQuote.maximumPriorityFeePerGasWei) {
+      details.push({
+        label: 'Maximum priority fee per gas',
+        value: `${feeQuote.maximumPriorityFeePerGasWei} wei`,
+      });
+    }
+  }
   const signedLegacyOrderTypeLabel =
     envelope.intent.metadata?.legacyCompatibility ===
       'standard-recipient-bound' &&
@@ -72,6 +144,7 @@ export const buildActionConfirmation = (
       : signedLegacyOrderTypeLabel,
     assets,
     amounts,
+    details,
     counterparty: envelope.intent.recipient ?? null,
     spender: step.approval?.spender ?? null,
     fee:

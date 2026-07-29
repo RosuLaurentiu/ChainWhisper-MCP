@@ -1,6 +1,7 @@
 import type { DecimalString } from './types.js';
 
 const DECIMAL_PATTERN = /^(?:0|[1-9]\d*)(?:\.\d+)?$/u;
+export const MAX_DECIMAL_INPUT_LENGTH = 160;
 
 export type ParsedDecimal = {
   coefficient: bigint;
@@ -10,7 +11,12 @@ export type ParsedDecimal = {
 export const parseDecimal = (value: unknown): ParsedDecimal | null => {
   if (typeof value !== 'string') return null;
   const trimmed = value.trim();
-  if (!DECIMAL_PATTERN.test(trimmed)) return null;
+  if (
+    trimmed.length > MAX_DECIMAL_INPUT_LENGTH ||
+    !DECIMAL_PATTERN.test(trimmed)
+  ) {
+    return null;
+  }
   const [whole, fraction = ''] = trimmed.split('.');
   return {
     coefficient: BigInt(`${whole}${fraction}`),

@@ -17,10 +17,12 @@ import type {
 import { assertPlainRecord } from './validation.js';
 import { toolFailure } from './errors.js';
 import { ORDER_CLASSIFICATION_IDS_V1 } from '../shared/orderClassification.js';
+import { MAX_DECIMAL_INPUT_LENGTH } from './decimal.js';
 
 const addressSchema = { type: 'string', pattern: '^0x[a-fA-F0-9]{40}$' };
 const decimalSchema = {
   type: 'string',
+  maxLength: MAX_DECIMAL_INPUT_LENGTH,
   pattern: '^(?:0|[1-9][0-9]*)(?:\\.[0-9]+)?$',
   description: 'A base-10 decimal string. JSON numbers are not accepted.'
 };

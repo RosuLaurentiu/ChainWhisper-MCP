@@ -249,29 +249,81 @@ export class PrivateTokenAccountService {
     }
     if (record.stage === 'completed') {
       const refreshed = await this.status(reference);
-      return {
-        ...refreshed,
-        transactionHash: record.transactionHashes.at(-1) ?? null,
-      };
+      if (refreshed.ready) {
+        return {
+          ...refreshed,
+          transactionHash: record.transactionHashes.at(-1) ?? null,
+        };
+      }
+      record =
+        (await this.#journal.updateStage(
+          operationId,
+          'validated',
+          0,
+        )) ?? record;
     }
     for (const transactionHash of record.transactionHashes) {
-      const receipt =
-        await this.#wallet.getTransactionReceipt(transactionHash);
-      if (receipt?.status === 'success') {
-        await this.#journal.recordReceipt(operationId, receipt);
-        await this.#journal.updateStage(operationId, 'completed', 1);
-        const refreshed = await this.status(reference);
-        return { ...refreshed, transactionHash };
-      }
-      if (
-        !receipt &&
-        (await this.#wallet.getTransaction(transactionHash))
-      ) {
+      let receipt;
+      try {
+        receipt =
+          await this.#wallet.getTransactionReceipt(transactionHash);
+      } catch {
         return {
           ...current,
           transactionHash,
         };
       }
+      if (receipt?.status === 'success') {
+        await this.#journal.recordReceipt(operationId, receipt);
+        const refreshed = await this.status(reference);
+        if (refreshed.ready) {
+          await this.#journal.updateStage(operationId, 'completed', 1);
+          return { ...refreshed, transactionHash };
+        }
+        record =
+          (await this.#journal.updateStage(
+            operationId,
+            'validated',
+            0,
+          )) ?? record;
+        await this.#journal.recordError(
+          operationId,
+          'PRIVATE_TOKEN_SETUP_NOT_READY',
+          true,
+        );
+        continue;
+      }
+      if (receipt?.status === 'reverted') {
+        await this.#journal.recordReceipt(operationId, receipt);
+        await this.#journal.recordError(
+          operationId,
+          'TRANSACTION_REVERTED',
+          true,
+        );
+        continue;
+      }
+      if (receipt?.status === 'pending') {
+        await this.#journal.recordReceipt(operationId, receipt);
+      }
+      return {
+        ...current,
+        transactionHash,
+      };
+    }
+    if (
+      record.transactionHashes.length === 0 &&
+      record.nonces.length > 0
+    ) {
+      // This service never broadcasts before recordPreparedTransaction
+      // persists a hash. A nonce-only record is therefore safe to retry,
+      // while a different wallet transaction with that nonce is not proof
+      // that this setup call was sent.
+      record =
+        (await this.#journal.updateStage(
+          operationId,
+          'validated',
+          0,
+        )) ?? record;
     }
     const request = {
       to: current.token,
@@ -305,6 +357,14 @@ export class PrivateTokenAccountService {
       action: 'enable_private_token',
       assets: [current.symbol],
       amounts: [],
+      details: simulation.feeQuote
+        ? [
+            {
+              label: 'Maximum network fee',
+              value: `${simulation.feeQuote.maximumNetworkFeeCoti} COTI (${simulation.feeQuote.maximumNetworkFeeWei} wei)`,
+            },
+          ]
+        : undefined,
       counterparty: null,
       fee: 'Network gas only',
       nativeValue: '0',
@@ -325,7 +385,6 @@ export class PrivateTokenAccountService {
     }
     const broadcast = await this.#nonceQueue.runTransaction(
       async (nonce) => {
-        await this.#journal.reserveNonce(operationId, nonce, 0);
         const prepared = await this.#wallet.prepareTransaction({
           ...request,
           nonce,
@@ -336,16 +395,29 @@ export class PrivateTokenAccountService {
           prepared.hash,
           0,
         );
-        const sent = await this.#wallet.broadcastTransaction(
-          prepared.signedTransaction,
-        );
-        if (sent.hash.toLowerCase() !== prepared.hash.toLowerCase()) {
-          throw new SignerError(
-            'TRANSACTION_FAILED',
-            'The private-token setup broadcast hash changed unexpectedly.',
+        let observed = true;
+        try {
+          const sent = await this.#wallet.broadcastTransaction(
+            prepared.signedTransaction,
           );
+          if (
+            sent.hash.toLowerCase() !== prepared.hash.toLowerCase()
+          ) {
+            throw new SignerError(
+              'TRANSACTION_FAILED',
+              'The private-token setup broadcast hash changed unexpectedly.',
+            );
+          }
+        } catch {
+          try {
+            observed = Boolean(
+              await this.#wallet.getTransaction(prepared.hash),
+            );
+          } catch {
+            observed = false;
+          }
         }
-        return sent;
+        return { hash: prepared.hash, observed };
       },
     );
     record =
@@ -355,9 +427,23 @@ export class PrivateTokenAccountService {
         broadcast.result.hash,
         0,
       )) ?? record;
-    const receipt = await this.#wallet.waitForTransaction(
-      broadcast.result.hash,
-    );
+    if (!broadcast.result.observed) {
+      return {
+        ...current,
+        transactionHash: broadcast.result.hash,
+      };
+    }
+    let receipt;
+    try {
+      receipt = await this.#wallet.waitForTransaction(
+        broadcast.result.hash,
+      );
+    } catch {
+      return {
+        ...current,
+        transactionHash: broadcast.result.hash,
+      };
+    }
     await this.#journal.recordReceipt(operationId, receipt);
     if (receipt.status === 'pending') {
       return {
@@ -376,14 +462,20 @@ export class PrivateTokenAccountService {
         'The private-token account setup transaction reverted.',
       );
     }
-    await this.#journal.updateStage(operationId, 'completed', 1);
     const refreshed = await this.status(reference);
     if (!refreshed.ready) {
+      await this.#journal.updateStage(operationId, 'validated', 0);
+      await this.#journal.recordError(
+        operationId,
+        'PRIVATE_TOKEN_SETUP_NOT_READY',
+        true,
+      );
       throw new SignerError(
         'TRANSACTION_FAILED',
         'The private token did not retain the wallet encryption address.',
       );
     }
+    await this.#journal.updateStage(operationId, 'completed', 1);
     return {
       ...refreshed,
       transactionHash: broadcast.result.hash,

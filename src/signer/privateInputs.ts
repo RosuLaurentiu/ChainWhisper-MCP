@@ -523,6 +523,8 @@ const unixExpiry = (envelope: SignedActionEnvelopeV1): number => {
 export class VaultBackedPrivateInputMaterializer
   implements PrivateInputMaterializer
 {
+  static readonly MAX_CACHED_ARTIFACT_RESOLUTIONS = 128;
+
   readonly #vault: EncryptedSecretVault;
   readonly #privateUint256: CotiPrivateUint256Encoder;
   readonly #calldata: StepCalldataMaterializer;
@@ -538,6 +540,7 @@ export class VaultBackedPrivateInputMaterializer
     string,
     Promise<ResolvedArtifactSet>
   >();
+  readonly #settledArtifactResolutions = new Set<string>();
 
   constructor(options: {
     vault: EncryptedSecretVault;
@@ -1148,9 +1151,43 @@ export class VaultBackedPrivateInputMaterializer
   ): Promise<ResolvedArtifactSet> {
     const existing = this.#artifactResolutions.get(envelope.operationHash);
     if (existing) return existing;
+    this.#pruneArtifactResolutions(
+      VaultBackedPrivateInputMaterializer.MAX_CACHED_ARTIFACT_RESOLUTIONS -
+        1,
+    );
+    if (
+      this.#artifactResolutions.size >=
+      VaultBackedPrivateInputMaterializer.MAX_CACHED_ARTIFACT_RESOLUTIONS
+    ) {
+      throw new SignerError(
+        'WRITE_UNAVAILABLE',
+        'Too many private artifact operations are active; wait for an existing operation to finish.',
+      );
+    }
     const resolution = this.#resolveArtifacts(envelope);
     this.#artifactResolutions.set(envelope.operationHash, resolution);
+    void resolution.then(
+      () => this.#markArtifactResolutionSettled(envelope.operationHash),
+      () => this.#markArtifactResolutionSettled(envelope.operationHash),
+    );
     return resolution;
+  }
+
+  #markArtifactResolutionSettled(operationHash: string): void {
+    this.#settledArtifactResolutions.add(operationHash);
+    this.#pruneArtifactResolutions(
+      VaultBackedPrivateInputMaterializer.MAX_CACHED_ARTIFACT_RESOLUTIONS,
+    );
+  }
+
+  #pruneArtifactResolutions(maximum: number): void {
+    if (this.#artifactResolutions.size <= maximum) return;
+    for (const operationHash of this.#artifactResolutions.keys()) {
+      if (!this.#settledArtifactResolutions.has(operationHash)) continue;
+      this.#artifactResolutions.delete(operationHash);
+      this.#settledArtifactResolutions.delete(operationHash);
+      if (this.#artifactResolutions.size <= maximum) return;
+    }
   }
 
   #requiredValue(

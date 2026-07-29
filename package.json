@@ -26,7 +26,10 @@
   "files": [
     "dist",
     "runtime",
-    "README.md"
+    "README.md",
+    "CHANGELOG.md",
+    "SECURITY.md",
+    "LICENSE"
   ],
   "exports": {
     ".": "./dist/shared/index.js",
@@ -35,11 +38,8 @@
   },
   "scripts": {
     "audit:runtime": "node dist/bin/audit-runtime.js",
-    "smoke:live-readonly": "node scripts/live-readonly-smoke.mjs",
-    "test:local-confirmation": "node scripts/local-confirmation-diagnostic.mjs",
-    "setup:live-confirmed": "node scripts/live-confirmed-setup.mjs",
-    "order:live-preview": "node scripts/live-order-preview.mjs",
-    "order:live-execute-step": "node scripts/live-order-execute-step.mjs"
+    "prepack": "tsc -p tsconfig.json",
+    "prepublishOnly": "tsc -p tsconfig.json && vitest run test && node scripts/package-smoke.mjs && node scripts/package-tarball-smoke.mjs"
   },
   "dependencies": {
     "@coti-io/coti-ethers": "1.0.5",

@@ -8,6 +8,7 @@ import { EncryptedSecretVault } from './vault.js';
 import { ActionEnvelopeVerifier } from './verification.js';
 import type {
   ExecuteActionResult,
+  JournalReceipt,
   MaterializedActionStep,
   MaterializedIntentValidator,
   OperationJournalRecord,
@@ -197,7 +198,12 @@ export class SignerEngine {
           stepIndex,
         );
         await this.#confirmation.confirm(
-          buildActionConfirmation(envelope, materialized, stepIndex),
+          buildActionConfirmation(
+            envelope,
+            materialized,
+            stepIndex,
+            simulation.feeQuote,
+          ),
         );
         await this.#verifier.verify(envelope, wallet);
         await this.#intentValidator.validate(
@@ -223,11 +229,6 @@ export class SignerEngine {
         }
         const broadcast = await this.#nonceQueue.runTransaction(
           async (nonce) => {
-            await this.#journal.reserveNonce(
-              envelope.operationId,
-              nonce,
-              stepIndex,
-            );
             const prepared = await this.#wallet.prepareTransaction({
               ...requestWithoutNonce,
               nonce,
@@ -238,6 +239,7 @@ export class SignerEngine {
               prepared.hash,
               stepIndex,
             );
+            let observed = true;
             try {
               const sent = await this.#wallet.broadcastTransaction(
                 prepared.signedTransaction,
@@ -248,13 +250,16 @@ export class SignerEngine {
                   'Broadcast transaction hash does not match the locally signed transaction.',
                 );
               }
-            } catch (error) {
-              const accepted = await this.#wallet.getTransaction(
-                prepared.hash,
-              );
-              if (!accepted) throw error;
+            } catch {
+              try {
+                observed = Boolean(
+                  await this.#wallet.getTransaction(prepared.hash),
+                );
+              } catch {
+                observed = false;
+              }
             }
-            return { hash: prepared.hash };
+            return { hash: prepared.hash, observed };
           },
         );
         record =
@@ -264,6 +269,9 @@ export class SignerEngine {
             broadcast.result.hash,
             stepIndex,
           )) ?? record;
+        if (!broadcast.result.observed) {
+          return toResult(record, 'processing');
+        }
         const receipt = await this.#wallet.waitForTransaction(
           broadcast.result.hash,
         );
@@ -315,6 +323,19 @@ export class SignerEngine {
         record =
           (await this.#journal.get(envelope.operationId)) ??
           record;
+        if (
+          record.stage === 'failed' ||
+          (record.stage === 'awaiting-broadcast' &&
+            record.transactionHashes.length === 0)
+        ) {
+          record =
+            (await this.#journal.updateStage(
+              envelope.operationId,
+              'validated',
+              stepIndex,
+            )) ?? record;
+          return toResult(record, 'retryable', errorCode);
+        }
         if (
           record.stage === 'broadcast' ||
           record.stage === 'prepared-broadcast' ||
@@ -402,72 +423,73 @@ export class SignerEngine {
         errorCodes: [...record.errorCodes],
       };
     }
-    let hasPending = false;
-    let hasPreparedButUnbroadcast = false;
-    let hasReverted = false;
-    for (const transactionHash of record.transactionHashes) {
-      const receipt = await this.#wallet.getTransactionReceipt(
-        transactionHash,
+    const transactionHash = record.transactionHashes.at(-1);
+    let receiptStatus: JournalReceipt['status'] | null = null;
+    if (transactionHash) {
+      const recordedReceipt: JournalReceipt | undefined =
+        record.receipts.find(
+        (receipt) =>
+          sameHex(receipt.transactionHash, transactionHash) &&
+          receipt.status !== 'pending',
       );
+      let receipt: JournalReceipt | null | undefined =
+        recordedReceipt;
+      if (!receipt) {
+        try {
+          receipt = await this.#wallet.getTransactionReceipt(
+            transactionHash,
+          );
+        } catch {
+          return {
+            operationId,
+            operationHash: record.operationHash,
+            status: 'processing',
+            transactionHashes: [...record.transactionHashes],
+            errorCodes: [...record.errorCodes],
+          };
+        }
+      }
       if (!receipt || receipt.status === 'pending') {
-        const transaction = await this.#wallet.getTransaction(
-          transactionHash,
-        );
-        if (transaction) hasPending = true;
-        else hasPreparedButUnbroadcast = true;
-        continue;
+        return {
+          operationId,
+          operationHash: record.operationHash,
+          status: 'processing',
+          transactionHashes: [...record.transactionHashes],
+          errorCodes: [...record.errorCodes],
+        };
       }
       record =
         (await this.#journal.recordReceipt(operationId, receipt)) ??
         record;
-      if (receipt.status === 'reverted') hasReverted = true;
+      receiptStatus = receipt.status;
     }
     if (
       record.transactionHashes.length === 0 &&
       record.nonces.length > 0
     ) {
-      for (const nonce of record.nonces) {
-        const transaction = await this.#wallet.findTransactionByNonce(
-          nonce,
-        );
-        if (transaction) {
-          record =
-            (await this.#journal.recordBroadcast(
-              operationId,
-              nonce,
-              transaction.hash,
-              record.nextStepIndex,
-            )) ?? record;
-          hasPending = true;
-        } else {
-          hasPreparedButUnbroadcast = true;
-        }
-      }
-    }
-    if (hasPending) {
-      return {
-        operationId,
-        operationHash: record.operationHash,
-        status: 'processing',
-        transactionHashes: [...record.transactionHashes],
-        errorCodes: [...record.errorCodes],
-      };
-    }
-    if (hasReverted) {
-      record =
-        (await this.#journal.recordError(
-          operationId,
-          'TRANSACTION_REVERTED',
-          true,
-        )) ?? record;
-    } else if (hasPreparedButUnbroadcast) {
+      // Broadcasting is only attempted after recordPreparedTransaction
+      // persists the locally derived transaction hash. A nonce without a
+      // hash therefore cannot identify this operation's transaction, and
+      // adopting an arbitrary wallet transaction by nonce would be unsafe.
       record =
         (await this.#journal.updateStage(
           operationId,
           'validated',
           record.nextStepIndex,
         )) ?? record;
-    } else if (record.stage === 'broadcast') {
+    }
+    if (receiptStatus === 'reverted') {
+      record =
+        (await this.#journal.recordError(
+          operationId,
+          'TRANSACTION_REVERTED',
+          true,
+        )) ?? record;
+    } else if (
+      receiptStatus === 'success' &&
+      (record.stage === 'broadcast' ||
+        record.stage === 'prepared-broadcast')
+    ) {
       record =
         (await this.#journal.updateStage(
           operationId,
@@ -505,9 +527,10 @@ export class SignerEngine {
       );
     }
     if (
-      record.stage === 'awaiting-broadcast' ||
       record.stage === 'prepared-broadcast' ||
-      record.stage === 'broadcast'
+      record.stage === 'broadcast' ||
+      (record.stage === 'awaiting-broadcast' &&
+        record.transactionHashes.length > 0)
     ) {
       throw new SignerError(
         'OPERATION_IN_PROGRESS',

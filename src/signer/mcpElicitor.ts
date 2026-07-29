@@ -12,6 +12,19 @@ import type {
 const display = (values: string[]): string =>
   values.length ? values.join(', ') : 'None';
 
+const transactionDetails = (request: ConfirmationRequest): string[] =>
+  request.details?.length
+    ? [
+        'Exact transaction terms:',
+        ...request.details.map(
+          (detail) => `- ${detail.label}: ${detail.value}`,
+        ),
+      ]
+    : [
+        `Assets: ${display(request.assets)}`,
+        `Amounts: ${display(request.amounts)}`,
+      ];
+
 const orderTypeDisplay = (request: ConfirmationRequest): string => {
   if (!request.orderType) {
     if (request.orderTypeLabel) return request.orderTypeLabel;
@@ -40,8 +53,7 @@ export const buildConfirmationMessage = (
     `Action: ${request.action}`,
     `Order type: ${orderTypeDisplay(request)}`,
     `Step: ${request.stepIndex + 1}/${request.stepCount} (${request.stepId})`,
-    `Assets: ${display(request.assets)}`,
-    `Amounts: ${display(request.amounts)}`,
+    ...transactionDetails(request),
     `Counterparty: ${request.counterparty ?? 'None'}`,
     `Spender: ${request.spender ?? 'None'}`,
     `Protocol fee: ${request.fee}`,
@@ -104,59 +116,13 @@ export class McpFormElicitor
         };
   }
 
-  async requestPrivateValues(
-    request: PrivateValueRequest,
-    timeoutMs: number,
+  requestPrivateValues(
+    _request: PrivateValueRequest,
+    _timeoutMs: number,
   ): Promise<PrivateValueResult> {
-    if (!this.isSupported()) return { outcome: 'cancelled' };
-    const properties = Object.fromEntries(
-      request.fields.map((field) => [
-        field.id,
-        field.kind === 'access-secret'
-          ? {
-              type: 'string' as const,
-              title: field.title,
-              description: field.description,
-              pattern: '^0x[0-9a-fA-F]{64}$',
-            }
-          : {
-              type: 'string' as const,
-              title: field.title,
-              description: field.description,
-              pattern: '^(?:0|[1-9][0-9]*)(?:\\.[0-9]+)?$',
-            },
-      ]),
-    );
-    const result = await this.#server.elicitInput(
-      {
-        mode: 'form',
-        message: [
-          'Enter confidential ChainWhisper signer values.',
-          `Wallet: ${request.wallet}`,
-          `Operation hash: ${request.operationHash}`,
-          'These values go directly to the local signer and are not MCP tool arguments.',
-          'Never enter a wallet private key, mnemonic, AES key, or vault passphrase.',
-        ].join('\n'),
-        requestedSchema: {
-          type: 'object',
-          properties,
-          required: request.fields.map((field) => field.id),
-        },
-      },
-      { timeout: timeoutMs },
-    );
-    if (result.action === 'decline') return { outcome: 'declined' };
-    if (result.action === 'cancel') return { outcome: 'cancelled' };
-    const content = result.content ?? {};
-    const values: Record<string, string> = {};
-    for (const field of request.fields) {
-      const value = content[field.id];
-      if (typeof value !== 'string' || !value.trim()) {
-        return { outcome: 'declined' };
-      }
-      values[field.id] = value.trim();
-    }
-    return { outcome: 'accepted', values };
+    // MCP form responses are visible to the MCP host. Confidential amounts
+    // and access secrets therefore use the signer-owned local-web channel.
+    return Promise.resolve({ outcome: 'cancelled' });
   }
 }
 

@@ -1,9 +1,31 @@
 import { randomBytes } from 'node:crypto';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, resolve } from 'node:path';
 
 const MINIMUM_PAIRING_SECRET_LENGTH = 32;
+
+const assertPrivatePath = async (
+  path: string,
+  kind: 'directory' | 'file',
+): Promise<void> => {
+  const details = await lstat(path);
+  const expectedType =
+    kind === 'directory' ? details.isDirectory() : details.isFile();
+  if (!expectedType || details.isSymbolicLink()) {
+    throw new Error(
+      `The ChainWhisper pairing ${kind} must be a regular, non-symbolic-link ${kind}.`,
+    );
+  }
+  if (
+    process.platform !== 'win32' &&
+    (details.mode & 0o077) !== 0
+  ) {
+    throw new Error(
+      `The ChainWhisper pairing ${kind} must not be accessible by group or other users.`,
+    );
+  }
+};
 
 export interface PairingSecretOptions {
   environment?: NodeJS.ProcessEnv;
@@ -43,8 +65,11 @@ export const getOrCreatePairingSecret = async (
   }
 
   const pairingPath = resolvePairingSecretPath(options);
-  await mkdir(dirname(pairingPath), { recursive: true, mode: 0o700 });
+  const pairingDirectory = dirname(pairingPath);
+  await mkdir(pairingDirectory, { recursive: true, mode: 0o700 });
+  await assertPrivatePath(pairingDirectory, 'directory');
   try {
+    await assertPrivatePath(pairingPath, 'file');
     return validatePairingSecret(await readFile(pairingPath, 'utf8'));
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
@@ -64,6 +89,7 @@ export const getOrCreatePairingSecret = async (
     if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
       throw error;
     }
+    await assertPrivatePath(pairingPath, 'file');
     return validatePairingSecret(await readFile(pairingPath, 'utf8'));
   }
 };

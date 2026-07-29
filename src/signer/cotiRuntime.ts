@@ -7,12 +7,13 @@ import {
   createPrivateMessagingClient,
   type PrivateMessagingClient,
 } from '@coti-io/coti-sdk-private-messaging';
-import { keccak256 } from 'viem';
+import { formatUnits, keccak256 } from 'viem';
 
 import type {
   Address,
   HexString,
   TransactionReceipt,
+  TransactionFeeQuote,
   TransactionRequest,
   TransactionSimulator,
   WalletTransport,
@@ -22,6 +23,7 @@ import {
   isCotiAesKey,
   normalizeCotiAesKey,
 } from './cotiAes.js';
+import { SignerError } from './errors.js';
 
 type RpcTransaction = {
   hash?: string;
@@ -29,7 +31,160 @@ type RpcTransaction = {
   nonce?: string;
 };
 
+// The signed gas limit and this fixed per-gas ceiling jointly bound the
+// maximum network fee even when an RPC returns hostile fee data.
+export const COTI_SIGNER_MAX_FEE_PER_GAS_WEI = 100_000_000_000n;
+export const COTI_SIGNER_MAX_TRANSACTION_GAS = 12_000_000n;
+
+const boundTransactionFees = Symbol('chainwhisper.boundTransactionFees');
+
+type BoundTransactionFees =
+  | {
+      type: 0;
+      gasPrice: bigint;
+    }
+  | {
+      type: 2;
+      maxFeePerGas: bigint;
+      maxPriorityFeePerGas: bigint;
+    };
+
+type FeeBoundTransactionRequest = Omit<TransactionRequest, 'nonce'> & {
+  [boundTransactionFees]?: BoundTransactionFees;
+};
+
 const asHexHash = (value: string): HexString => value as HexString;
+
+const feePolicyError = (message: string): SignerError =>
+  new SignerError('FEE_CHANGED', message);
+
+const assertFeeWithinPolicy = (
+  value: bigint,
+  label: string,
+): void => {
+  if (
+    value < 0n ||
+    value > COTI_SIGNER_MAX_FEE_PER_GAS_WEI
+  ) {
+    throw feePolicyError(
+      `${label} is outside the signer fee ceiling.`,
+    );
+  }
+};
+
+const asBigInt = (value: unknown): bigint | null => {
+  if (
+    typeof value !== 'bigint' &&
+    typeof value !== 'number' &&
+    typeof value !== 'string'
+  ) {
+    return null;
+  }
+  try {
+    return BigInt(value);
+  } catch {
+    return null;
+  }
+};
+
+const bigintMatches = (
+  actual: unknown,
+  expected: bigint,
+): boolean => {
+  return asBigInt(actual) === expected;
+};
+
+export const assertCotiSignerTransactionFeePolicy = (
+  transaction: EthersTransactionRequest,
+): void => {
+  const gasLimit = asBigInt(transaction.gasLimit);
+  if (
+    gasLimit === null ||
+    gasLimit <= 0n ||
+    gasLimit > COTI_SIGNER_MAX_TRANSACTION_GAS
+  ) {
+    throw feePolicyError(
+      'Transaction gas limit is outside the signer policy ceiling.',
+    );
+  }
+  const gasPrice = asBigInt(transaction.gasPrice);
+  const maxFeePerGas = asBigInt(transaction.maxFeePerGas);
+  const maxPriorityFeePerGas = asBigInt(
+    transaction.maxPriorityFeePerGas,
+  );
+  if (maxFeePerGas !== null || maxPriorityFeePerGas !== null) {
+    if (maxFeePerGas === null || maxPriorityFeePerGas === null) {
+      throw feePolicyError(
+        'The populated transaction has incomplete EIP-1559 fee fields.',
+      );
+    }
+    assertFeeWithinPolicy(maxFeePerGas, 'Maximum gas fee');
+    assertFeeWithinPolicy(
+      maxPriorityFeePerGas,
+      'Maximum priority gas fee',
+    );
+    if (maxPriorityFeePerGas > maxFeePerGas || gasPrice !== null) {
+      throw feePolicyError(
+        'The populated transaction has inconsistent EIP-1559 fee fields.',
+      );
+    }
+    return;
+  }
+  if (gasPrice === null) {
+    throw feePolicyError(
+      'The populated transaction is missing a bounded gas price.',
+    );
+  }
+  assertFeeWithinPolicy(gasPrice, 'Gas price');
+};
+
+export const maximumNetworkFeeDisplay = (
+  gasLimit: bigint,
+  maximumFeePerGas = COTI_SIGNER_MAX_FEE_PER_GAS_WEI,
+): {
+  wei: string;
+  coti: string;
+} => {
+  const wei = gasLimit * maximumFeePerGas;
+  return {
+    wei: wei.toString(),
+    coti: formatUnits(wei, 18),
+  };
+};
+
+const feeQuote = (
+  fees: BoundTransactionFees,
+  gasLimit: bigint,
+): TransactionFeeQuote => {
+  const maximumFeePerGas =
+    fees.type === 2 ? fees.maxFeePerGas : fees.gasPrice;
+  const maximum = maximumNetworkFeeDisplay(
+    gasLimit,
+    maximumFeePerGas,
+  );
+  return {
+    model: fees.type === 2 ? 'eip1559' : 'legacy',
+    maximumNetworkFeeWei: maximum.wei,
+    maximumNetworkFeeCoti: maximum.coti,
+    maximumFeePerGasWei: maximumFeePerGas.toString(),
+    ...(fees.type === 2
+      ? {
+          maximumPriorityFeePerGasWei:
+            fees.maxPriorityFeePerGas.toString(),
+        }
+      : {}),
+  };
+};
+
+export class PolicyBoundCotiWallet extends Wallet {
+  override async populateTransaction(
+    transaction: EthersTransactionRequest,
+  ) {
+    const populated = await super.populateTransaction(transaction);
+    assertCotiSignerTransactionFeePolicy(populated);
+    return populated;
+  }
+}
 
 const normalizedRpcTransaction = (
   value: RpcTransaction | null | undefined,
@@ -77,9 +232,76 @@ export class CotiWalletTransport implements WalletTransport {
     );
   }
 
+  async bindTransactionFees(
+    request: Omit<TransactionRequest, 'nonce'>,
+  ): Promise<BoundTransactionFees> {
+    const feeBoundRequest = request as FeeBoundTransactionRequest;
+    const existing = feeBoundRequest[boundTransactionFees];
+    if (existing) return existing;
+
+    const feeData = await this.provider.getFeeData();
+    const hasMaxFee = feeData.maxFeePerGas !== null;
+    const hasPriorityFee = feeData.maxPriorityFeePerGas !== null;
+    let fees: BoundTransactionFees;
+    if (hasMaxFee || hasPriorityFee) {
+      if (
+        feeData.maxFeePerGas === null ||
+        feeData.maxPriorityFeePerGas === null
+      ) {
+        throw feePolicyError(
+          'The RPC returned incomplete EIP-1559 fee data.',
+        );
+      }
+      assertFeeWithinPolicy(feeData.maxFeePerGas, 'Maximum gas fee');
+      assertFeeWithinPolicy(
+        feeData.maxPriorityFeePerGas,
+        'Maximum priority gas fee',
+      );
+      if (feeData.maxPriorityFeePerGas > feeData.maxFeePerGas) {
+        throw feePolicyError(
+          'The RPC returned a priority gas fee above the maximum gas fee.',
+        );
+      }
+      fees = {
+        type: 2,
+        maxFeePerGas: feeData.maxFeePerGas,
+        maxPriorityFeePerGas: feeData.maxPriorityFeePerGas,
+      };
+    } else {
+      if (feeData.gasPrice === null) {
+        throw feePolicyError(
+          'The RPC did not return usable transaction fee data.',
+        );
+      }
+      assertFeeWithinPolicy(feeData.gasPrice, 'Gas price');
+      fees = {
+        type: 0,
+        gasPrice: feeData.gasPrice,
+      };
+    }
+
+    Object.defineProperty(feeBoundRequest, boundTransactionFees, {
+      value: fees,
+      // The execution paths add the nonce with object spread, so this
+      // private binding must follow that exact request into preparation.
+      enumerable: true,
+      configurable: false,
+      writable: false,
+    });
+    return fees;
+  }
+
   async prepareTransaction(
     request: TransactionRequest,
   ): Promise<{ hash: HexString; signedTransaction: HexString }> {
+    const fees = (request as FeeBoundTransactionRequest)[
+      boundTransactionFees
+    ];
+    if (!fees) {
+      throw feePolicyError(
+        'Transaction fees were not fixed before confirmation.',
+      );
+    }
     const populated = await this.wallet.populateTransaction({
       to: request.to,
       data: request.data,
@@ -87,7 +309,39 @@ export class CotiWalletTransport implements WalletTransport {
       gasLimit: request.gasLimit,
       nonce: request.nonce,
       chainId: await this.getChainId(),
+      ...(fees.type === 2
+        ? {
+            type: 2,
+            maxFeePerGas: fees.maxFeePerGas,
+            maxPriorityFeePerGas: fees.maxPriorityFeePerGas,
+          }
+        : {
+            type: 0,
+            gasPrice: fees.gasPrice,
+          }),
     } satisfies EthersTransactionRequest);
+    if (
+      (fees.type === 2 &&
+        (populated.type !== 2 ||
+          !bigintMatches(
+            populated.maxFeePerGas,
+            fees.maxFeePerGas,
+          ) ||
+          !bigintMatches(
+            populated.maxPriorityFeePerGas,
+            fees.maxPriorityFeePerGas,
+          ) ||
+          populated.gasPrice != null)) ||
+      (fees.type === 0 &&
+        (populated.type !== 0 ||
+          !bigintMatches(populated.gasPrice, fees.gasPrice) ||
+          populated.maxFeePerGas != null ||
+          populated.maxPriorityFeePerGas != null))
+    ) {
+      throw feePolicyError(
+        'Wallet transaction population changed the pre-confirmed fee fields.',
+      );
+    }
     const signedTransaction = (await this.wallet.signTransaction(
       populated,
     )) as HexString;
@@ -196,7 +450,10 @@ export class CotiTransactionSimulator implements TransactionSimulator {
   async simulate(
     request: Omit<TransactionRequest, 'nonce'>,
     wallet: Address,
-  ): Promise<{ ok: true } | { ok: false; errorCode: string }> {
+  ): Promise<
+    | { ok: true; feeQuote: TransactionFeeQuote }
+    | { ok: false; errorCode: string }
+  > {
     try {
       const estimatedGas =
         await this.#transport.provider.estimateGas({
@@ -212,9 +469,20 @@ export class CotiTransactionSimulator implements TransactionSimulator {
           errorCode: 'SIMULATION_GAS_CAP_EXCEEDED',
         };
       }
-      return { ok: true };
-    } catch {
-      return { ok: false, errorCode: 'SIMULATION_REVERTED' };
+      const fees =
+        await this.#transport.bindTransactionFees(request);
+      return {
+        ok: true,
+        feeQuote: feeQuote(fees, request.gasLimit),
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        errorCode:
+          error instanceof SignerError && error.code === 'FEE_CHANGED'
+            ? 'SIMULATION_FEE_POLICY_REJECTED'
+            : 'SIMULATION_REVERTED',
+      };
     }
   }
 }
@@ -237,7 +505,10 @@ export const createCotiSignerRuntime = (
     ? normalizeCotiAesKey(configuredAesKey)
     : null;
   const provider = new JsonRpcProvider(config.rpcUrl);
-  const wallet = new Wallet(secrets.privateKey, provider);
+  const wallet = new PolicyBoundCotiWallet(
+    secrets.privateKey,
+    provider,
+  );
   wallet.disableAutoOnboard();
   if (aesKey) wallet.setAesKey(aesKey);
   const transport = new CotiWalletTransport({ wallet, provider });

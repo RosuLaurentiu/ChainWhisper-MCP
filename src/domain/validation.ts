@@ -54,20 +54,53 @@ export const normalizeOptionalHash = (value: unknown, field: string): string | n
   return value.trim().toLowerCase();
 };
 
+const MAX_INPUT_DEPTH = 32;
+const MAX_INPUT_NODES = 2_048;
+
 export const rejectSensitiveOrArbitraryInput = (value: unknown, path = 'input'): void => {
-  if (!value || typeof value !== 'object') return;
-  if (Array.isArray(value)) {
-    value.forEach((entry, index) => rejectSensitiveOrArbitraryInput(entry, `${path}[${index}]`));
-    return;
-  }
-  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
-    const normalized = key.replace(/[^a-z]/giu, '').toLowerCase();
-    if (FORBIDDEN_INPUT_KEYS.has(normalized)) {
-      throw new DomainInputError('Secrets, credentials, signatures, and arbitrary transaction data are not accepted.', [
-        { field: `${path}.${key}`, message: 'Configure sensitive data only in the local signer adapter.' }
+  const pending: Array<{ value: unknown; path: string; depth: number }> = [
+    { value, path, depth: 0 }
+  ];
+  const visited = new WeakSet<object>();
+  let nodes = 0;
+
+  while (pending.length > 0) {
+    const current = pending.pop()!;
+    if (!current.value || typeof current.value !== 'object') continue;
+    if (visited.has(current.value)) continue;
+    visited.add(current.value);
+    nodes += 1;
+    if (current.depth > MAX_INPUT_DEPTH || nodes > MAX_INPUT_NODES) {
+      throw new DomainInputError('The request is too deeply nested or complex.', [
+        {
+          field: current.path,
+          message: 'Use a shallow JSON object containing only the documented tool fields.'
+        }
       ]);
     }
-    rejectSensitiveOrArbitraryInput(entry, `${path}.${key}`);
+    if (Array.isArray(current.value)) {
+      for (let index = current.value.length - 1; index >= 0; index -= 1) {
+        pending.push({
+          value: current.value[index],
+          path: `${current.path}[${index}]`,
+          depth: current.depth + 1
+        });
+      }
+      continue;
+    }
+    for (const [key, entry] of Object.entries(current.value as Record<string, unknown>)) {
+      const normalized = key.replace(/[^a-z]/giu, '').toLowerCase();
+      if (FORBIDDEN_INPUT_KEYS.has(normalized)) {
+        throw new DomainInputError('Secrets, credentials, signatures, and arbitrary transaction data are not accepted.', [
+          { field: `${current.path}.${key}`, message: 'Configure sensitive data only in the local signer adapter.' }
+        ]);
+      }
+      pending.push({
+        value: entry,
+        path: `${current.path}.${key}`,
+        depth: current.depth + 1
+      });
+    }
   }
 };
 

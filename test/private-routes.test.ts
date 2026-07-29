@@ -256,6 +256,10 @@ describe('audited private transaction routes', () => {
     const estimateGas = vi.fn().mockResolvedValue(233_280n);
     const simulator = new CotiTransactionSimulator({
       provider: { estimateGas },
+      bindTransactionFees: vi.fn().mockResolvedValue({
+        type: 0,
+        gasPrice: 1n,
+      }),
     } as never);
     const request = {
       to: FEE_RECIPIENT,
@@ -264,7 +268,7 @@ describe('audited private transaction routes', () => {
       gasLimit: 6_000_000n,
     };
 
-    await expect(simulator.simulate(request, WALLET)).resolves.toEqual({
+    await expect(simulator.simulate(request, WALLET)).resolves.toMatchObject({
       ok: true,
     });
     expect(estimateGas).toHaveBeenCalledWith({
@@ -350,6 +354,61 @@ describe('audited private transaction routes', () => {
         0,
       ),
     ).resolves.toBeUndefined();
+  });
+
+  it('rejects a paired private recipe missing a mandatory relational output', async () => {
+    const manifest = await loadRuntimeManifest();
+    const intent: CreateTradeIntent = {
+      action: 'create_trade',
+      wallet: WALLET,
+      offerAsset: asset(manifest, 'WISP'),
+      requestAsset: asset(manifest, 'COTI'),
+      offerAmount: '10',
+      requestAmount: '2',
+      access: 'unlisted',
+      recipient: null,
+      amountVisibility: 'visible',
+      expiresAt: '2026-07-28T12:00:00.000Z',
+      fillPolicy: {
+        partialFillsAllowed: false,
+        minPartialFillBps: 0,
+        minRequestAmount: null,
+        maxRequestAmountPerWallet: null,
+        oneFillPerWallet: false,
+      },
+      secretPolicy: { kind: 'none' },
+    };
+    const execution = await new ManifestExecutionPlanner({
+      manifest,
+      rpc: new FakePlannerRpc(),
+      now: () => NOW,
+    }).plan(intent, status(manifest));
+    const protocol = execution.steps.find(
+      (step) => step.kind === 'protocol',
+    );
+    const group = protocol?.privateArtifactGroups?.[0];
+    if (!group) throw new Error('Expected a Direct private recipe.');
+    group.outputs = group.outputs.filter(
+      (output) => output.kind !== 'terms-hash-v1',
+    );
+    const signed = (
+      await new SignedDomainEnvelopeFactory({
+        manifest,
+        pairingSecret: PAIRING,
+        now: () => NOW,
+      }).create(intent, execution)
+    ).payload as SignedActionEnvelopeV1;
+
+    await expect(
+      new ActionEnvelopeVerifier(
+        config(manifest),
+        runtimeState(manifest, signed),
+        () => NOW,
+      ).verify(signed, WALLET),
+    ).rejects.toMatchObject({
+      code: 'ENVELOPE_INVALID',
+      message: expect.stringContaining('recipe is incomplete'),
+    });
   });
 
   it('binds each visible recurring private allowance to its own signed liquidity field', async () => {

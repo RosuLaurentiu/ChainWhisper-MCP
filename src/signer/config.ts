@@ -1,4 +1,4 @@
-import { readFile } from 'node:fs/promises';
+import { lstat, readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { isAbsolute, resolve } from 'node:path';
 import { getOrCreatePairingSecret } from '../shared/index.js';
@@ -100,7 +100,7 @@ const positiveInteger = (
 const confirmationChannel = (
   value: unknown,
 ): 'mcp' | 'local-web' => {
-  if (value === undefined || value === '') return 'mcp';
+  if (value === undefined || value === '') return 'local-web';
   if (value !== 'mcp' && value !== 'local-web') {
     throw new SignerError(
       'CONFIGURATION_REQUIRED',
@@ -127,6 +127,18 @@ const loadConfigFile = async (
     ? requested
     : resolve(process.cwd(), requested);
   try {
+    const details = await lstat(absolute);
+    if (!details.isFile() || details.isSymbolicLink()) {
+      throw new Error('configuration path must be a regular, non-symbolic-link file');
+    }
+    if (
+      process.platform !== 'win32' &&
+      (details.mode & 0o077) !== 0
+    ) {
+      throw new Error(
+        'configuration file must not be readable or writable by group or other users (use chmod 600)',
+      );
+    }
     const parsed: unknown = JSON.parse(await readFile(absolute, 'utf8'));
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
       throw new Error('configuration root must be an object');
@@ -163,7 +175,7 @@ export class LoadedSignerConfig {
     this.rpcUrl = config.rpcUrl;
     this.stateDirectory = config.stateDirectory;
     this.expectedWallet = config.expectedWallet;
-    this.confirmationChannel = config.confirmationChannel ?? 'mcp';
+    this.confirmationChannel = config.confirmationChannel ?? 'local-web';
     this.confirmationTimeoutMs = config.confirmationTimeoutMs;
     this.operationExpirySkewMs = config.operationExpirySkewMs;
     this.#secrets = { ...config.secrets };
