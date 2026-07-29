@@ -23,7 +23,7 @@ import { fileURLToPath } from 'node:url';
 
 const scriptDirectory = dirname(fileURLToPath(import.meta.url));
 const packageRoot = resolve(scriptDirectory, '..');
-const repositoryRoot = resolve(packageRoot, '..', '..');
+const repositoryRoot = packageRoot;
 
 const readCliOptions = () => {
   let packDestination;

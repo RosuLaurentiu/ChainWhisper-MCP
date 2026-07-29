@@ -58,13 +58,13 @@ Install the exact reviewed release after that version is published:
 npm install --global @chainwhisper/agent-tools@0.1.0-beta.0
 ```
 
-For repository development, build and run the workspace package instead of
-assuming the beta tag has already been published:
+For repository development, build and run the local package instead of assuming
+the beta tag has already been published:
 
 ```sh
 npm ci
-npm run build:mcp
-node packages/chainwhisper-agent-tools/dist/bin/chainwhisper-mcp.js
+npm run build
+node dist/bin/chainwhisper-mcp.js
 ```
 
 Register both commands with the same local MCP client:
@@ -422,21 +422,22 @@ not call a chain provider, sign, broadcast, or send a message.
 The tarball gate then creates the actual npm archive with lifecycle scripts
 disabled, checks its allowlisted contents, performs a real npm install in an
 external temporary consumer, and repeats the stdio smoke through both
-npm-created command shims. `build:mcp` must run first. The clean install may
+npm-created command shims. `npm run build` must run first. The clean install may
 resolve package dependencies through the configured npm registry.
 
 ```sh
-npm run build:mcp
-npm run test:mcp
-npm run smoke:mcp
-npm run pack:mcp
+npm run lint
+npm run build
+npm test
+npm run smoke
+npm run verify:tarball
 ```
 
 The following checks are read-only but use the configured COTI Mainnet RPC:
 
 ```sh
-npm run smoke:mcp:live
-npm run audit:runtime --workspace @chainwhisper/agent-tools
+npm run smoke:live
+npm run audit:runtime
 ```
 
 Live signing and private-message smoke tests are intentionally excluded. They
@@ -445,7 +446,8 @@ require explicitly funded test wallets and separate authorization.
 ## Publishing the beta
 
 The repository's `Publish ChainWhisper Agent Tools` workflow is the only
-documented release path. Before dispatching it:
+documented release path. See [BETA_RELEASE.md](./BETA_RELEASE.md) for the
+complete checklist. Before dispatching it:
 
 1. Confirm the `@chainwhisper` npm scope can publish the package.
 2. Create a protected GitHub Actions environment named `npm-beta`.

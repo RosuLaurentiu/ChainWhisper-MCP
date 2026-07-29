@@ -9,12 +9,11 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/RosuLaurentiu/ChainWhisper.git",
-    "directory": "packages/chainwhisper-agent-tools"
+    "url": "git+https://github.com/RosuLaurentiu/ChainWhisper-MCP.git"
   },
-  "homepage": "https://github.com/RosuLaurentiu/ChainWhisper/tree/agent/packages/chainwhisper-agent-tools#readme",
+  "homepage": "https://github.com/RosuLaurentiu/ChainWhisper-MCP#readme",
   "bugs": {
-    "url": "https://github.com/RosuLaurentiu/ChainWhisper/issues"
+    "url": "https://github.com/RosuLaurentiu/ChainWhisper-MCP/issues"
   },
   "engines": {
     "node": ">=20"
@@ -37,9 +36,17 @@
     "./signer": "./dist/signer/index.js"
   },
   "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "lint": "eslint .",
+    "test": "vitest run test",
+    "smoke": "node scripts/package-smoke.mjs",
+    "smoke:live": "node scripts/package-smoke.mjs --live-status",
+    "verify:tarball": "npm run build && node scripts/package-tarball-smoke.mjs",
+    "pack:dry-run": "npm run build && npm pack --dry-run",
+    "audit:dependencies": "npm audit --omit=dev --audit-level=low",
     "audit:runtime": "node dist/bin/audit-runtime.js",
     "prepack": "tsc -p tsconfig.json",
-    "prepublishOnly": "tsc -p tsconfig.json && vitest run test && node scripts/package-smoke.mjs && node scripts/package-tarball-smoke.mjs"
+    "prepublishOnly": "npm run lint && npm run build && npm test && npm run smoke && npm run audit:dependencies && node scripts/package-tarball-smoke.mjs"
   },
   "dependencies": {
     "@coti-io/coti-ethers": "1.0.5",
@@ -52,8 +59,12 @@
     "zod": "3.25.76"
   },
   "devDependencies": {
+    "@eslint/js": "9.39.2",
     "@types/node": "22.19.15",
+    "eslint": "9.39.2",
+    "globals": "17.3.0",
     "typescript": "5.9.3",
+    "typescript-eslint": "8.56.0",
     "vitest": "4.0.18"
   }
 }

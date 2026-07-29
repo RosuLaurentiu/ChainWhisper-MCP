@@ -95,10 +95,19 @@ assert.deepEqual(packageJson.files, [
   'LICENSE',
 ]);
 assert.deepEqual(packageJson.scripts, {
+  build: 'tsc -p tsconfig.json',
+  lint: 'eslint .',
+  test: 'vitest run test',
+  smoke: 'node scripts/package-smoke.mjs',
+  'smoke:live': 'node scripts/package-smoke.mjs --live-status',
+  'verify:tarball':
+    'npm run build && node scripts/package-tarball-smoke.mjs',
+  'pack:dry-run': 'npm run build && npm pack --dry-run',
+  'audit:dependencies': 'npm audit --omit=dev --audit-level=low',
   'audit:runtime': 'node dist/bin/audit-runtime.js',
   prepack: 'tsc -p tsconfig.json',
   prepublishOnly:
-    'tsc -p tsconfig.json && vitest run test && node scripts/package-smoke.mjs && node scripts/package-tarball-smoke.mjs',
+    'npm run lint && npm run build && npm test && npm run smoke && npm run audit:dependencies && node scripts/package-tarball-smoke.mjs',
 });
 
 const plannerBinary = resolve(packageRoot, packageJson.bin['chainwhisper-mcp']);

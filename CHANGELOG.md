@@ -65,6 +65,8 @@ Initial public beta release candidate.
 
 ### Verification
 
+- The agent tools are maintained in a dedicated standalone repository with an
+  independent lockfile, cross-platform CI, and protected beta release workflow.
 - The package build and 209-test MCP suite pass on the release-candidate
   working tree; three POSIX-specific checks are skipped on Windows.
 - Stdio smoke coverage verifies the planner surface and the unconfigured

@@ -13,7 +13,7 @@ MCP processes, and run the two read-only status checks before enabling writes.
 ## Report a vulnerability privately
 
 Use
-[GitHub private vulnerability reporting](https://github.com/RosuLaurentiu/ChainWhisper/security/advisories/new)
+[GitHub private vulnerability reporting](https://github.com/RosuLaurentiu/ChainWhisper-MCP/security/advisories/new)
 to send the maintainers a draft security advisory. Do not open a public issue
 for a suspected vulnerability. If private reporting is unavailable, use a
 non-sensitive contact channel associated with the repository owner to arrange
