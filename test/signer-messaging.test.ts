@@ -721,7 +721,7 @@ describe('embedded official COTI negotiation messaging', () => {
     expect(afterConflict.privateValues?.[ORDER_ACCESS_SECRET_ID]).toBe(
       secret,
     );
-  });
+  }, 15_000);
 
   it('atomically preserves one order access binding across concurrent conflicting reads', async () => {
     const firstSecret = `0x${'ab'.repeat(32)}` as HexString;

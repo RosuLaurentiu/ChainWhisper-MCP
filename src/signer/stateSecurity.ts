@@ -5,6 +5,7 @@ import {
   open,
   readdir,
   readFile,
+  realpath,
   rename,
   unlink,
 } from 'node:fs/promises';
@@ -47,6 +48,27 @@ const errorCode = (error: unknown): string | undefined =>
 export const isMissingPathError = (error: unknown): boolean =>
   errorCode(error) === 'ENOENT';
 
+// macOS publishes TMPDIR under /var/folders even though /var is an
+// OS-managed alias. Only that exact root-owned alias and target are trusted;
+// every descendant component still goes through the normal link check.
+const isTrustedMacOsVarAlias = async (
+  path: string,
+  ownerUid: number,
+): Promise<boolean> => {
+  if (
+    process.platform !== 'darwin' ||
+    path !== '/var' ||
+    ownerUid !== 0
+  ) {
+    return false;
+  }
+  try {
+    return (await realpath(path)) === '/private/var';
+  } catch {
+    return false;
+  }
+};
+
 const assertNoLinkedComponents = async (
   inputPath: string,
   allowMissingTail: boolean,
@@ -61,7 +83,10 @@ const assertNoLinkedComponents = async (
     current = join(current, segment);
     try {
       const details = await lstat(current);
-      if (details.isSymbolicLink()) {
+      if (
+        details.isSymbolicLink() &&
+        !(await isTrustedMacOsVarAlias(current, details.uid))
+      ) {
         throw new SignerPathSecurityError(
           'state-path-linked',
           'The signer path must not contain symbolic links or junctions.',
