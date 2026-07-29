@@ -81,7 +81,7 @@ export class ChainWhisperSignerService {
   }
 
   async getStatus(): Promise<PublicSignerStatus> {
-    let wallet: Address | null = null;
+    let wallet: Address | null;
     try {
       wallet = await this.#wallet.getAddress();
     } catch {

@@ -1597,8 +1597,7 @@ export class ChainWhisperMessagingBridge {
         errorCode: 'MESSAGE_BROADCAST_UNCERTAIN',
       });
     }
-    record =
-      (await this.#journal.recordReceipt(operationId, receipt)) ?? record;
+    await this.#journal.recordReceipt(operationId, receipt);
     if (receipt.status === 'pending') {
       return safeResult({
         status: 'processing',

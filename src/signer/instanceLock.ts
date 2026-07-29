@@ -54,7 +54,7 @@ export class SignerInstanceLock {
   async release(): Promise<void> {
     if (this.#released) return;
 
-    let owner: LockOwnerV1 | null = null;
+    let owner: LockOwnerV1 | null;
     try {
       owner = parseOwner(await readFile(this.path, 'utf8'));
     } catch {

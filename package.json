@@ -16,7 +16,7 @@
     "url": "https://github.com/RosuLaurentiu/ChainWhisper-MCP/issues"
   },
   "engines": {
-    "node": "^22.0.0 || ^24.0.0 || ^26.0.0"
+    "node": "^22.13.0 || ^24.0.0 || ^26.0.0"
   },
   "bin": {
     "chainwhisper-mcp": "./dist/bin/chainwhisper-mcp.js",
@@ -59,12 +59,12 @@
     "zod": "3.25.76"
   },
   "devDependencies": {
-    "@eslint/js": "9.39.2",
+    "@eslint/js": "10.0.1",
     "@types/node": "22.19.15",
-    "eslint": "9.39.2",
-    "globals": "17.3.0",
+    "eslint": "10.8.0",
+    "globals": "17.8.0",
     "typescript": "5.9.3",
-    "typescript-eslint": "8.56.0",
-    "vitest": "4.0.18"
+    "typescript-eslint": "8.65.0",
+    "vitest": "4.1.10"
   }
 }

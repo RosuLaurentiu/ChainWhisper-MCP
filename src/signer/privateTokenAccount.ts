@@ -260,12 +260,7 @@ export class PrivateTokenAccountService {
           transactionHash: record.transactionHashes.at(-1) ?? null,
         };
       }
-      record =
-        (await this.#journal.updateStage(
-          operationId,
-          'validated',
-          0,
-        )) ?? record;
+      await this.#journal.updateStage(operationId, 'validated', 0);
     }
     for (const transactionHash of record.transactionHashes) {
       let receipt;
@@ -323,12 +318,7 @@ export class PrivateTokenAccountService {
       // persists a hash. A nonce-only record is therefore safe to retry,
       // while a different wallet transaction with that nonce is not proof
       // that this setup call was sent.
-      record =
-        (await this.#journal.updateStage(
-          operationId,
-          'validated',
-          0,
-        )) ?? record;
+      await this.#journal.updateStage(operationId, 'validated', 0);
     }
     const request = {
       to: current.token,
@@ -425,13 +415,12 @@ export class PrivateTokenAccountService {
         return { hash: prepared.hash, observed };
       },
     );
-    record =
-      (await this.#journal.recordBroadcast(
-        operationId,
-        broadcast.nonce,
-        broadcast.result.hash,
-        0,
-      )) ?? record;
+    await this.#journal.recordBroadcast(
+      operationId,
+      broadcast.nonce,
+      broadcast.result.hash,
+      0,
+    );
     if (!broadcast.result.observed) {
       return {
         ...current,
