@@ -84,7 +84,7 @@ const withStdioClient = async (name, binaryPath, environment, callback) => {
 const packageJson = JSON.parse(await readFile(packageJsonPath, 'utf8'));
 assert.equal(
   packageJson.engines?.node,
-  '^22.0.0 || ^24.0.0 || ^26.0.0',
+  '^22.13.0 || ^24.0.0 || ^26.0.0',
 );
 assert.equal(packageJson.bin?.['chainwhisper-mcp'], './dist/bin/chainwhisper-mcp.js');
 assert.equal(
