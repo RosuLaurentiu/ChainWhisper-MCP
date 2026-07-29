@@ -5,3 +5,4 @@ export * from './privacyBridge.js';
 export * from './protocol.js';
 export * from './redaction.js';
 export * from './runtimeManifest.js';
+export * from './version.js';

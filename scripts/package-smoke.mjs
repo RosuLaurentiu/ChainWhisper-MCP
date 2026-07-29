@@ -11,7 +11,9 @@ import {
   getDefaultEnvironment,
 } from '@modelcontextprotocol/sdk/client/stdio.js';
 
-const REQUEST_TIMEOUT_MS = 30_000;
+// A clean Windows npm install can spend substantial time cold-loading the
+// COTI SDK dependency graph under real-time antivirus scanning.
+const REQUEST_TIMEOUT_MS = 90_000;
 const scriptDirectory = dirname(fileURLToPath(import.meta.url));
 const packageRootArgument = process.argv.indexOf('--package-root');
 const packageRoot =
@@ -80,7 +82,10 @@ const withStdioClient = async (name, binaryPath, environment, callback) => {
 };
 
 const packageJson = JSON.parse(await readFile(packageJsonPath, 'utf8'));
-assert.equal(packageJson.engines?.node, '>=20');
+assert.equal(
+  packageJson.engines?.node,
+  '^22.0.0 || ^24.0.0 || ^26.0.0',
+);
 assert.equal(packageJson.bin?.['chainwhisper-mcp'], './dist/bin/chainwhisper-mcp.js');
 assert.equal(
   packageJson.bin?.['chainwhisper-coti-signer'],
@@ -153,8 +158,12 @@ try {
       });
       assert.deepEqual(
         tools.map((tool) => tool.name),
-        ['chainwhisper_signer_status'],
-        'An unconfigured signer must expose only its read-only status tool.',
+        [
+          'chainwhisper_signer_status',
+          'chainwhisper_open_control_panel',
+          'chainwhisper_autonomy_status',
+        ],
+        'A wallet-setup signer must expose only status and its signer-owned setup surface.',
       );
       const result = await client.callTool(
         { name: 'chainwhisper_signer_status', arguments: {} },
@@ -166,15 +175,24 @@ try {
       assert.equal(status.chainId, 2_632_500);
       assert.equal(status.configured, false);
       assert.equal(status.mode, 'configuration-required');
+      assert.equal(status.walletSetup, 'required');
+      assert.equal(status.signerReadiness, 'wallet-setup-required');
+      assert.equal(status.controlPageReadiness, 'ready');
+      assert.deepEqual(status.autonomy, {
+        mode: 'manual',
+        state: 'inactive',
+        activePolicyCount: 0,
+        globalPaused: false,
+      });
     },
   );
   assert.deepEqual(
-    await readdir(stateDirectory),
-    [],
-    'An unconfigured signer must not create pairing, journal, or vault state.',
+    (await readdir(stateDirectory)).sort(),
+    ['pairing.key', 'signer.instance.lock', 'storage.key'],
+    'Wallet setup may create only the process lock, local pairing, and internal storage keys.',
   );
   process.stdout.write(
-    'chainwhisper-coti-signer: unconfigured read-only status verified\n',
+    'chainwhisper-coti-signer: wallet-setup status and local control surface verified\n',
   );
 
   await withStdioClient(

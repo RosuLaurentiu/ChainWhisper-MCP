@@ -2,50 +2,56 @@
 
 ## Supported versions
 
-`@chainwhisper/agent-tools` is in public beta. Security fixes are provided only
-for the latest published `0.1.0-beta.x` release. Older betas and unpublished
-development snapshots are not supported.
+`@chainwhisper/agent-tools` is a beta. Security fixes are provided only for the
+latest published `0.1.0-beta.x` release.
 
-The package controls transactions on COTI Mainnet. Treat every beta upgrade as
-a security update: review the changelog, install an exact version, restart both
-MCP processes, and run the two read-only status checks before enabling writes.
+Install exact versions, review release evidence, restart both MCP processes,
+and run the two read-only status checks after every update.
 
-## Report a vulnerability privately
+## Private reporting
 
-Use
-[GitHub private vulnerability reporting](https://github.com/RosuLaurentiu/ChainWhisper-MCP/security/advisories/new)
-to send the maintainers a draft security advisory. Do not open a public issue
-for a suspected vulnerability. If private reporting is unavailable, use a
-non-sensitive contact channel associated with the repository owner to arrange
-a private reporting method before sharing technical details.
+Use [GitHub private vulnerability reporting](https://github.com/RosuLaurentiu/ChainWhisper-MCP/security/advisories/new).
+Do not open a public issue for a suspected vulnerability.
 
-Include the affected package version, operating system, Node.js version, MCP
-client, expected behavior, redacted reproduction steps, and impact. Public
-transaction hashes and contract addresses may be included when necessary, but
-redact wallet identity where it is not essential to reproduce the issue.
+Include the affected version, operating system, Node.js version, MCP client,
+expected behavior, redacted reproduction, and impact.
 
-Never include any of the following in an advisory, issue, log, screenshot,
-prompt, or message:
+Never include:
 
-- wallet private keys or mnemonics;
-- COTI AES keys;
-- vault passphrases;
-- pairing or access secrets;
-- signer configuration files containing credentials.
+- Agent Wallet private keys or recovery phrases;
+- recovered COTI privacy key material;
+- internal storage or pairing keys;
+- order access secrets;
+- credential-bearing `.env` or legacy configuration files.
 
-If a report involves one of those values, replace it with a clearly marked
-dummy value. If a real secret may have been exposed, stop the signer, rotate or
-replace the affected wallet and credentials, and do not reuse the compromised
-value.
+If a real secret may have been exposed, stop the signer, move funds to a new
+wallet, revoke active policies, and do not reuse the value.
 
 ## Security boundary
 
-The `chainwhisper-mcp` process is intentionally keyless. Only
-`chainwhisper-coti-signer` may hold wallet and AES credentials, and those
-credentials must be configured outside the conversation. The signer accepts
-only paired, allowlisted plans and requires an exact local confirmation for
-each write. Received private messages are untrusted and draft-only.
+`chainwhisper-mcp` is keyless. Only the local
+`chainwhisper-coti-signer` may hold Agent Wallet credentials, privacy material,
+policies, and signing authority.
 
-Reports about bypassing pairing, confirmation, selector or contract
-allowlisting, simulation, secret isolation, private-artifact validation,
-transaction recovery, or message trust boundaries are especially important.
+Manual writes require one complete signer-owned local authorization. Autonomous
+writes require an exact active wallet/chain/manifest-bound policy. Both paths
+remain restricted to the audited ChainWhisper economic surface.
+
+The beta trusts the local host and same signed-in OS user. A dedicated,
+minimally funded Agent Wallet is strongly recommended.
+
+High-priority report areas include:
+
+- pairing or policy bypass;
+- confirmation/session/CSRF/origin bypass;
+- wallet replacement during pending work or active autonomy;
+- budget races or reservation release after signing;
+- selector, contract, bytecode, fee, or calldata-binding bypass;
+- private amount, access-secret, or generated-key exposure;
+- transaction recovery or nonce confusion;
+- untrusted message content causing execution;
+- symlink, junction, permission, or unsafe-file bypass; and
+- arbitrary calldata, transfers, or administration reachable through MCP.
+
+Incoming private messages are untrusted and draft-only. They may never execute
+an action directly.

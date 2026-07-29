@@ -1,85 +1,355 @@
 name: Publish ChainWhisper Agent Tools
 
 on:
-  workflow_dispatch:
-    inputs:
-      version:
-        description: Exact prerelease version from the package manifest
-        required: true
-        type: string
-
-permissions:
-  contents: read
-  id-token: write
+  push:
+    tags:
+      - 'v*'
 
 concurrency:
-  group: publish-chainwhisper-agent-tools
+  group: publish-chainwhisper-agent-tools-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  publish-beta:
-    name: Verify and publish beta
+  build-evidence:
+    name: Build immutable release evidence
     runs-on: ubuntu-latest
-    environment: npm-beta
+    permissions:
+      contents: read
+    outputs:
+      package-version: ${{ steps.identity.outputs.package-version }}
+      artifact-name: ${{ steps.identity.outputs.artifact-name }}
     steps:
-      - name: Checkout
+      - name: Checkout exact tag
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
 
       - name: Setup Node
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 22
-          cache: npm
+          node-version: 24
           registry-url: https://registry.npmjs.org
+
+      - name: Validate release identity
+        id: identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_version="$(node -p "require('./package.json').version")"
+          source_version="$(node --input-type=module -e "import { readFileSync } from 'node:fs'; const value=readFileSync('src/shared/version.ts','utf8').match(/VERSION\\s*=\\s*'([^']+)'/)?.[1]; if (!value) process.exit(2); process.stdout.write(value)")"
+          expected_tag="v${package_version}"
+          if [[ "${GITHUB_REF_TYPE}" != "tag" || "${GITHUB_REF_NAME}" != "${expected_tag}" ]]; then
+            echo "Release tag must exactly equal ${expected_tag}." >&2
+            exit 1
+          fi
+          if [[ "${package_version}" != *-beta.* ]]; then
+            echo "Only explicit beta prereleases may use this workflow." >&2
+            exit 1
+          fi
+          if [[ "${source_version}" != "${package_version}" ]]; then
+            echo "Source version ${source_version} does not match package ${package_version}." >&2
+            exit 1
+          fi
+          git fetch origin main --no-tags
+          if ! git merge-base --is-ancestor HEAD origin/main; then
+            echo "The tagged commit is not contained in origin/main." >&2
+            exit 1
+          fi
+          echo "package-version=${package_version}" >> "${GITHUB_OUTPUT}"
+          echo "artifact-name=chainwhisper-agent-tools-${package_version}" >> "${GITHUB_OUTPUT}"
 
       - name: Install dependencies
         run: npm ci
 
-      - name: Validate requested version
-        shell: bash
-        env:
-          REQUESTED_VERSION: ${{ inputs.version }}
-        run: |
-          package_version="$(node -p "require('./package.json').version")"
-          if [[ "$package_version" != "$REQUESTED_VERSION" ]]; then
-            echo "Requested version does not match package.json: $package_version" >&2
-            exit 1
-          fi
-          if [[ "$package_version" != *-beta.* ]]; then
-            echo "Only explicit beta prereleases may use this workflow." >&2
-            exit 1
-          fi
-          if npm view "@chainwhisper/agent-tools@$package_version" version >/dev/null 2>&1; then
-            echo "@chainwhisper/agent-tools@$package_version already exists and cannot be replaced." >&2
-            exit 1
-          fi
+      - name: Verify registry signatures and attestations
+        run: npm audit signatures
 
-      - name: Verify source and COTI Mainnet runtime
+      - name: Verify source
         run: |
           npm run lint
           npm run build
           npm test
           npm run smoke
           npm run audit:dependencies
-          npm run audit:runtime
 
-      - name: Build and verify the release tarball
+      - name: Build and inspect the exact tarball
         shell: bash
         run: |
+          set -euo pipefail
           mkdir release-artifacts
           node scripts/package-tarball-smoke.mjs --pack-destination release-artifacts
-          sha256sum release-artifacts/*.tgz > release-artifacts/SHA256SUMS
-          npm sbom --sbom-format cyclonedx > release-artifacts/sbom.cdx.json
+          node dist/bin/audit-runtime.js > release-artifacts/runtime-audit.json
+          cp CHANGELOG.md release-artifacts/RELEASE_NOTES.md
+          (
+            cd release-artifacts
+            sha256sum ./*.tgz > SHA256SUMS
+            sha256sum -c SHA256SUMS
+          )
 
-      - name: Upload release evidence
+      - name: Generate production-only SBOM from installed tarball
+        shell: bash
+        run: |
+          set -euo pipefail
+          tarball="$(realpath release-artifacts/*.tgz)"
+          consumer="$(mktemp -d)"
+          trap 'rm -rf "${consumer}"' EXIT
+          cd "${consumer}"
+          npm init --yes >/dev/null
+          npm install --ignore-scripts --omit=dev --no-audit --no-fund "${tarball}"
+          npm sbom --omit=dev --sbom-format cyclonedx \
+            > "${GITHUB_WORKSPACE}/release-artifacts/sbom.cdx.json"
+
+      - name: Upload immutable release evidence
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: chainwhisper-agent-tools-${{ inputs.version }}
+          name: ${{ steps.identity.outputs.artifact-name }}
           path: release-artifacts/
           if-no-files-found: error
           retention-days: 90
 
+  publish-beta:
+    name: Approve and publish exact beta
+    needs: build-evidence
+    runs-on: ubuntu-latest
+    environment: npm-beta
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - name: Setup Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      - name: Download reviewed release evidence
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ needs.build-evidence.outputs.artifact-name }}
+          path: release-artifacts
+
+      - name: Reverify exact artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release-artifacts
+          sha256sum -c SHA256SUMS
+          test -s runtime-audit.json
+          test -s sbom.cdx.json
+
+      - name: Inspect existing registry version
+        id: registry
+        shell: bash
+        env:
+          PACKAGE_VERSION: ${{ needs.build-evidence.outputs.package-version }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          tarballs=(release-artifacts/*.tgz)
+          if (( ${#tarballs[@]} != 1 )); then
+            echo "Expected exactly one reviewed package tarball." >&2
+            exit 1
+          fi
+          tarball="${tarballs[0]}"
+          local_sha256="$(sha256sum "${tarball}" | awk '{print $1}')"
+          local_sha1="$(sha1sum "${tarball}" | awk '{print $1}')"
+          local_integrity="$(node --input-type=module -e \
+            "import { createHash } from 'node:crypto'; import { readFileSync } from 'node:fs'; process.stdout.write('sha512-' + createHash('sha512').update(readFileSync(process.argv[1])).digest('base64'))" \
+            "${tarball}")"
+          metadata_file="$(mktemp)"
+          registry_tarball_file="$(mktemp)"
+          trap 'rm -f "${metadata_file}" "${registry_tarball_file}"' EXIT
+          metadata_url="https://registry.npmjs.org/@chainwhisper%2Fagent-tools/${PACKAGE_VERSION}"
+          set +e
+          http_code="$(curl --silent --show-error --location \
+            --proto '=https' --tlsv1.2 \
+            --output "${metadata_file}" --write-out '%{http_code}' \
+            "${metadata_url}")"
+          curl_status=$?
+          set -e
+          if (( curl_status != 0 )); then
+            echo "Could not determine whether the package version exists." >&2
+            exit 1
+          fi
+          if [[ "${http_code}" == "404" ]]; then
+            echo "should-publish=true" >> "${GITHUB_OUTPUT}"
+            echo "Registry version is absent; the reviewed artifact will be published."
+            exit 0
+          fi
+          if [[ "${http_code}" != "200" ]]; then
+            echo "Unexpected npm registry response: HTTP ${http_code}." >&2
+            exit 1
+          fi
+          mapfile -t registry_fields < <(
+            node --input-type=module -e \
+              "import { readFileSync } from 'node:fs'; const value=JSON.parse(readFileSync(process.argv[1], 'utf8')); for (const field of [value.version, value.dist?.integrity, value.dist?.shasum, value.dist?.tarball]) { if (typeof field !== 'string' || field.length === 0 || field.includes('\\n')) process.exit(2); console.log(field); }" \
+              "${metadata_file}"
+          )
+          if (( ${#registry_fields[@]} != 4 )); then
+            echo "Registry metadata is incomplete." >&2
+            exit 1
+          fi
+          registry_version="${registry_fields[0]}"
+          registry_integrity="${registry_fields[1]}"
+          registry_sha1="${registry_fields[2]}"
+          registry_tarball="${registry_fields[3]}"
+          if [[ "${registry_version}" != "${PACKAGE_VERSION}" ]]; then
+            echo "Registry returned a different package version." >&2
+            exit 1
+          fi
+          if [[ "${registry_integrity}" != "${local_integrity}" || "${registry_sha1}" != "${local_sha1}" ]]; then
+            echo "Existing registry version does not match the reviewed artifact integrity." >&2
+            exit 1
+          fi
+          if [[ "${registry_tarball}" != https://registry.npmjs.org/* ]]; then
+            echo "Registry returned an unexpected tarball origin." >&2
+            exit 1
+          fi
+          curl --fail --silent --show-error --location \
+            --proto '=https' --tlsv1.2 \
+            --output "${registry_tarball_file}" "${registry_tarball}"
+          registry_sha256="$(sha256sum "${registry_tarball_file}" | awk '{print $1}')"
+          if [[ "${registry_sha256}" != "${local_sha256}" ]]; then
+            echo "Existing registry tarball bytes do not match the reviewed artifact." >&2
+            exit 1
+          fi
+          echo "should-publish=false" >> "${GITHUB_OUTPUT}"
+          echo "Registry already contains the exact reviewed artifact; publish will be skipped."
+
       - name: Publish immutable beta with provenance
-        run: npm publish release-artifacts/*.tgz --access public --tag beta --provenance --ignore-scripts
+        if: steps.registry.outputs.should-publish == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          tarballs=(release-artifacts/*.tgz)
+          if (( ${#tarballs[@]} != 1 )); then
+            echo "Expected exactly one reviewed package tarball." >&2
+            exit 1
+          fi
+          npm publish "${tarballs[0]}" --access public --tag beta --provenance --ignore-scripts
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Verify exact registry publication
+        shell: bash
+        env:
+          PACKAGE_VERSION: ${{ needs.build-evidence.outputs.package-version }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          tarballs=(release-artifacts/*.tgz)
+          if (( ${#tarballs[@]} != 1 )); then
+            echo "Expected exactly one reviewed package tarball." >&2
+            exit 1
+          fi
+          tarball="${tarballs[0]}"
+          local_sha256="$(sha256sum "${tarball}" | awk '{print $1}')"
+          local_sha1="$(sha1sum "${tarball}" | awk '{print $1}')"
+          local_integrity="$(node --input-type=module -e \
+            "import { createHash } from 'node:crypto'; import { readFileSync } from 'node:fs'; process.stdout.write('sha512-' + createHash('sha512').update(readFileSync(process.argv[1])).digest('base64'))" \
+            "${tarball}")"
+          metadata_file="$(mktemp)"
+          registry_tarball_file="$(mktemp)"
+          trap 'rm -f "${metadata_file}" "${registry_tarball_file}"' EXIT
+          metadata_url="https://registry.npmjs.org/@chainwhisper%2Fagent-tools/${PACKAGE_VERSION}"
+          http_code=""
+          for attempt in {1..12}; do
+            set +e
+            http_code="$(curl --silent --show-error --location \
+              --proto '=https' --tlsv1.2 \
+              --output "${metadata_file}" --write-out '%{http_code}' \
+              "${metadata_url}")"
+            curl_status=$?
+            set -e
+            if (( curl_status != 0 )); then
+              echo "Could not verify the npm registry publication." >&2
+              exit 1
+            fi
+            if [[ "${http_code}" == "200" ]]; then
+              break
+            fi
+            if [[ "${http_code}" != "404" || "${attempt}" == "12" ]]; then
+              echo "Unexpected npm registry response: HTTP ${http_code}." >&2
+              exit 1
+            fi
+            sleep 5
+          done
+          mapfile -t registry_fields < <(
+            node --input-type=module -e \
+              "import { readFileSync } from 'node:fs'; const value=JSON.parse(readFileSync(process.argv[1], 'utf8')); for (const field of [value.version, value.dist?.integrity, value.dist?.shasum, value.dist?.tarball]) { if (typeof field !== 'string' || field.length === 0 || field.includes('\\n')) process.exit(2); console.log(field); }" \
+              "${metadata_file}"
+          )
+          if (( ${#registry_fields[@]} != 4 )); then
+            echo "Registry metadata is incomplete." >&2
+            exit 1
+          fi
+          registry_version="${registry_fields[0]}"
+          registry_integrity="${registry_fields[1]}"
+          registry_sha1="${registry_fields[2]}"
+          registry_tarball="${registry_fields[3]}"
+          if [[ "${registry_version}" != "${PACKAGE_VERSION}" ]]; then
+            echo "Registry returned a different package version." >&2
+            exit 1
+          fi
+          if [[ "${registry_integrity}" != "${local_integrity}" || "${registry_sha1}" != "${local_sha1}" ]]; then
+            echo "Published registry integrity does not match the reviewed artifact." >&2
+            exit 1
+          fi
+          if [[ "${registry_tarball}" != https://registry.npmjs.org/* ]]; then
+            echo "Registry returned an unexpected tarball origin." >&2
+            exit 1
+          fi
+          curl --fail --silent --show-error --location \
+            --proto '=https' --tlsv1.2 \
+            --output "${registry_tarball_file}" "${registry_tarball}"
+          registry_sha256="$(sha256sum "${registry_tarball_file}" | awk '{print $1}')"
+          if [[ "${registry_sha256}" != "${local_sha256}" ]]; then
+            echo "Published registry tarball bytes do not match the reviewed artifact." >&2
+            exit 1
+          fi
+
+      - name: Create permanent GitHub prerelease
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PACKAGE_VERSION: ${{ needs.build-evidence.outputs.package-version }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          tarballs=(release-artifacts/*.tgz)
+          if (( ${#tarballs[@]} != 1 )); then
+            echo "Expected exactly one reviewed package tarball." >&2
+            exit 1
+          fi
+          assets=(
+            "${tarballs[0]}"
+            release-artifacts/SHA256SUMS
+            release-artifacts/sbom.cdx.json
+            release-artifacts/runtime-audit.json
+            release-artifacts/RELEASE_NOTES.md
+          )
+          for asset in "${assets[@]}"; do
+            test -s "${asset}"
+          done
+          if gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            is_prerelease="$(gh release view "${RELEASE_TAG}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --json isPrerelease --jq '.isPrerelease')"
+            if [[ "${is_prerelease}" != "true" ]]; then
+              echo "An existing GitHub release for ${RELEASE_TAG} is not a prerelease." >&2
+              exit 1
+            fi
+          else
+            gh release create "${RELEASE_TAG}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --verify-tag \
+              --prerelease \
+              --latest=false \
+              --generate-notes \
+              --title "@chainwhisper/agent-tools ${PACKAGE_VERSION}"
+          fi
+          gh release upload "${RELEASE_TAG}" "${assets[@]}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --clobber

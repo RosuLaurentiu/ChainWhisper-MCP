@@ -1,11 +1,20 @@
 import type { SignedActionEnvelopeV1 } from '../shared/index.js';
 
-import { ConfirmationGate, buildActionConfirmation } from './confirmation.js';
+import {
+  ConfirmationGate,
+  buildActionConfirmation,
+  materializedActionStepDigest,
+} from './confirmation.js';
 import { asSignerErrorCode, SignerError } from './errors.js';
 import { OperationJournal } from './journal.js';
 import { NonceQueue } from './nonceQueue.js';
 import { EncryptedSecretVault } from './vault.js';
 import { ActionEnvelopeVerifier } from './verification.js';
+import {
+  AutonomyPolicyManager,
+  type AutonomyReservationV1,
+} from './autonomy.js';
+import { buildPolicyExposure } from './policyExposure.js';
 import type {
   ExecuteActionResult,
   JournalReceipt,
@@ -15,6 +24,7 @@ import type {
   PrivateInputMaterializer,
   RecoverOperationResult,
   TransactionSimulator,
+  TransactionFeeQuote,
   WalletTransport,
 } from './types.js';
 
@@ -46,6 +56,7 @@ export class SignerEngine {
   readonly #journal: OperationJournal;
   readonly #vault: EncryptedSecretVault;
   readonly #nonceQueue: NonceQueue;
+  readonly #autonomy: AutonomyPolicyManager | null;
   readonly #activeOperations = new Map<string, Promise<ExecuteActionResult>>();
 
   constructor(options: {
@@ -58,6 +69,7 @@ export class SignerEngine {
     journal: OperationJournal;
     vault: EncryptedSecretVault;
     nonceQueue?: NonceQueue;
+    autonomy?: AutonomyPolicyManager;
   }) {
     this.#verifier = options.verifier;
     this.#wallet = options.wallet;
@@ -70,6 +82,7 @@ export class SignerEngine {
     this.#nonceQueue =
       options.nonceQueue ??
       new NonceQueue(() => this.#wallet.getPendingNonce());
+    this.#autonomy = options.autonomy ?? null;
   }
 
   get nonceQueue(): NonceQueue {
@@ -78,10 +91,11 @@ export class SignerEngine {
 
   async executeAction(
     envelope: SignedActionEnvelopeV1,
+    policyId?: string,
   ): Promise<ExecuteActionResult> {
     const active = this.#activeOperations.get(envelope.operationId);
     if (active) return active;
-    const execution = this.#executeAction(envelope).finally(() => {
+    const execution = this.#executeAction(envelope, policyId).finally(() => {
       this.#activeOperations.delete(envelope.operationId);
     });
     this.#activeOperations.set(envelope.operationId, execution);
@@ -90,6 +104,7 @@ export class SignerEngine {
 
   async #executeAction(
     envelope: SignedActionEnvelopeV1,
+    policyId?: string,
   ): Promise<ExecuteActionResult> {
     const wallet = await this.#wallet.getAddress();
     const walletChainId = await this.#wallet.getChainId();
@@ -100,7 +115,7 @@ export class SignerEngine {
       );
     }
     await this.#verifier.verify(envelope, wallet);
-    if (!this.#confirmation.isWriteAvailable) {
+    if (!policyId && !this.#confirmation.isWriteAvailable) {
       return {
         operationId: envelope.operationId,
         operationHash: envelope.operationHash,
@@ -150,15 +165,23 @@ export class SignerEngine {
         record;
     }
 
+    const firstStepIndex = record.nextStepIndex;
+    const materializedSteps: MaterializedActionStep[] = [];
+    const authorizedFeeQuotes: Array<
+      TransactionFeeQuote | undefined
+    > = [];
+    const authorizedStepDigests: string[] = [];
+    let autonomyReservation: AutonomyReservationV1 | null = null;
+    let autonomySigned = false;
+
     for (
-      let stepIndex = record.nextStepIndex;
+      let stepIndex = firstStepIndex;
       stepIndex < envelope.steps.length;
       stepIndex += 1
     ) {
-      let materialized: MaterializedActionStep;
       try {
         await this.#verifier.verify(envelope, wallet);
-        materialized = await this.#materializer.materializeStep(
+        const materialized = await this.#materializer.materializeStep(
           envelope,
           stepIndex,
         );
@@ -172,14 +195,13 @@ export class SignerEngine {
           materialized,
           stepIndex,
         );
-        const requestWithoutNonce = {
-          to: materialized.to,
-          data: materialized.data,
-          value: BigInt(materialized.value),
-          gasLimit: BigInt(materialized.gasCap),
-        };
         const simulation = await this.#simulator.simulate(
-          requestWithoutNonce,
+          {
+            to: materialized.to,
+            data: materialized.data,
+            value: BigInt(materialized.value),
+            gasLimit: BigInt(materialized.gasCap),
+          },
           wallet,
         );
         if (!simulation.ok) {
@@ -192,20 +214,154 @@ export class SignerEngine {
             )) ?? record;
           return toResult(record, 'retryable', errorCode);
         }
+        materializedSteps.push(materialized);
+        authorizedFeeQuotes.push(simulation.feeQuote);
+        authorizedStepDigests.push(
+          materializedActionStepDigest(materialized),
+        );
+      } catch (error) {
+        const errorCode = asSignerErrorCode(error);
+        if (
+          errorCode === 'CONFIRMATION_DECLINED' ||
+          errorCode === 'CONFIRMATION_TIMEOUT' ||
+          errorCode === 'ELICITATION_UNSUPPORTED'
+        ) {
+          await this.#journal.recordError(
+            envelope.operationId,
+            errorCode,
+            false,
+          );
+          record =
+            (await this.#journal.get(envelope.operationId)) ??
+            record;
+          return toResult(record, 'declined', errorCode);
+        }
+        await this.#journal.recordError(
+          envelope.operationId,
+          errorCode,
+          true,
+        );
+        record =
+          (await this.#journal.updateStage(
+            envelope.operationId,
+            'validated',
+            firstStepIndex,
+          )) ?? record;
+        return toResult(record, 'retryable', errorCode);
+      }
+    }
+
+    try {
+      if (policyId) {
+        if (!this.#autonomy) {
+          return {
+            operationId: envelope.operationId,
+            operationHash: envelope.operationHash,
+            status: 'denied',
+            transactionHashes: [...record.transactionHashes],
+            errorCode: 'AUTONOMY_UNAVAILABLE',
+            autonomyDenial: {
+              code: 'POLICY_NOT_FOUND',
+              message: 'Autonomy is not available in this signer session.',
+              policyId,
+            },
+          };
+        }
+        const reserved = await this.#autonomy.reserve(
+          policyId,
+          buildPolicyExposure({
+            envelope,
+            wallet,
+            steps: materializedSteps,
+            feeQuotes: authorizedFeeQuotes,
+          }),
+        );
+        if (!reserved.allowed) {
+          return {
+            operationId: envelope.operationId,
+            operationHash: envelope.operationHash,
+            status: 'denied',
+            transactionHashes: [...record.transactionHashes],
+            errorCode: `AUTONOMY_${reserved.denial.code}`,
+            autonomyDenial: reserved.denial,
+          };
+        }
+        autonomyReservation = reserved.value;
+      } else {
         await this.#journal.updateStage(
           envelope.operationId,
           'awaiting-confirmation',
-          stepIndex,
+          firstStepIndex,
         );
         await this.#confirmation.confirm(
           buildActionConfirmation(
             envelope,
-            materialized,
-            stepIndex,
-            simulation.feeQuote,
+            materializedSteps,
+            firstStepIndex,
+            authorizedFeeQuotes,
           ),
         );
+      }
+    } catch (error) {
+      const errorCode = asSignerErrorCode(error);
+      if (
+        errorCode === 'CONFIRMATION_DECLINED' ||
+        errorCode === 'CONFIRMATION_TIMEOUT' ||
+        errorCode === 'ELICITATION_UNSUPPORTED'
+      ) {
+        await this.#journal.recordError(
+          envelope.operationId,
+          errorCode,
+          false,
+        );
+        record =
+          (await this.#journal.get(envelope.operationId)) ??
+          record;
+        return toResult(record, 'declined', errorCode);
+      }
+      await this.#journal.recordError(
+        envelope.operationId,
+        errorCode,
+        true,
+      );
+      record =
+        (await this.#journal.updateStage(
+          envelope.operationId,
+          'validated',
+          firstStepIndex,
+        )) ?? record;
+      return toResult(record, 'retryable', errorCode);
+    }
+
+    for (
+      let offset = 0;
+      offset < materializedSteps.length;
+      offset += 1
+    ) {
+      const stepIndex = firstStepIndex + offset;
+      const materialized = materializedSteps[offset]!;
+      const requestWithoutNonce = {
+        to: materialized.to,
+        data: materialized.data,
+        value: BigInt(materialized.value),
+        gasLimit: BigInt(materialized.gasCap),
+      };
+      try {
         await this.#verifier.verify(envelope, wallet);
+        this.#assertMaterialization(
+          envelope,
+          stepIndex,
+          materialized,
+        );
+        if (
+          materializedActionStepDigest(materialized) !==
+          authorizedStepDigests[offset]
+        ) {
+          throw new SignerError(
+            'ENVELOPE_TAMPERED',
+            'Materialized calldata changed after the complete action was authorized.',
+          );
+        }
         await this.#intentValidator.validate(
           envelope,
           materialized,
@@ -225,8 +381,23 @@ export class SignerEngine {
               errorCode,
               true,
             )) ?? record;
+          if (autonomyReservation && this.#autonomy) {
+            if (autonomySigned) {
+              await this.#autonomy.markUncertain(
+                autonomyReservation.id,
+              );
+            } else {
+              await this.#autonomy.releaseBeforeSigning(
+                autonomyReservation.id,
+              );
+            }
+          }
           return toResult(record, 'retryable', errorCode);
         }
+        this.#assertFeeAuthorization(
+          authorizedFeeQuotes[offset],
+          confirmedSimulation.feeQuote,
+        );
         const broadcast = await this.#nonceQueue.runTransaction(
           async (nonce) => {
             const prepared = await this.#wallet.prepareTransaction({
@@ -239,6 +410,20 @@ export class SignerEngine {
               prepared.hash,
               stepIndex,
             );
+            if (autonomyReservation && this.#autonomy) {
+              const marked = await this.#autonomy.markSigned(
+                autonomyReservation.id,
+                prepared.hash,
+              );
+              if (!marked.allowed) {
+                throw new SignerError(
+                  'WRITE_UNAVAILABLE',
+                  `Autonomy reservation could not record the signed transaction: ${marked.denial.code}.`,
+                );
+              }
+              autonomySigned = true;
+              autonomyReservation = marked.value;
+            }
             let observed = true;
             try {
               const sent = await this.#wallet.broadcastTransaction(
@@ -270,6 +455,9 @@ export class SignerEngine {
             stepIndex,
           )) ?? record;
         if (!broadcast.result.observed) {
+          if (autonomyReservation && this.#autonomy) {
+            await this.#autonomy.markUncertain(autonomyReservation.id);
+          }
           return toResult(record, 'processing');
         }
         const receipt = await this.#wallet.waitForTransaction(
@@ -281,9 +469,15 @@ export class SignerEngine {
             receipt,
           )) ?? record;
         if (receipt.status === 'pending') {
+          if (autonomyReservation && this.#autonomy) {
+            await this.#autonomy.markPending(autonomyReservation.id);
+          }
           return toResult(record, 'processing');
         }
         if (receipt.status !== 'success') {
+          if (autonomyReservation && this.#autonomy) {
+            await this.#autonomy.markSettled(autonomyReservation.id);
+          }
           record =
             (await this.#journal.recordError(
               envelope.operationId,
@@ -300,21 +494,6 @@ export class SignerEngine {
           )) ?? record;
       } catch (error) {
         const errorCode = asSignerErrorCode(error);
-        if (
-          errorCode === 'CONFIRMATION_DECLINED' ||
-          errorCode === 'CONFIRMATION_TIMEOUT' ||
-          errorCode === 'ELICITATION_UNSUPPORTED'
-        ) {
-          await this.#journal.recordError(
-            envelope.operationId,
-            errorCode,
-            false,
-          );
-          record =
-            (await this.#journal.get(envelope.operationId)) ??
-            record;
-          return toResult(record, 'declined', errorCode);
-        }
         await this.#journal.recordError(
           envelope.operationId,
           errorCode,
@@ -323,6 +502,15 @@ export class SignerEngine {
         record =
           (await this.#journal.get(envelope.operationId)) ??
           record;
+        if (autonomyReservation && this.#autonomy) {
+          if (autonomySigned) {
+            await this.#autonomy.markUncertain(autonomyReservation.id);
+          } else {
+            await this.#autonomy.releaseBeforeSigning(
+              autonomyReservation.id,
+            );
+          }
+        }
         if (
           record.stage === 'failed' ||
           (record.stage === 'awaiting-broadcast' &&
@@ -353,6 +541,9 @@ export class SignerEngine {
         'completed',
         envelope.steps.length,
       )) ?? record;
+    if (autonomyReservation && this.#autonomy) {
+      await this.#autonomy.markSettled(autonomyReservation.id);
+    }
     return toResult(record, 'completed');
   }
 
@@ -375,6 +566,28 @@ export class SignerEngine {
       throw new SignerError(
         'ENVELOPE_TAMPERED',
         'Private input materialization changed signed transaction terms.',
+      );
+    }
+  }
+
+  #assertFeeAuthorization(
+    authorized: TransactionFeeQuote | undefined,
+    current: TransactionFeeQuote | undefined,
+  ): void {
+    if (!authorized && !current) return;
+    if (!authorized || !current) {
+      throw new SignerError(
+        'FEE_CHANGED',
+        'The network fee quote changed after the complete action was authorized.',
+      );
+    }
+    if (
+      BigInt(current.maximumNetworkFeeWei) >
+      BigInt(authorized.maximumNetworkFeeWei)
+    ) {
+      throw new SignerError(
+        'FEE_CHANGED',
+        'The maximum network cost now exceeds the locally authorized ceiling.',
       );
     }
   }
@@ -508,8 +721,14 @@ export class SignerEngine {
 
   async discardOperation(
     operationId: string,
-    operationHash?: string,
+    operationHash: string,
   ): Promise<RecoverOperationResult> {
+    if (!/^0x[0-9a-fA-F]{64}$/u.test(operationHash)) {
+      throw new SignerError(
+        'ENVELOPE_INVALID',
+        'An exact 32-byte operation hash is required before local state can be discarded.',
+      );
+    }
     const record = await this.#journal.get(operationId);
     if (!record) {
       throw new SignerError(
@@ -518,7 +737,6 @@ export class SignerEngine {
       );
     }
     if (
-      operationHash &&
       !sameHex(record.operationHash, operationHash)
     ) {
       throw new SignerError(
@@ -570,6 +788,36 @@ export class SignerEngine {
         );
       }
     }
+    await this.#confirmation.confirm({
+      operationId,
+      operationHash: record.operationHash,
+      stepId: 'discard-operation',
+      stepIndex: 0,
+      stepCount: 1,
+      wallet: await this.#wallet.getAddress(),
+      contract: '0x0000000000000000000000000000000000000000',
+      action: 'discard_operation',
+      orderType: null,
+      orderTypeLabel: 'Local recovery operation',
+      assets: [],
+      amounts: [],
+      details: [
+        { label: 'Operation', value: operationId },
+        { label: 'Exact operation hash', value: record.operationHash },
+      ],
+      counterparty: null,
+      spender: null,
+      fee: '0',
+      nativeValue: '0',
+      gasCap: '0',
+      expectedResult:
+        'Local recovery data and signer-held operation secrets are deleted. No transaction is signed or broadcast.',
+      summary: 'Discard this exact local ChainWhisper operation.',
+      authorizationScope: 'complete-logical-action',
+      actionButtonLabel: 'Confirm discard and delete local data',
+      maximumNetworkFeeWei: '0',
+      maximumNetworkFeeCoti: '0',
+    });
     const discarded =
       (await this.#journal.discard(operationId)) ?? record;
     await this.#vault.deletePrefix(`${record.operationHash}:`);

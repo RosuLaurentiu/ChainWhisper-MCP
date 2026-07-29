@@ -500,15 +500,17 @@ export const createCotiSignerRuntime = (
   aesKeyOverride?: string,
 ): CotiSignerRuntime => {
   const secrets = config.credentialMaterial();
-  const configuredAesKey = aesKeyOverride ?? secrets.aesKey;
-  const aesKey = isCotiAesKey(configuredAesKey)
-    ? normalizeCotiAesKey(configuredAesKey)
-    : null;
   const provider = new JsonRpcProvider(config.rpcUrl);
   const wallet = new PolicyBoundCotiWallet(
     secrets.privateKey,
     provider,
   );
+  const configuredAesKey =
+    aesKeyOverride ??
+    config.aesKeyForWallet(wallet.address as Address);
+  const aesKey = isCotiAesKey(configuredAesKey)
+    ? normalizeCotiAesKey(configuredAesKey)
+    : null;
   wallet.disableAutoOnboard();
   if (aesKey) wallet.setAesKey(aesKey);
   const transport = new CotiWalletTransport({ wallet, provider });

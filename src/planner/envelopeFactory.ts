@@ -104,7 +104,10 @@ const normalizedIntent = (
   if (intent.action === 'create_trade' || intent.action === 'counter') {
     base.sellAsset = normalizeAsset(intent.offerAsset);
     base.buyAsset = normalizeAsset(intent.requestAsset);
-    if (intent.amountVisibility === 'visible') {
+    if (
+      intent.amountVisibility === 'visible' ||
+      intent.privateAmountMode === 'agent-provided'
+    ) {
       if (intent.offerAmount) base.sellAmount = intent.offerAmount;
       if (intent.requestAmount) base.buyAmount = intent.requestAmount;
     }
@@ -113,8 +116,19 @@ const normalizedIntent = (
     if (intent.action === 'create_trade') {
       base.metadata =
         intent.amountVisibility === 'private'
-          ? { confidentialTerms: 'signer-local' }
+          ? {
+              confidentialTerms:
+                intent.privateAmountMode === 'agent-provided'
+                  ? 'agent-visible'
+                  : 'signer-local',
+              ...(intent.privateAmountMode
+                ? { privateAmountMode: intent.privateAmountMode }
+                : {})
+            }
           : {
+              ...(intent.privateAmountMode
+                ? { privateAmountMode: intent.privateAmountMode }
+                : {}),
               partialFillsAllowed: intent.fillPolicy.partialFillsAllowed,
               minPartialFillBps: intent.fillPolicy.minPartialFillBps,
               minRequestAmount: intent.fillPolicy.minRequestAmount,
@@ -142,6 +156,9 @@ const normalizedIntent = (
             ? 'direct-counter'
             : 'direct-primary';
       base.metadata = {
+        ...(intent.privateAmountMode
+          ? { privateAmountMode: intent.privateAmountMode }
+          : {}),
         counteredEscrowContract: intent.order.identity.escrowContract,
         counteredTradeId: intent.order.identity.localId,
         parentEscrowContract: parent.escrowContract,
@@ -166,6 +183,9 @@ const normalizedIntent = (
     base.buyAsset = normalizeAsset(intent.quoteAsset);
     if (intent.recipient) base.recipient = intent.recipient;
     base.metadata = {
+      ...(intent.privateAmountMode
+        ? { privateAmountMode: intent.privateAmountMode }
+        : {}),
       buyPrice: intent.buyPrice,
       sellPrice: intent.sellPrice,
       buyQuoteLiquidity: intent.buyQuoteLiquidity,
@@ -186,7 +206,10 @@ const normalizedIntent = (
           : intent.order.recurring.quoteAsset
         : intent.order.offerAsset
     );
-    if (intent.order.amountVisibility === 'visible') {
+    if (
+      intent.order.amountVisibility === 'visible' ||
+      intent.privateAmountMode === 'agent-provided'
+    ) {
       if (intent.inputAmount) base.sellAmount = intent.inputAmount;
       if (intent.minOutputAmount) base.buyAmount = intent.minOutputAmount;
     } else {
@@ -209,6 +232,9 @@ const normalizedIntent = (
           null
         : null;
     base.metadata = {
+      ...(intent.privateAmountMode
+        ? { privateAmountMode: intent.privateAmountMode }
+        : {}),
       recurringSide: intent.recurringSide,
       orderRelation: intent.order.relation?.kind ?? 'primary',
       ...(intent.order.relation?.parentOrder
@@ -295,8 +321,28 @@ const normalizedIntent = (
           ? intent.changes.expiresAt ?? null
           : intent.order.expiresAt;
       if (resultingExpiry) base.expiresAt = resultingExpiry;
+      if (intent.privateAmountMode === 'agent-provided') {
+        if (resultingOffer) base.sellAmount = resultingOffer;
+        if (resultingRequest) base.buyAmount = resultingRequest;
+      }
     }
     base.metadata = {
+      ...(intent.privateAmountMode
+        ? { privateAmountMode: intent.privateAmountMode }
+        : {}),
+      ...(intent.privateAmountMode === 'agent-provided' &&
+      intent.order.kind === 'recurring'
+        ? {
+            addSellBaseLiquidity:
+              intent.changes.addSellBaseLiquidity ?? '0',
+            addBuyQuoteLiquidity:
+              intent.changes.addBuyQuoteLiquidity ?? '0',
+            removeSellBaseLiquidity:
+              intent.changes.removeSellBaseLiquidity ?? '0',
+            removeBuyQuoteLiquidity:
+              intent.changes.removeBuyQuoteLiquidity ?? '0'
+          }
+        : {}),
       ...Object.fromEntries(
         Object.entries(intent.changes).map(([key, value]) => [
           key,

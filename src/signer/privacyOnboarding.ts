@@ -29,7 +29,7 @@ import { NonceQueue } from './nonceQueue.js';
 import type { Address, HexString } from './types.js';
 import { EncryptedSecretVault } from './vault.js';
 
-const ACCOUNT_ONBOARD_CONTRACT =
+export const ACCOUNT_ONBOARD_CONTRACT =
   '0x536A67f0cc46513E7d27a370ed1aF9FDcC7A5095' as Address;
 const ACCOUNT_ONBOARD_GAS_LIMIT = 12_000_000n;
 const COTI_MAINNET_CHAIN_ID = 2_632_500n;
@@ -348,17 +348,21 @@ export class PrivacyOnboardingService {
   readonly #vault: EncryptedSecretVault;
   readonly #confirmation: ConfirmationGate;
   readonly #nonceQueue: NonceQueue;
+  readonly #assertRuntimeAttested: () => Promise<void>;
 
   constructor(options: {
     wallet: Wallet;
     vault: EncryptedSecretVault;
     confirmation: ConfirmationGate;
     nonceQueue: NonceQueue;
+    assertRuntimeAttested?: () => Promise<void>;
   }) {
     this.#wallet = options.wallet;
     this.#vault = options.vault;
     this.#confirmation = options.confirmation;
     this.#nonceQueue = options.nonceQueue;
+    this.#assertRuntimeAttested =
+      options.assertRuntimeAttested ?? (async () => undefined);
   }
 
   async isReady(): Promise<boolean> {
@@ -570,13 +574,13 @@ export class PrivacyOnboardingService {
     } catch {
       throw new SignerError(
         'PRIVATE_INPUT_UNAVAILABLE',
-        'The signer could not recover the COTI AES key from the confirmed onboarding event.',
+        'The signer could not recover the COTI privacy account key from the confirmed onboarding event.',
       );
     }
     if (!isCotiAesKey(aesKey)) {
       throw new SignerError(
         'PRIVATE_INPUT_UNAVAILABLE',
-        'COTI onboarding recovered an invalid wallet AES key.',
+        'COTI onboarding recovered invalid wallet privacy material.',
       );
     }
     return this.#persistAesKey(recovery.wallet, aesKey);
@@ -698,6 +702,7 @@ export class PrivacyOnboardingService {
     const ready = await this.#adoptReadyKey(wallet);
     if (ready) return ready;
 
+    await this.#assertRuntimeAttested();
     const existingRecovery = await this.#loadRecovery(wallet);
     if (!existingRecovery?.txHash) {
       await this.#confirmation.confirm({
@@ -719,7 +724,7 @@ export class PrivacyOnboardingService {
           {
             label: 'Local result',
             value:
-              'Recover and encrypt the wallet AES key in the signer vault',
+              'Recover and encrypt the wallet privacy key in signer-owned storage',
           },
         ],
         counterparty: null,
@@ -727,7 +732,7 @@ export class PrivacyOnboardingService {
         nativeValue: '0',
         gasCap: ACCOUNT_ONBOARD_GAS_LIMIT.toString(),
         expectedResult:
-          'Retrieve this wallet’s unique COTI AES key and store it only in the encrypted local signer vault.',
+          'Retrieve this wallet’s unique COTI privacy key and store it only in encrypted signer-owned storage.',
         summary:
           'Onboard the local signer wallet for COTI private computation.',
       });

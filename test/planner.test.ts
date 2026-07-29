@@ -18,6 +18,7 @@ import {
   verifySignedActionEnvelope,
   hashRuntimeManifest,
   loadRuntimeManifest,
+  PRIVACY_BRIDGE_PAIRS_V1,
   type ChainWhisperRuntimeManifestV1,
   type SignedActionEnvelopeV1
 } from '../src/shared/index.js';
@@ -40,6 +41,10 @@ class FakeRpc implements PlannerRpc {
   chargeFeeOnEdit = true;
   trustsDirectCounterEscrow = true;
   failProtocolSimulation = false;
+  bridgePublicToken =
+    '0xb70c55bd0823436F44877DC6A9f46E0C55f2C3A8' as `0x${string}`;
+  bridgePrivateToken =
+    '0x682e3142e62a7aDe2a0CA5bdC87b205CaDe4B17a' as `0x${string}`;
 
   async request<T>(method: string, params: unknown[]): Promise<T> {
     this.calls.push({ method, params });
@@ -111,18 +116,21 @@ class FakeRpc implements PlannerRpc {
         'maxWithdrawAmount()'
       ].map((signature) => toFunctionSelector(signature).toLowerCase()).includes(selector ?? '')
     ) {
-      return encodeAbiParameters([{ type: 'uint256' }], [1_000_000_000n]) as T;
+      return encodeAbiParameters([{ type: 'uint256' }], [10n ** 30n]) as T;
     }
     if (selector === toFunctionSelector('token()').toLowerCase()) {
       return encodeAbiParameters(
         [{ type: 'address' }],
-        ['0xb70c55bd0823436F44877DC6A9f46E0C55f2C3A8']
+        [this.bridgePublicToken]
       ) as T;
     }
-    if (selector === toFunctionSelector('privateToken()').toLowerCase()) {
+    if (
+      selector === toFunctionSelector('privateToken()').toLowerCase() ||
+      selector === toFunctionSelector('privateCoti()').toLowerCase()
+    ) {
       return encodeAbiParameters(
         [{ type: 'address' }],
-        ['0x682e3142e62a7aDe2a0CA5bdC87b205CaDe4B17a']
+        [this.bridgePrivateToken]
       ) as T;
     }
     if (
@@ -401,6 +409,108 @@ describe('ManifestExecutionPlanner', () => {
       portalFeeAtomic: '9'
     });
   });
+
+  it.each(
+    PRIVACY_BRIDGE_PAIRS_V1.flatMap((pair) =>
+      (['public-to-private', 'private-to-public'] as const).map(
+        (direction) => ({ pair, direction })
+      )
+    )
+  )(
+    'binds the audited Privacy Portal route for $pair.id $direction',
+    async ({ pair, direction }) => {
+      const manifest = await loadRuntimeManifest();
+      const rpc = new FakeRpc();
+      rpc.bridgePublicToken =
+        pair.publicTokenAddress ??
+        '0x0000000000000000000000000000000000000000';
+      rpc.bridgePrivateToken = pair.privateTokenAddress;
+      const planner = new ManifestExecutionPlanner({
+        manifest,
+        rpc,
+        now: () => NOW
+      });
+      const publicAsset = resolveAsset(manifest, pair.publicSymbol);
+      const privateAsset = resolveAsset(manifest, pair.privateSymbol);
+      const execution = await planner.plan(
+        {
+          action: 'privacy_bridge',
+          wallet: WALLET,
+          pair: pair.id,
+          direction,
+          publicAsset,
+          privateAsset,
+          amount: '1'
+        },
+        statusFor(manifest)
+      );
+
+      const amountAtomic = (10n ** BigInt(pair.decimals)).toString();
+      const protocol = execution.steps.at(-1);
+      expect(protocol).toMatchObject({
+        kind: 'protocol',
+        contract: manifest.contracts[pair.contractName]!.address,
+        nativeValue:
+          pair.bridgeKind === 'native'
+            ? direction === 'public-to-private'
+              ? amountAtomic
+              : '0'
+            : '9'
+      });
+      expect(protocol?.encoding?.selector).toBe(
+        manifest.contracts[pair.contractName]!.selectors[
+          direction === 'public-to-private' ? 'deposit' : 'withdraw'
+        ]
+      );
+      expect(protocol?.encoding?.arguments).toHaveLength(
+        pair.bridgeKind === 'native' &&
+          direction === 'public-to-private'
+          ? 2
+          : 3
+      );
+      expect(execution.intentMetadata).toMatchObject({
+        bridgePair: pair.id,
+        bridgeDirection: direction,
+        amountAtomic,
+        portalFeeAtomic: '9'
+      });
+
+      if (
+        pair.bridgeKind === 'native' &&
+        direction === 'public-to-private'
+      ) {
+        expect(execution.steps).toHaveLength(1);
+        expect(execution.exactNativeValue).toBe(amountAtomic);
+        return;
+      }
+
+      expect(execution.steps).toHaveLength(2);
+      expect(execution.steps[0]).toMatchObject({
+        kind: 'approval',
+        token:
+          direction === 'public-to-private'
+            ? publicAsset.address
+            : privateAsset.address,
+        approvalScheme:
+          direction === 'public-to-private'
+            ? 'erc20-exact'
+            : 'coti-private-exact',
+        amount:
+          direction === 'public-to-private' ? amountAtomic : '0'
+      });
+      if (direction === 'private-to-public') {
+        expect(
+          execution.steps[0]?.privateArtifactGroups?.[0]?.values[0]
+        ).toMatchObject({
+          source: 'intent-sell-amount',
+          asset: { symbol: pair.privateSymbol }
+        });
+      }
+      expect(execution.exactNativeValue).toBe(
+        pair.bridgeKind === 'native' ? '0' : '9'
+      );
+    }
+  );
 
   it('binds the live fee, recipient, exact approval, selector, gas, and native value', async () => {
     const manifest = await loadRuntimeManifest();
@@ -1431,6 +1541,65 @@ describe('SignedDomainEnvelopeFactory', () => {
     expect(
       verifySignedActionEnvelope(tampered, PAIRING_SECRET, NOW)
     ).toEqual({ ok: false, error: 'operation-hash-mismatch' });
+  });
+
+  it('keeps agent-provided private amounts encrypted in calldata and binds them to the envelope', async () => {
+    const manifest = await loadRuntimeManifest();
+    const intent: CreateTradeIntent = {
+      ...createTradeIntent(manifest, 'p.WISP'),
+      amountVisibility: 'private',
+      privateAmountMode: 'agent-provided',
+      access: 'public',
+      offerAmount: '1.25',
+      requestAmount: '2.5',
+      secretPolicy: { kind: 'none' }
+    };
+    const execution = await new ManifestExecutionPlanner({
+      manifest,
+      rpc: new FakeRpc(),
+      now: () => NOW
+    }).plan(intent, statusFor(manifest));
+    const protocol = execution.steps.at(-1)!;
+    const artifact = protocol.privateArtifactGroups?.[0];
+    if (!artifact) throw new Error('Expected one private artifact group.');
+
+    expect(protocol.encoding?.arguments[0]).toEqual([
+      2,
+      resolveAsset(manifest, 'p.WISP').address,
+      '0'
+    ]);
+    expect(protocol.encoding?.arguments[1]?.[2]).toBe('0');
+    expect(artifact.values).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: 'hidden-offer-amount',
+          source: 'intent-sell-amount'
+        }),
+        expect.objectContaining({
+          id: 'hidden-request-amount',
+          source: 'intent-buy-amount'
+        })
+      ])
+    );
+
+    const prepared = await new SignedDomainEnvelopeFactory({
+      manifest,
+      pairingSecret: PAIRING_SECRET,
+      now: () => NOW
+    }).create(intent, execution);
+    const signed = prepared.payload as SignedActionEnvelopeV1;
+    expect(signed.intent).toMatchObject({
+      amountVisibility: 'private-hidden',
+      sellAmount: '1.25',
+      buyAmount: '2.5',
+      metadata: {
+        confidentialTerms: 'agent-visible',
+        privateAmountMode: 'agent-provided'
+      }
+    });
+    expect(verifySignedActionEnvelope(signed, PAIRING_SECRET, NOW).ok).toBe(
+      true
+    );
   });
 
   it('marks Direct creation as generating a signer-local secret even for recipient-bound access', async () => {

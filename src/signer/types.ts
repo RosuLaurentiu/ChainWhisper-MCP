@@ -33,6 +33,24 @@ export type PublicSignerStatus = {
   pairingConfigured: boolean;
   confirmation: 'available' | 'unsupported';
   mode: 'read-write' | 'read-only' | 'configuration-required';
+  walletSetup: 'ready' | 'required';
+  signerReadiness:
+    | 'ready'
+    | 'wallet-setup-required'
+    | 'privacy-onboarding-required'
+    | 'confirmation-unavailable';
+  privacyReadiness:
+    | 'ready'
+    | 'onboarding-required'
+    | 'wallet-setup-required';
+  controlPageReadiness: 'ready' | 'starting' | 'unavailable';
+  autonomy: {
+    mode: 'manual' | 'bounded' | 'full';
+    state: 'inactive' | 'active' | 'paused' | 'expired' | 'revoked';
+    activePolicyCount: number;
+    globalPaused: boolean;
+  };
+  diagnosticCodes: string[];
 };
 
 export type RuntimeRegistryState = {
@@ -105,10 +123,51 @@ export type ConfirmationRequest = {
   gasCap: string;
   expectedResult: string;
   summary: string;
+  authorizationScope?: 'complete-logical-action';
+  actionButtonLabel?: string;
+  maximumNetworkFeeWei?: string;
+  maximumNetworkFeeCoti?: string;
+  stepDigests?: HexString[];
+  technicalDetails?: Array<{
+    stepId: string;
+    kind: MaterializedActionStep['kind'];
+    contract: Address;
+    selector: HexString;
+    calldataDigest: HexString;
+    gasCap: string;
+    maximumNetworkFeeWei: string;
+  }>;
+  acknowledgements?: string[];
+  autonomyEditor?: {
+    expiresAt: string;
+    agentVisiblePrivateAmounts: boolean;
+    perActionSpend: Array<{
+      asset: string;
+      amount: string;
+    }>;
+    cumulativeSpend: Array<{
+      asset: string;
+      amount: string;
+    }>;
+    maximumNativeValuePerAction?: string;
+    maximumNativeValueCumulative?: string;
+    maximumNetworkFeePerAction?: string;
+    maximumNetworkFeeCumulative?: string;
+    maximumActions?: number;
+    maximumMessages?: number;
+    priceBands: Array<{
+      sellAsset: string;
+      buyAsset: string;
+      minimumNumerator: string;
+      minimumDenominator: string;
+      maximumNumerator: string;
+      maximumDenominator: string;
+    }>;
+  };
 };
 
 export type ConfirmationResult =
-  | { outcome: 'accepted' }
+  | { outcome: 'accepted'; values?: Record<string, string> }
   | {
       outcome: 'declined';
       reason?: 'client-declined' | 'confirmation-not-enabled';
@@ -265,9 +324,21 @@ export type OperationJournalRecord = {
 export type ExecuteActionResult = {
   operationId: string;
   operationHash: HexString;
-  status: 'completed' | 'processing' | 'retryable' | 'declined' | 'read-only';
+  status:
+    | 'completed'
+    | 'processing'
+    | 'retryable'
+    | 'declined'
+    | 'denied'
+    | 'read-only';
   transactionHashes: HexString[];
   errorCode?: string;
+  autonomyDenial?: {
+    code: string;
+    message: string;
+    policyId?: string;
+    field?: string;
+  };
 };
 
 export type RecoverOperationResult = {
