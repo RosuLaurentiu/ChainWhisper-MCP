@@ -20,6 +20,7 @@ import {
 } from '../shared/index.js';
 import {
   ACCOUNT_ONBOARD_CONTRACT,
+  AgentWalletBalanceReader,
   AbiCallTemplateMaterializer,
   ActionEnvelopeVerifier,
   AuditedRuntimeStateReader,
@@ -132,11 +133,11 @@ const configuredControlSummary = async (options: {
   service: ChainWhisperSignerService;
   autonomy: AutonomyPolicyManager;
   privacy: PrivacyOnboardingService;
+  balances: AgentWalletBalanceReader;
   walletControl: WalletControlState;
 }): Promise<AgentControlSummary> => {
-  const [balance, operations, privacyReady, autonomyDecision, blockedReason] =
+  const [operations, privacyReady, autonomyDecision, blockedReason] =
     await Promise.all([
-      readCotiBalance(options.rpc, options.wallet),
       options.journal.list(),
       options.privacy.isReady(),
       options.autonomy.status(),
@@ -173,11 +174,23 @@ const configuredControlSummary = async (options: {
       ]
     : undefined;
   const pending = operations.filter(pendingOperation);
+  const pendingStatuses = new Map(
+    await Promise.all(
+      pending.map(async (operation) => [
+        operation.operationId,
+        await options.service
+          .getOperation(operation.operationId)
+          .catch(() => null),
+      ] as const),
+    ),
+  );
   const recentOperations = await Promise.all(
-    operations.slice(0, 8).map(async (operation) => {
-      const semanticStatus = await options.service
-        .getOperation(operation.operationId)
-        .catch(() => null);
+    operations.slice(0, 5).map(async (operation) => {
+      const semanticStatus = pendingStatuses.has(operation.operationId)
+        ? pendingStatuses.get(operation.operationId) ?? null
+        : await options.service
+            .getOperation(operation.operationId)
+            .catch(() => null);
       const fallbackTransaction = operation.transactionHashes.at(-1);
       const fallbackUrl = fallbackTransaction
         ? `${options.manifest.network.explorerUrl}/tx/${fallbackTransaction}`
@@ -245,10 +258,16 @@ const configuredControlSummary = async (options: {
       };
     }),
   );
+  const requiredBalanceAssets = [...pendingStatuses.values()].flatMap(
+    (status) => status?.setupRequirement?.assets ?? [],
+  );
+  const balances = await options.balances.snapshot(
+    requiredBalanceAssets,
+  );
   return {
     wallet: options.wallet,
     network: options.manifest.network.name,
-    balance,
+    balances,
     privacyStatus: privacyReady ? 'ready' : 'onboarding-required',
     signerStatus: options.walletControl.restartRequired
       ? 'read-only'
@@ -298,6 +317,7 @@ const configuredControlSummary = async (options: {
       onboardPrivacy: !privacyReady && !options.walletControl.restartRequired,
       enablePrivateToken:
         privacyReady && !options.walletControl.restartRequired,
+      refreshBalances: !options.walletControl.restartRequired,
       pause:
         Boolean(current) &&
         !autonomyStatus.globalPaused &&
@@ -318,6 +338,7 @@ type ConfiguredSignerRuntime = {
   manifest: Awaited<ReturnType<typeof loadRuntimeManifest>>;
   journal: OperationJournal;
   privacy: PrivacyOnboardingService;
+  balances: AgentWalletBalanceReader;
   autonomy: AutonomyPolicyManager;
   autonomyApprovals: ControlPageAutonomyApprovals;
   service: ChainWhisperSignerService;
@@ -448,6 +469,13 @@ const initializeConfiguredSigner = async (
     autonomy,
     assertRuntimeAttested,
   });
+  const balances = new AgentWalletBalanceReader({
+    wallet: walletAddress,
+    rpc,
+    manifest,
+    privacyKey: () =>
+      runtime.wallet.getUserOnboardInfo()?.aesKey ?? null,
+  });
   const verifier = new ActionEnvelopeVerifier(config, runtimeState);
   const materializer = new VaultBackedPrivateInputMaterializer({
     vault,
@@ -525,6 +553,7 @@ const initializeConfiguredSigner = async (
     manifest,
     journal,
     privacy: privacyOnboarding,
+    balances,
     autonomy,
     autonomyApprovals,
     service,
@@ -547,6 +576,10 @@ const handleConfiguredControlAction = async (
   if (action === 'clear-wallet-backup') {
     walletControl.generatedBackup = null;
     return { ok: true, message: 'Generated wallet backup view cleared.' };
+  }
+  if (action === 'refresh-balances') {
+    await runtime.balances.refresh();
+    return { ok: true, message: 'Wallet balances refreshed.' };
   }
   if (action === 'import-wallet' || action === 'generate-wallet') {
     const blockedReason = await replacementBlockReason(journal, autonomy);
@@ -597,6 +630,7 @@ const handleConfiguredControlAction = async (
     void service
       .onboardPrivacy()
       .then(() => {
+        runtime.balances.invalidate();
         walletControl.lastDiagnostic = 'privacy-ready';
         walletControl.lastDiagnosticCode = 'privacy-ready';
       })
@@ -639,6 +673,7 @@ const handleConfiguredControlAction = async (
     void service
       .enablePrivateToken(verifiedToken.symbol)
       .then((result) => {
+        runtime.balances.invalidate();
         walletControl.lastDiagnostic = result.ready
           ? `private-token-${result.symbol}-ready`
           : 'private-token-setup-incomplete';
@@ -805,6 +840,7 @@ const runSigner = async (
           service: active.service,
           autonomy: active.autonomy,
           privacy: active.privacy,
+          balances: active.balances,
           walletControl,
         });
       }

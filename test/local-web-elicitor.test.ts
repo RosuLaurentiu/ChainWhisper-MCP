@@ -1207,6 +1207,117 @@ describe('local Agent Control elicitor', () => {
     expect(reloaded.credentialMaterial().aesKey).toBe('');
   });
 
+  it('renders configured wallets as a balance-first dashboard and refreshes balances locally', async () => {
+    let bootstrapUrl = '';
+    const submitted: Array<{
+      action: string;
+      fields: Readonly<Record<string, string>>;
+    }> = [];
+    const elicitor = new LocalWebFormElicitor({
+      openUrl: (url) => {
+        bootstrapUrl = url;
+      },
+      getControlSummary: () => ({
+        wallet: '0x1111111111111111111111111111111111111111',
+        network: 'COTI Mainnet',
+        privacyStatus: 'ready',
+        signerStatus: 'ready',
+        autonomy: { mode: 'manual' },
+        pendingOperations: 0,
+        balances: {
+          refreshedAt: '2026-07-30T12:00:00.000Z',
+          stale: false,
+          revision: 7,
+          rows: [
+            {
+              symbol: 'COTI',
+              kind: 'native',
+              displayAmount: '12.345678',
+              exactAmount: '12.34567890123456789',
+              readiness: 'ready',
+              defaultVisible: true,
+              stale: false,
+            },
+            {
+              symbol: 'WISP',
+              kind: 'erc20',
+              displayAmount: '4',
+              exactAmount: '4',
+              readiness: 'ready',
+              defaultVisible: true,
+              stale: false,
+            },
+            {
+              symbol: 'p.WISP',
+              kind: 'private-erc20',
+              displayAmount: '0',
+              exactAmount: '0',
+              readiness: 'ready',
+              defaultVisible: true,
+              stale: false,
+            },
+            {
+              symbol: 'p.COTI',
+              kind: 'private-erc20',
+              readiness: 'setup-required',
+              defaultVisible: false,
+              stale: false,
+            },
+          ],
+        },
+        walletSetup: {
+          required: false,
+          environmentFilePath: 'C:\\ChainWhisper\\signer.env',
+        },
+        controlActions: {
+          refreshBalances: true,
+          enablePrivateToken: true,
+        },
+      }),
+      onControlAction: (action, fields) => {
+        submitted.push({ action, fields });
+        return { ok: true, message: 'Balances refreshed.' };
+      },
+    });
+    eliciters.push(elicitor);
+
+    await elicitor.openControlPanel();
+    const session = await establishSession(bootstrapUrl);
+    expect(session.page.body.indexOf('Wallet balances')).toBeLessThan(
+      session.page.body.indexOf('Agent mode'),
+    );
+    expect(session.page.body).toContain('12.345678');
+    expect(session.page.body).toContain('12.34567890123456789 COTI');
+    expect(session.page.body).toContain('<strong>p.WISP</strong>');
+    expect(session.page.body).toContain('Show all assets');
+    expect(session.page.body).toContain('Prepare private token');
+    expect(session.page.body).toContain(
+      'Ask your agent for bounded or 24-hour autonomy.',
+    );
+    expect(session.page.body).toContain(
+      '<strong>Wallet settings</strong>',
+    );
+    expect(session.page.body).toContain(
+      '<summary>Replace Agent Wallet</summary>',
+    );
+    expect(session.page.body).not.toContain(
+      '<section class="wallet-setup"',
+    );
+
+    const response = await submit(
+      session,
+      new URLSearchParams({
+        csrf: hiddenValue(session.page.body, 'csrf'),
+        intent: 'control',
+        action: 'refresh-balances',
+      }),
+    );
+    expect(response.status).toBe(200);
+    expect(submitted).toEqual([
+      { action: 'refresh-balances', fields: {} },
+    ]);
+  });
+
   it('requires both explicit acknowledgements for full autonomy', async () => {
     let browserDone: Promise<void> = Promise.resolve();
     const elicitor = new LocalWebFormElicitor({
@@ -1480,6 +1591,110 @@ describe('local Agent Control elicitor', () => {
 });
 
 describe('Agent Control state refresh key', () => {
+  it('renders manual, bounded, full, paused, expired, and revoked autonomy states', () => {
+    const cases = [
+      {
+        autonomy: { mode: 'manual' as const },
+        expected: ['Manual approval', 'Ask your agent for bounded'],
+      },
+      {
+        autonomy: { mode: 'bounded' as const, state: 'active' as const },
+        expected: ['Bounded autonomy', 'Active'],
+      },
+      {
+        autonomy: { mode: 'full' as const, state: 'active' as const },
+        expected: ['Full autonomy', 'Active'],
+      },
+      {
+        autonomy: { mode: 'bounded' as const, state: 'paused' as const },
+        expected: ['Bounded autonomy', 'Paused'],
+      },
+      {
+        autonomy: { mode: 'bounded' as const, state: 'expired' as const },
+        expected: ['Bounded autonomy', 'Expired'],
+      },
+      {
+        autonomy: { mode: 'full' as const, state: 'revoked' as const },
+        expected: ['Full autonomy', 'Revoked'],
+      },
+    ];
+    for (const { autonomy, expected } of cases) {
+      const page = renderAgentControlPage(
+        {
+          csrfToken: 'csrf',
+          pending: null,
+          summary: { autonomy },
+        },
+        'nonce',
+      );
+      for (const value of expected) expect(page).toContain(value);
+    }
+  });
+
+  it('keeps blocked wallet replacement collapsed and disabled', () => {
+    const reason =
+      'Wallet replacement is blocked while an operation is pending.';
+    const page = renderAgentControlPage(
+      {
+        csrfToken: 'csrf',
+        pending: null,
+        summary: {
+          wallet: '0x1111111111111111111111111111111111111111',
+          autonomy: { mode: 'manual' },
+          walletSetup: {
+            required: false,
+            environmentFilePath: 'C:\\ChainWhisper\\signer.env',
+            replacementBlockedReason: reason,
+          },
+        },
+      },
+      'nonce',
+    );
+    expect(page).toContain('<strong>Wallet settings</strong>');
+    expect(page).toContain('<summary>Replace Agent Wallet</summary>');
+    expect(page).toContain(reason);
+    expect(page).toMatch(
+      /name="action" value="import-wallet" disabled/u,
+    );
+    expect(page).toMatch(
+      /name="action" value="generate-wallet" disabled/u,
+    );
+  });
+
+  it('uses the balance revision without serializing decrypted amounts', () => {
+    const summary = {
+      balances: {
+        refreshedAt: '2026-07-30T12:00:00.000Z',
+        stale: false,
+        revision: 1,
+        rows: [
+          {
+            symbol: 'p.WISP',
+            kind: 'private-erc20' as const,
+            displayAmount: '8.123456',
+            exactAmount: '8.123456789',
+            readiness: 'ready' as const,
+            defaultVisible: true,
+            stale: false,
+          },
+        ],
+      },
+    };
+    const first = agentControlStateKey({
+      pending: null,
+      summary,
+    });
+    const next = agentControlStateKey({
+      pending: null,
+      summary: {
+        ...summary,
+        balances: { ...summary.balances, revision: 2 },
+      },
+    });
+    expect(first).not.toContain('8.123456789');
+    expect(first).not.toBe(next);
+  });
+
   it('renders the complete private authority in the policy editor and active summary', () => {
     const activationPage = renderAgentControlPage(
       {

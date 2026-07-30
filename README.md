@@ -163,15 +163,21 @@ The signer keeps one persistent server on `127.0.0.1`. It is a signing and
 policy surface, not a second trading app. It contains only:
 
 - pending confirmation and private-input cards;
-- Agent Wallet address, COTI balance, network, privacy readiness, and signer
-  health;
-- current mode and policy;
+- Agent Wallet address, verified public and prepared private-token balances,
+  network, privacy readiness, and signer health;
+- current mode and policy, including the manual path for requesting autonomy
+  through the user's agent;
 - remaining budgets;
-- pending and recent operations with transaction links;
+- up to five recent operations with transaction links;
 - pause, resume, and revoke controls; and
-- redacted diagnostics.
+- collapsed local wallet settings and redacted diagnostics.
 
 It does not contain market discovery, order composition, or general trading.
+When a wallet is configured, wallet replacement stays collapsed under
+**Wallet settings**. The balance reader caches one local snapshot for 30
+seconds, keeps the last successful value visibly stale on partial RPC failure,
+and never places decrypted amounts in MCP status, prompts, logs, diagnostics,
+or page refresh keys.
 
 The page uses package-bundled HTML, CSS, and JavaScript with no remote assets,
 fonts, analytics, telemetry, iframes, or app configuration. It uses a consumed

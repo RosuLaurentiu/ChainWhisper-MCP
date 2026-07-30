@@ -1,5 +1,6 @@
 export * from './atomicStore.js';
 export * from './agentWallet.js';
+export * from './agentWalletBalances.js';
 export * from './autonomy.js';
 export * from './autonomyStore.js';
 export * from './config.js';

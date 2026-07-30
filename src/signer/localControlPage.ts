@@ -2,6 +2,7 @@ import type {
   ConfirmationRequest,
   PrivateValueRequest,
 } from './types.js';
+import type { AgentWalletBalanceSnapshot } from './agentWalletBalances.js';
 import {
   localDateTimeValue,
   policyAmountDisplay,
@@ -22,6 +23,7 @@ export type AgentControlSummary = {
   wallet?: string | null;
   network?: string;
   balance?: string;
+  balances?: AgentWalletBalanceSnapshot;
   privacyStatus?: 'ready' | 'onboarding-required' | 'unknown';
   signerStatus?: 'ready' | 'setup-required' | 'read-only' | 'unavailable';
   autonomy?: {
@@ -50,6 +52,7 @@ export type AgentControlSummary = {
     revoke?: boolean;
     onboardPrivacy?: boolean;
     enablePrivateToken?: boolean;
+    refreshBalances?: boolean;
   };
 };
 
@@ -111,8 +114,12 @@ export const agentControlStateKey = (
       ],
     ),
     localActions: model.summary.controlActions
-      ? [Boolean(model.summary.controlActions.enablePrivateToken)]
+      ? [
+          Boolean(model.summary.controlActions.enablePrivateToken),
+          Boolean(model.summary.controlActions.refreshBalances),
+        ]
       : null,
+    balanceRevision: model.summary.balances?.revision ?? null,
     walletSetup: model.summary.walletSetup
       ? [
           model.summary.walletSetup.required,
@@ -693,7 +700,7 @@ const renderWalletSetup = (
   csrfToken: string,
 ): string => {
   const setup = summary.walletSetup;
-  if (!setup) return '';
+  if (!setup || !setup.required) return '';
   const path = escapeHtml(setup.environmentFilePath);
   const backup = setup.generatedBackup
     ? `<section class="wallet-backup" aria-labelledby="wallet-backup-title">
@@ -718,23 +725,16 @@ const renderWalletSetup = (
   const restart = setup.restartRequired
     ? `<div class="notice" role="status">Agent Wallet saved. Restart the signer connection to load it, then fund the address with COTI for gas and the assets the agent may trade.</div>`
     : '';
-  const blocked = setup.replacementBlockedReason
-    ? `<div class="notice notice-error" role="alert">${escapeHtml(setup.replacementBlockedReason)}</div>`
-    : '';
-  const replacing = !setup.required;
   return `<section class="wallet-setup" aria-labelledby="wallet-setup-title">
     <div class="section-heading">
       <div>
-        <span class="kicker">${replacing ? 'Local wallet management' : 'One-time local setup'}</span>
-        <h2 id="wallet-setup-title">${replacing ? 'Replace Agent Wallet' : 'Set up Agent Wallet'}</h2>
+        <span class="kicker">One-time local setup</span>
+        <h1 id="wallet-setup-title">Set up Agent Wallet</h1>
       </div>
       <span class="badge">Keys stay on this device</span>
     </div>
-    <p class="lead">${replacing
-      ? 'Replacement is available only when no operation is pending and no autonomy policy is active.'
-      : 'Use a dedicated, minimally funded wallet for agent activity. Import and generation happen only on this local page.'}</p>
+    <p class="lead">Use a dedicated, minimally funded wallet for agent activity. Import and generation happen only on this local page.</p>
     ${restart}
-    ${blocked}
     ${backup}
     <div class="setup-grid">
       <form method="post" action="/action" class="setup-card">
@@ -748,7 +748,6 @@ const renderWalletSetup = (
           pattern="(?:0x)?[0-9a-fA-F]{64}" autocomplete="off" autocapitalize="none" spellcheck="false">
         <label for="wallet-env-path">Configured signer .env file</label>
         <input id="wallet-env-path" name="environmentFilePath" value="${path}" required readonly autocomplete="off" spellcheck="false">
-        ${replacing ? '<label class="ack"><input type="checkbox" name="confirmReplacement" value="replace-agent-wallet" required> I approve replacing the current Agent Wallet after restart.</label>' : ''}
         <button class="button button-primary" name="action" value="import-wallet">Save existing wallet</button>
       </form>
       <form method="post" action="/action" class="setup-card">
@@ -758,11 +757,199 @@ const renderWalletSetup = (
         <p class="muted">The signer generates the key with the operating system cryptographic random source and shows it once for backup.</p>
         <label for="generated-env-path">Configured signer .env file</label>
         <input id="generated-env-path" name="environmentFilePath" value="${path}" required readonly autocomplete="off" spellcheck="false">
-        ${replacing ? '<label class="ack"><input type="checkbox" name="confirmReplacement" value="replace-agent-wallet" required> I approve replacing the current Agent Wallet after restart.</label>' : ''}
         <button class="button button-secondary" name="action" value="generate-wallet">Create new Agent Wallet</button>
       </form>
     </div>
     <p class="muted compact">${setup.restartRequired ? 'After restart, fund' : 'Fund'} the displayed address with COTI for network fees and only the tokens you want the agent to use. Privacy onboarding is completed from this page after funding.</p>
+  </section>`;
+};
+
+const renderConfiguredWalletState = (
+  summary: AgentControlSummary,
+  csrfToken: string,
+): string => {
+  const setup = summary.walletSetup;
+  if (!setup || setup.required) return '';
+  const backup = setup.generatedBackup
+    ? `<section class="wallet-backup priority-state" aria-labelledby="wallet-backup-title">
+        <span class="badge badge-purple">Backup required</span>
+        <h2 id="wallet-backup-title">Save this Agent Wallet key now</h2>
+        <p class="muted">This is the only recovery method. ChainWhisper cannot recover it later.</p>
+        <div class="copy-field">
+          <label for="generated-wallet-address">Agent Wallet address</label>
+          <div><input id="generated-wallet-address" readonly value="${escapeHtml(setup.generatedBackup.address)}"><button type="button" class="button button-secondary" data-copy-target="generated-wallet-address">Copy address</button></div>
+        </div>
+        <div class="copy-field">
+          <label for="generated-wallet-key">Private key</label>
+          <div><input id="generated-wallet-key" readonly value="${escapeHtml(setup.generatedBackup.privateKey)}"><button type="button" class="button button-secondary" data-copy-target="generated-wallet-key">Copy private key</button></div>
+        </div>
+        <form method="post" action="/action">
+          <input type="hidden" name="csrf" value="${escapeHtml(csrfToken)}">
+          <input type="hidden" name="intent" value="control">
+          <button class="button button-primary" name="action" value="clear-wallet-backup">I saved the private key</button>
+        </form>
+      </section>`
+    : '';
+  const restart = setup.restartRequired
+    ? `<div class="notice priority-state" role="status">Agent Wallet saved. Restart the signer connection to load it, then fund the address with COTI and only the assets the agent may use.</div>`
+    : '';
+  return `${restart}${backup}`;
+};
+
+const renderWalletSettings = (
+  summary: AgentControlSummary,
+  csrfToken: string,
+): string => {
+  const setup = summary.walletSetup;
+  if (!setup || setup.required) return '';
+  const path = escapeHtml(setup.environmentFilePath);
+  const blockedReason = setup.replacementBlockedReason
+    ? escapeHtml(setup.replacementBlockedReason)
+    : '';
+  const disabled = blockedReason ? ' disabled' : '';
+  const disabledNote = blockedReason
+    ? `<p class="settings-warning" role="status">${blockedReason}</p>`
+    : '';
+  return `<details class="settings-section">
+    <summary>
+      <span><strong>Wallet settings</strong><small>Configuration and wallet replacement</small></span>
+    </summary>
+    <div class="settings-body">
+      <dl class="settings-summary">
+        <div><dt>Current address</dt><dd>${escapeHtml(displayValue(summary.wallet))}</dd></div>
+        <div><dt>Configuration file</dt><dd>${path}</dd></div>
+      </dl>
+      <details class="replacement-settings">
+        <summary>Replace Agent Wallet</summary>
+        <div class="replacement-body">
+          <p class="muted">Replacement takes effect after signer restart and is available only when no operation is pending and no autonomy policy is active.</p>
+          ${disabledNote}
+          <div class="setup-grid">
+            <form method="post" action="/action" class="setup-card">
+              <input type="hidden" name="csrf" value="${escapeHtml(csrfToken)}">
+              <input type="hidden" name="intent" value="control">
+              <h3>Use existing wallet</h3>
+              <p class="muted">Paste a standard 32-byte EVM private key. It stays on this device.</p>
+              <label for="replacement-private-key">Agent Wallet private key</label>
+              <input id="replacement-private-key" name="privateKey" type="password" required
+                pattern="(?:0x)?[0-9a-fA-F]{64}" autocomplete="off" autocapitalize="none" spellcheck="false"${disabled}>
+              <input name="environmentFilePath" value="${path}" type="hidden">
+              <label class="ack"><input type="checkbox" name="confirmReplacement" value="replace-agent-wallet" required${disabled}> I approve replacing the current Agent Wallet after restart.</label>
+              <button class="button button-primary" name="action" value="import-wallet"${disabled}>Save existing wallet</button>
+            </form>
+            <form method="post" action="/action" class="setup-card">
+              <input type="hidden" name="csrf" value="${escapeHtml(csrfToken)}">
+              <input type="hidden" name="intent" value="control">
+              <h3>Create new wallet</h3>
+              <p class="muted">Generate a new key locally and show it once for backup.</p>
+              <input name="environmentFilePath" value="${path}" type="hidden">
+              <label class="ack"><input type="checkbox" name="confirmReplacement" value="replace-agent-wallet" required${disabled}> I approve replacing the current Agent Wallet after restart.</label>
+              <button class="button button-secondary" name="action" value="generate-wallet"${disabled}>Create new Agent Wallet</button>
+            </form>
+          </div>
+        </div>
+      </details>
+    </div>
+  </details>`;
+};
+
+const renderBalanceRow = (
+  row: AgentWalletBalanceSnapshot['rows'][number],
+  csrfToken: string,
+  canPreparePrivateToken: boolean,
+): string => {
+  const kind =
+    row.kind === 'native'
+      ? 'Native'
+      : row.kind === 'private-erc20'
+        ? 'Private'
+        : 'Public';
+  const state =
+    row.readiness === 'ready'
+      ? row.displayAmount ?? '0'
+      : row.readiness === 'privacy-required'
+        ? 'Enable private trading'
+        : row.readiness === 'setup-required'
+          ? 'Not prepared'
+          : 'Unavailable';
+  const exact =
+    row.readiness === 'ready' && row.exactAmount
+      ? `<details class="exact-balance"><summary>Exact amount</summary><code>${escapeHtml(row.exactAmount)} ${escapeHtml(row.symbol)}</code></details>`
+      : '';
+  const prepare =
+    row.kind === 'private-erc20' &&
+    row.readiness === 'setup-required' &&
+    canPreparePrivateToken
+      ? `<form method="post" action="/action" class="inline-control">
+          <input type="hidden" name="csrf" value="${escapeHtml(csrfToken)}">
+          <input type="hidden" name="intent" value="control">
+          <input type="hidden" name="token" value="${escapeHtml(row.symbol)}">
+          <button class="button button-secondary button-small" name="action" value="enable-private-token">Prepare private token</button>
+        </form>`
+      : '';
+  return `<li class="balance-row">
+    <div class="asset-identity">
+      <span><strong>${escapeHtml(row.symbol)}</strong><small>${kind}${row.stale ? ' · Stale' : ''}</small></span>
+    </div>
+    <div class="asset-value">
+      <strong>${escapeHtml(state)}</strong>
+      ${exact}
+      ${prepare}
+    </div>
+  </li>`;
+};
+
+const renderBalances = (
+  summary: AgentControlSummary,
+  csrfToken: string,
+): string => {
+  const snapshot = summary.balances;
+  if (!snapshot) {
+    return `<section class="dashboard-card balances-card" aria-labelledby="balances-title">
+      <div class="card-heading"><div><span class="kicker">Agent Wallet</span><h2 id="balances-title">Wallet balances</h2></div></div>
+      <ul class="balance-list"><li class="balance-row"><div class="asset-identity"><span><strong>COTI</strong><small>Native</small></span></div><div class="asset-value"><strong>${escapeHtml(displayValue(summary.balance))}</strong></div></li></ul>
+    </section>`;
+  }
+  const visible = snapshot.rows.filter(({ defaultVisible }) => defaultVisible);
+  const hidden = snapshot.rows.filter(({ defaultVisible }) => !defaultVisible);
+  const rows = visible
+    .map((row) =>
+      renderBalanceRow(
+        row,
+        csrfToken,
+        Boolean(summary.controlActions?.enablePrivateToken),
+      ),
+    )
+    .join('');
+  const hiddenRows = hidden
+    .map((row) =>
+      renderBalanceRow(
+        row,
+        csrfToken,
+        Boolean(summary.controlActions?.enablePrivateToken),
+      ),
+    )
+    .join('');
+  const refreshed = Number.isNaN(Date.parse(snapshot.refreshedAt))
+    ? snapshot.refreshedAt
+    : new Date(snapshot.refreshedAt).toLocaleString('en', {
+        dateStyle: 'medium',
+        timeStyle: 'short',
+      });
+  const refresh = summary.controlActions?.refreshBalances
+    ? `<form method="post" action="/action" class="inline-control">
+        <input type="hidden" name="csrf" value="${escapeHtml(csrfToken)}">
+        <input type="hidden" name="intent" value="control">
+        <button class="button button-secondary button-small" name="action" value="refresh-balances">Refresh</button>
+      </form>`
+    : '';
+  return `<section class="dashboard-card balances-card" aria-labelledby="balances-title">
+    <div class="card-heading">
+      <div><span class="kicker">Agent Wallet</span><h2 id="balances-title">Wallet balances</h2></div>
+      <div class="refresh-block"><small>${snapshot.stale ? 'Some values are stale · ' : ''}Updated ${escapeHtml(refreshed)}</small>${refresh}</div>
+    </div>
+    <ul class="balance-list">${rows || '<li class="empty">No balances available.</li>'}</ul>
+    ${hidden.length ? `<details class="all-assets"><summary>Show all assets <span>${hidden.length}</span></summary><ul class="balance-list">${hiddenRows}</ul></details>` : ''}
   </section>`;
 };
 
@@ -776,17 +963,17 @@ const renderControlSummary = (
       ? 'Full autonomy'
       : autonomy.mode === 'bounded'
         ? 'Bounded autonomy'
-        : 'Manual signing';
+        : 'Manual approval';
   const stateLabel = autonomy.state ? humanize(autonomy.state) : 'Ready';
   const privateAmountAuthority =
     autonomy.mode === 'manual'
-      ? ''
+      ? '<p class="muted">Ask your agent for bounded or 24-hour autonomy. The policy review will appear here before anything is enabled.</p>'
       : autonomy.agentVisiblePrivateAmounts
         ? '<p class="muted">This policy lets the agent both choose private amounts and view policy-scoped private balances, hidden order inventory/progress, and participant receipts.</p>'
         : '<p class="muted">This policy does not let the agent choose private amounts or view policy-scoped private balances, hidden order inventory/progress, or participant receipts.</p>';
   const budgetRows = autonomy.remainingBudgets?.length
-    ? renderSummaryRows(autonomy.remainingBudgets)
-    : '<p class="muted">No autonomous spending policy is active.</p>';
+    ? `<div class="details-grid">${renderSummaryRows(autonomy.remainingBudgets)}</div>`
+    : '';
   const actions = summary.controlActions;
   const operations = summary.recentOperations?.length
     ? summary.recentOperations
@@ -854,7 +1041,7 @@ const renderControlSummary = (
           ${actions.resume ? '<button class="button button-secondary" name="action" value="resume-autonomy">Resume autonomy</button>' : ''}
           ${actions.revoke ? '<button class="button button-danger" name="action" value="revoke-autonomy">Revoke policy</button>' : ''}
         </form>`
-      : '<p class="muted compact">Autonomy controls appear here when a policy is active.</p>';
+      : '';
   const privacyControl = actions?.onboardPrivacy
     ? `<form method="post" action="/action" class="privacy-control">
         <input type="hidden" name="csrf" value="${escapeHtml(csrfToken)}">
@@ -864,48 +1051,53 @@ const renderControlSummary = (
     : '';
 
   const walletSetup = renderWalletSetup(summary, csrfToken);
-  return `${walletSetup}<section class="control-overview" aria-labelledby="control-title">
-    <div class="section-heading">
-      <div>
-        <span class="kicker">Local signer</span>
-        <h1 id="control-title">Agent Control</h1>
-      </div>
-      <span class="status-dot"><i></i>${escapeHtml(
-        summary.signerStatus === 'ready' ? 'Signer ready' : humanize(summary.signerStatus ?? 'setup required'),
-      )}</span>
-    </div>
-    <div class="wallet-card">
-      <div>
+  if (walletSetup) return walletSetup;
+  const configuredState = renderConfiguredWalletState(summary, csrfToken);
+  const walletSettings = renderWalletSettings(summary, csrfToken);
+  const balances = renderBalances(summary, csrfToken);
+  const walletInputId = 'agent-wallet-address';
+  return `${configuredState}<section class="control-overview" aria-labelledby="control-title">
+    <header class="dashboard-header">
+      <div class="dashboard-title">
         <span class="kicker">Agent Wallet</span>
-        <strong class="wallet-address" title="${escapeHtml(displayValue(summary.wallet))}">${escapeHtml(shortAddress(summary.wallet))}</strong>
+        <div class="address-line">
+          <h1 id="control-title" title="${escapeHtml(displayValue(summary.wallet))}">${escapeHtml(shortAddress(summary.wallet))}</h1>
+          <input id="${walletInputId}" class="sr-only" readonly value="${escapeHtml(displayValue(summary.wallet))}">
+          <button type="button" class="copy-icon" data-copy-target="${walletInputId}" aria-label="Copy Agent Wallet address">Copy</button>
+        </div>
       </div>
-      <div><span>Network</span><strong>${escapeHtml(displayValue(summary.network))}</strong></div>
-      <div><span>Balance</span><strong>${escapeHtml(displayValue(summary.balance))}</strong></div>
-      <div><span>Privacy</span><strong>${escapeHtml(humanize(summary.privacyStatus ?? 'unknown'))}</strong>${privacyControl}</div>
-    </div>
-    <div class="panel-grid">
-      <section class="panel">
-        <div class="panel-heading"><span>Agent mode</span><span class="badge">${escapeHtml(stateLabel)}</span></div>
-        <h2>${escapeHtml(modeLabel)}</h2>
+      <div class="status-chips" aria-label="Agent Wallet status">
+        <span class="badge">${escapeHtml(displayValue(summary.network))}</span>
+        <span class="status-dot"><i></i>${escapeHtml(summary.signerStatus === 'ready' ? 'Signer ready' : humanize(summary.signerStatus ?? 'setup required'))}</span>
+        <span class="badge">Privacy: ${escapeHtml(humanize(summary.privacyStatus ?? 'unknown'))}</span>
+        <span class="badge badge-purple">${escapeHtml(modeLabel)}</span>
+      </div>
+    </header>
+    ${privacyControl ? `<div class="privacy-banner"><div><strong>Private trading is not enabled</strong><span>Complete one local onboarding step to prepare private assets.</span></div>${privacyControl}</div>` : ''}
+    <div class="dashboard-stack">
+      ${balances}
+      <section class="dashboard-card mode-card" aria-labelledby="mode-title">
+        <div class="card-heading">
+          <div><span class="kicker">Agent mode</span><h2 id="mode-title">${escapeHtml(modeLabel)}</h2></div>
+          <span class="badge">${escapeHtml(stateLabel)}</span>
+        </div>
         ${autonomy.expiresAt ? `<p class="muted">Expires ${escapeHtml(autonomy.expiresAt)}</p>` : ''}
         ${privateAmountAuthority}
+        ${budgetRows}
         ${autonomyControls}
       </section>
-      <section class="panel">
-        <div class="panel-heading"><span>Remaining policy budgets</span></div>
-        <div class="details-grid">${budgetRows}</div>
-      </section>
-      <section class="panel panel-wide">
-        <div class="panel-heading">
-          <span>Signer operations</span>
+      <section class="dashboard-card" aria-labelledby="operations-title">
+        <div class="card-heading">
+          <div><span class="kicker">Activity</span><h2 id="operations-title">Recent operations</h2></div>
           <span class="badge">${escapeHtml(String(summary.pendingOperations ?? 0))} pending</span>
         </div>
         <ul class="operation-list">${operations}</ul>
       </section>
-      <section class="panel panel-wide">
-        <div class="panel-heading"><span>Redacted diagnostics</span></div>
-        ${diagnostics}
-      </section>
+      ${walletSettings}
+      <details class="settings-section diagnostics-section">
+        <summary><span><strong>Diagnostics</strong><small>Redacted local signer details</small></span></summary>
+        <div class="settings-body">${diagnostics}</div>
+      </details>
     </div>
   </section>`;
 };
@@ -916,7 +1108,8 @@ const styles = `
 button,input{font:inherit}a{color:#cbb4ff}a:hover{color:#fff}.shell{width:min(1080px,calc(100% - 32px));margin:0 auto;padding:28px 0 42px}.topbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:28px}.brand{display:flex;align-items:center;gap:11px;font-size:17px;font-weight:780;letter-spacing:-.02em}.local-label{color:var(--muted);font-size:12px;letter-spacing:.08em;text-transform:uppercase}
 .approval-card,.control-overview{border:1px solid var(--line);border-radius:24px;background:linear-gradient(145deg,rgba(23,18,33,.98),rgba(12,10,18,.98));box-shadow:var(--shadow);padding:clamp(22px,5vw,46px)}.approval-card{max-width:840px;margin:2vh auto 88px}.eyebrow-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.badge{display:inline-flex;align-items:center;min-height:26px;padding:3px 9px;border:1px solid var(--line);border-radius:999px;color:#cfc4dd;background:#14101d;font-size:12px;font-weight:650}.badge-purple{border-color:#633fa0;color:#e5d8ff;background:var(--purple-soft)}.step{margin-left:auto;color:var(--muted);font-size:13px}h1{font-size:clamp(28px,5vw,44px);line-height:1.08;letter-spacing:-.045em;margin:20px 0 12px}h2{margin:12px 0 4px;font-size:22px;letter-spacing:-.025em}.lead{max-width:680px;margin:0 0 20px;color:#c8bfd3;font-size:16px}.order-type{margin:16px 0;padding:14px 16px;border:1px solid #4e3575;border-radius:14px;background:linear-gradient(90deg,rgba(70,41,108,.42),rgba(30,19,44,.52))}.order-type span,.result span,.wallet-card span,.stats span,.summary-row span,.panel-heading,.kicker{display:block;color:var(--muted);font-size:12px;font-weight:650;letter-spacing:.045em;text-transform:uppercase}.order-type strong{display:block;margin-top:5px;font-size:17px}.recurring-note{margin:10px 0;color:#d7cae8}.exposure{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));overflow:hidden;margin:14px 0;border:1px solid #4a3963;border-radius:16px;background:#0c0911}.exposure .summary-row{min-height:82px;padding:15px 18px;border-right:1px solid #332641}.exposure .summary-row:last-child{border-right:0}.exposure strong{display:block;margin-top:8px;font-size:20px;line-height:1.25}.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:1px;overflow:hidden;margin:14px 0;border:1px solid var(--line-soft);border-radius:14px;background:var(--line-soft)}.stats>div{min-height:70px;padding:13px;background:#100d18}.stats strong{display:block;margin-top:5px;overflow-wrap:anywhere}.details-grid{margin:14px 0}.details-grid .summary-row{display:flex;justify-content:space-between;gap:24px;padding:9px 0;border-bottom:1px solid var(--line-soft)}.details-grid .summary-row strong{text-align:right;overflow-wrap:anywhere}.result,.privacy-note{margin:16px 0;padding:14px 16px;border-left:3px solid var(--purple);border-radius:4px 12px 12px 4px;background:#110d19}.result p{margin:4px 0 0}.privacy-note{color:#d7cae8;border-left-color:var(--amber)}details{margin:16px 0;border:1px solid var(--line-soft);border-radius:12px;background:#0d0a12}summary{cursor:pointer;padding:14px 16px;color:#c9bdd7;font-weight:650}.technical{margin:0;padding:0 16px 14px}.technical>div{display:grid;grid-template-columns:150px minmax(0,1fr);gap:14px;padding:8px 0;border-top:1px solid var(--line-soft)}dt{color:var(--muted)}dd{margin:0;overflow-wrap:anywhere;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12px}.actions{position:fixed;z-index:5;left:50%;bottom:0;transform:translateX(-50%);display:flex;justify-content:flex-end;gap:10px;width:min(840px,calc(100% - 24px));padding:12px 0 max(12px,env(safe-area-inset-bottom));border-top:1px solid var(--line);background:rgba(7,6,11,.96);box-shadow:0 -18px 38px rgba(0,0,0,.35)}.control-actions{display:flex;justify-content:flex-end;gap:10px;margin-top:24px}.button{min-height:46px;padding:10px 17px;border:1px solid transparent;border-radius:11px;font-weight:740;cursor:pointer}.button:disabled{cursor:wait;opacity:.7}.button:focus-visible,input:focus-visible,summary:focus-visible,a:focus-visible{outline:3px solid #c6a7ff;outline-offset:3px}.button-primary{color:#0d0618;background:linear-gradient(135deg,#bb94ff,#8c54ef);box-shadow:0 8px 30px rgba(139,83,239,.25)}.button-primary:hover{filter:brightness(1.08)}.button-secondary{color:var(--text);border-color:#493b5d;background:#1b1624}.button-warning{color:#201400;border-color:#a66d13;background:var(--amber)}.button-danger{color:#23030a;border-color:#a8334c;background:var(--red)}.field{margin:22px 0}.field label{display:block;margin-bottom:5px;font-weight:720;font-size:16px}.field p{margin:0 0 9px;color:var(--muted)}.field input{width:100%;min-height:48px;padding:10px 13px;border:1px solid #4b3b60;border-radius:11px;background:#09070d;color:var(--text)}.notice{max-width:840px;margin:0 auto 16px;padding:12px 15px;border:1px solid #3b6d59;border-radius:12px;background:#10231c;color:#b9f3d9}.notice-error{border-color:#773447;background:#291018;color:#ffc1ce}
 .section-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:20px;margin-bottom:24px}.section-heading h1,.section-heading h2{margin:4px 0 0}.status-dot{display:flex;align-items:center;gap:8px;color:#d9d0e5;font-size:13px}.status-dot i{width:8px;height:8px;border-radius:50%;background:var(--green);box-shadow:0 0 12px rgba(84,223,165,.65)}.wallet-card{display:grid;grid-template-columns:2fr repeat(3,1fr);gap:1px;overflow:hidden;border:1px solid var(--line);border-radius:16px;background:var(--line)}.wallet-card>div{padding:16px 18px;background:#100d18}.wallet-card strong{display:block;margin-top:6px}.wallet-address{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}.panel-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-top:14px}.panel{min-height:190px;padding:20px;border:1px solid var(--line-soft);border-radius:16px;background:rgba(12,10,18,.72)}.panel-wide{grid-column:1/-1}.panel-heading{display:flex;justify-content:space-between;gap:16px;align-items:center}.muted{color:var(--muted)}.compact{margin-top:24px}.operation-list{list-style:none;margin:12px 0 0;padding:0}.operation-list li{display:flex;align-items:center;justify-content:space-between;gap:20px;padding:12px 0;border-top:1px solid var(--line-soft)}.operation-list li span{display:flex;flex-direction:column}.operation-list small{color:var(--muted)}.operation-list .empty{color:var(--muted)}.operation-actions{display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap}.operation-actions form{margin:0}.operation-actions .button{min-height:36px;padding:6px 10px}.diagnostics{margin:12px 0 0}.diagnostics>div{display:grid;grid-template-columns:minmax(120px,1fr) 2fr;gap:18px;padding:9px 0;border-top:1px solid var(--line-soft)}.diagnostics dd{font-family:inherit;font-size:13px}.footer{max-width:760px;margin:22px auto 0;color:#7e738d;text-align:center;font-size:12px}.mono{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}.wallet-setup{margin-bottom:14px;border:1px solid #4e3575;border-radius:24px;background:linear-gradient(145deg,rgba(31,21,46,.98),rgba(12,10,18,.98));box-shadow:var(--shadow);padding:clamp(22px,5vw,40px)}.setup-grid{display:grid;grid-template-columns:1.15fr .85fr;gap:14px}.setup-card,.wallet-backup{padding:20px;border:1px solid var(--line);border-radius:16px;background:#0d0a13}.setup-card{display:flex;flex-direction:column;gap:10px}.setup-card h3,.wallet-backup h2{margin:4px 0 0}.setup-card label,.copy-field label{font-weight:700}.setup-card>input,.copy-field input{width:100%;min-height:46px;padding:10px 12px;border:1px solid #4b3b60;border-radius:10px;background:#09070d;color:var(--text)}.setup-card .button{margin-top:auto}.ack{display:flex;align-items:flex-start;gap:8px;color:#d7cae8;font-weight:500!important}.ack input{margin-top:5px}.acknowledgements{display:grid;gap:12px;margin:20px 0;padding:16px 18px;border:1px solid #7251a1;border-radius:12px}.acknowledgements legend{padding:0 8px;color:#e3d5f8;font-weight:750}.wallet-backup{margin:16px 0;border-color:#7354a2}.copy-field{margin-top:14px}.copy-field>div{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;margin-top:6px}.copy-field input{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}.copy-field .button{min-height:46px}.policy-editor{margin:22px 0;padding:18px;border:1px solid #5d4381;border-radius:14px;background:#0b0810}.policy-editor h2{margin:0}.policy-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin-top:16px}.policy-grid label{display:flex;flex-direction:column;gap:6px;color:#d8cde5;font-size:13px;font-weight:650}.policy-grid input{min-height:42px;padding:8px 10px;border:1px solid #4b3b60;border-radius:9px;background:#09070d;color:var(--text)}.policy-grid .ack{flex-direction:row}.policy-fields{display:grid;gap:10px;margin:0;padding:12px;border:1px solid var(--line-soft);border-radius:10px}.policy-fields legend{padding:0 6px;color:var(--muted)}.policy-wide{grid-column:1/-1}.price-band{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;padding-top:10px;border-top:1px solid var(--line-soft)}.price-band>strong{grid-column:1/-1}
-@media(max-width:760px){.shell{width:min(100% - 20px,1080px);padding-top:16px}.local-label{display:none}.approval-card,.control-overview,.wallet-setup{border-radius:18px;padding:22px}.approval-card{margin-bottom:150px}.step{width:100%;margin:2px 0 0}.exposure,.wallet-card,.panel-grid,.setup-grid,.policy-grid,.price-band{grid-template-columns:1fr}.exposure .summary-row{border-right:0;border-bottom:1px solid #332641}.stats{grid-template-columns:1fr}.wallet-card>div:first-child{grid-column:1}.panel-wide,.policy-wide,.price-band>strong{grid-column:auto}.technical>div{grid-template-columns:1fr;gap:3px}.actions,.control-actions{flex-direction:column-reverse}.button{width:100%}.section-heading{flex-direction:column}.details-grid .summary-row{flex-direction:column;gap:4px}.details-grid .summary-row strong{text-align:left}.copy-field>div{grid-template-columns:1fr}}
+.sr-only{position:absolute!important;width:1px!important;height:1px!important;padding:0!important;margin:-1px!important;overflow:hidden!important;clip:rect(0,0,0,0)!important;white-space:nowrap!important;border:0!important}.control-overview{padding:0;border:0;border-radius:0;background:none;box-shadow:none}.dashboard-header{display:flex;align-items:flex-start;justify-content:space-between;gap:24px;margin-bottom:18px;padding:2px 2px 0}.dashboard-title h1{margin:2px 0 0;font-size:clamp(26px,4vw,34px);font-family:ui-monospace,SFMono-Regular,Consolas,monospace;letter-spacing:-.04em}.address-line{display:flex;align-items:center;gap:10px}.copy-icon{min-height:34px;padding:6px 10px;border:1px solid var(--line);border-radius:9px;color:#d9cdee;background:#15111d;font:inherit;font-size:12px;font-weight:700;cursor:pointer}.status-chips{display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap}.dashboard-stack{display:grid;gap:12px}.dashboard-card,.settings-section{margin:0;border:1px solid var(--line-soft);border-radius:16px;background:rgba(16,13,24,.84);box-shadow:0 10px 32px rgba(0,0,0,.16)}.dashboard-card{padding:20px}.card-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:20px}.card-heading h2{margin:3px 0 0;font-size:20px}.refresh-block{display:flex;align-items:center;justify-content:flex-end;gap:10px;color:var(--muted);text-align:right}.button-small{min-height:36px;width:auto;padding:6px 11px;font-size:13px}.inline-control{margin:0}.balance-list{list-style:none;margin:12px 0 0;padding:0}.balance-row{display:grid;grid-template-columns:minmax(0,1fr) minmax(160px,auto);align-items:center;gap:20px;min-height:62px;padding:10px 2px;border-top:1px solid var(--line-soft)}.asset-identity>span{display:flex;flex-direction:column}.asset-identity small{color:var(--muted)}.asset-value{text-align:right}.asset-value>strong{display:block;font-size:16px}.asset-value .inline-control{margin-top:7px}.exact-balance{display:inline-block;margin:3px 0 0;border:0;background:none;text-align:left}.exact-balance summary{padding:0;color:var(--muted);font-size:11px;font-weight:600}.exact-balance code{display:block;max-width:340px;margin-top:5px;padding:7px;border:1px solid var(--line-soft);border-radius:8px;background:#09070d;color:#dacde8;overflow-wrap:anywhere;white-space:normal}.all-assets{margin:10px 0 0;background:#0c0911}.all-assets>summary{display:flex;align-items:center;justify-content:space-between}.all-assets>summary span{display:grid;place-items:center;min-width:24px;height:24px;border-radius:999px;background:var(--purple-soft);color:#d9c5ff;font-size:12px}.all-assets>.balance-list{margin:0;padding:0 14px 8px}.mode-card .details-grid{max-width:620px}.privacy-banner{display:flex;align-items:center;justify-content:space-between;gap:20px;margin-bottom:12px;padding:14px 16px;border:1px solid #554078;border-radius:14px;background:#171022}.privacy-banner>div{display:flex;flex-direction:column}.privacy-banner span{color:var(--muted)}.privacy-banner .button{min-height:40px}.settings-section>summary{display:flex;align-items:center;justify-content:space-between;margin:0;padding:17px 20px;list-style-position:inside}.settings-section>summary span{display:flex;flex-direction:column;gap:2px}.settings-section>summary small{color:var(--muted);font-weight:500}.settings-body{padding:0 20px 20px}.settings-summary{margin:0}.settings-summary>div{display:grid;grid-template-columns:160px minmax(0,1fr);gap:18px;padding:9px 0;border-top:1px solid var(--line-soft)}.settings-summary dd{font-family:inherit;font-size:13px}.replacement-settings{margin:14px 0 0}.replacement-body{padding:0 14px 14px}.settings-warning{padding:10px 12px;border:1px solid #773447;border-radius:10px;background:#291018;color:#ffc1ce}.priority-state{max-width:none;margin:0 0 12px}.diagnostics-section .diagnostics{margin-top:0}
+@media(max-width:760px){.shell{width:min(100% - 20px,1080px);padding-top:16px}.topbar{margin-bottom:20px}.local-label{display:none}.approval-card,.wallet-setup{border-radius:18px;padding:22px}.control-overview{padding:0}.approval-card{margin-bottom:150px}.step{width:100%;margin:2px 0 0}.exposure,.wallet-card,.panel-grid,.setup-grid,.policy-grid,.price-band{grid-template-columns:1fr}.exposure .summary-row{border-right:0;border-bottom:1px solid #332641}.stats{grid-template-columns:1fr}.wallet-card>div:first-child{grid-column:1}.panel-wide,.policy-wide,.price-band>strong{grid-column:auto}.technical>div{grid-template-columns:1fr;gap:3px}.actions,.control-actions{flex-direction:column-reverse}.button{width:100%}.button-small,.copy-icon{width:auto}.section-heading,.dashboard-header,.card-heading,.privacy-banner{align-items:stretch;flex-direction:column}.status-chips{justify-content:flex-start}.refresh-block{align-items:flex-start;justify-content:flex-start;text-align:left}.details-grid .summary-row{flex-direction:column;gap:4px}.details-grid .summary-row strong{text-align:left}.copy-field>div{grid-template-columns:1fr}.dashboard-card{padding:16px}.balance-row{grid-template-columns:minmax(0,1fr);gap:8px}.asset-value{text-align:left}.settings-summary>div{grid-template-columns:1fr;gap:3px}.operation-list li{align-items:flex-start;flex-direction:column}.operation-actions{justify-content:flex-start}.address-line{align-items:flex-start;flex-wrap:wrap}.dashboard-title h1{font-size:24px}.privacy-banner .button{width:100%}}
 @media(prefers-reduced-motion:no-preference){.control-overview{animation:enter .22s ease-out both}@keyframes enter{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}}
 `;
 

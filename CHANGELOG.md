@@ -25,6 +25,15 @@ Initial public beta release candidate.
   replay/origin protections, strict CSP, no remote assets, no telemetry,
   redacted diagnostics, responsive accessible forms, active-tab prompt reuse,
   stale-tab reopening, and authenticated-page arrival checks.
+- Rebuilt configured-wallet Agent Control as a compact operational dashboard:
+  wallet and signer status, verified-asset balances, agent mode, five recent
+  operations, and collapsed wallet settings and diagnostics.
+- Added cached local balance reads for native COTI, public ERC-20 assets, and
+  locally decrypted prepared private tokens, with concurrent refresh
+  deduplication, partial-failure stale values, exact-amount disclosure, and
+  contextual private-token preparation.
+- Kept decrypted balances local to the authenticated dashboard and out of MCP
+  status, prompts, logs, diagnostics, and page refresh keys.
 - Added structured allowlisted Agent Control diagnostic codes to signer status
   so agents can distinguish setup progress and safe failures without receiving
   local error text or secrets.
