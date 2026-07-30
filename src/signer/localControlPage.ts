@@ -977,6 +977,17 @@ export const renderAgentControlPage = (
     document.addEventListener('submit', (event) => {
       const form = event.target;
       if (!(form instanceof HTMLFormElement)) return;
+      const submitter = event.submitter;
+      if (
+        submitter instanceof HTMLButtonElement &&
+        submitter.name
+      ) {
+        const submittedAction = document.createElement('input');
+        submittedAction.type = 'hidden';
+        submittedAction.name = submitter.name;
+        submittedAction.value = submitter.value;
+        form.appendChild(submittedAction);
+      }
       form.setAttribute('aria-busy', 'true');
       for (const button of form.querySelectorAll('button')) {
         button.disabled = true;

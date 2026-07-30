@@ -28,6 +28,10 @@ Initial public beta release candidate.
 - Added structured allowlisted Agent Control diagnostic codes to signer status
   so agents can distinguish setup progress and safe failures without receiving
   local error text or secrets.
+- Fixed real-browser Agent Control submissions by preserving the selected
+  action before disabling buttons and using an authenticated-page referrer
+  policy that lets Chrome provide the exact same-origin value required by the
+  signer.
 
 ### Signing and autonomy
 

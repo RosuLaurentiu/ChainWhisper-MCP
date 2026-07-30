@@ -127,6 +127,7 @@ const establishSession = async (
   origin: string;
   controlUrl: string;
   cookie: string;
+  bootstrap: HttpResult;
   page: HttpResult;
 }> => {
   const bootstrap = await rawRequest(bootstrapUrl, {
@@ -152,7 +153,7 @@ const establishSession = async (
       'Sec-Fetch-Dest': 'document',
     },
   });
-  return { origin, controlUrl, cookie, page };
+  return { origin, controlUrl, cookie, bootstrap, page };
 };
 
 const submit = (
@@ -196,6 +197,12 @@ describe('local Agent Control elicitor', () => {
           expect(session.controlUrl).not.toContain('/open/');
           expect(session.page.status).toBe(200);
           expect(header(session.page, 'cache-control')).toContain('no-store');
+          expect(header(session.bootstrap, 'referrer-policy')).toBe(
+            'no-referrer',
+          );
+          expect(header(session.page, 'referrer-policy')).toBe(
+            'same-origin',
+          );
           expect(header(session.page, 'x-frame-options')).toBe('DENY');
           expect(header(session.page, 'access-control-allow-origin')).toBe('');
           const csp = header(session.page, 'content-security-policy');
@@ -266,6 +273,12 @@ describe('local Agent Control elicitor', () => {
           expect(session.page.body).not.toContain('type="checkbox"');
           expect(session.page.body).not.toMatch(
             /<(?:script|img|link)[^>]+https?:/iu,
+          );
+          expect(session.page.body).toContain(
+            'const submitter = event.submitter',
+          );
+          expect(session.page.body).toContain(
+            'submittedAction.value = submitter.value',
           );
 
           const csrf = hiddenValue(session.page.body, 'csrf');
