@@ -37,7 +37,7 @@ export type ResolvedAsset = {
   verified: true;
   publicCounterpart?: {
     symbol: string;
-    address: Address;
+    address: Address | null;
   };
 };
 
