@@ -49,6 +49,7 @@ export type AgentControlAction =
   | 'pause-autonomy'
   | 'resume-autonomy'
   | 'revoke-autonomy'
+  | 'refresh-balances'
   | 'import-wallet'
   | 'generate-wallet'
   | 'clear-wallet-backup'
@@ -1028,6 +1029,7 @@ export class LocalWebFormElicitor
       action !== 'pause-autonomy' &&
       action !== 'resume-autonomy' &&
       action !== 'revoke-autonomy' &&
+      action !== 'refresh-balances' &&
       action !== 'import-wallet' &&
       action !== 'generate-wallet' &&
       action !== 'clear-wallet-backup' &&
