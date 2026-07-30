@@ -76,7 +76,14 @@ const hasReference = (
 export const formatDashboardAmount = (exact: string): string => {
   const [whole = '0', fraction = ''] = exact.split('.');
   if (!fraction) return whole;
-  const trimmed = fraction.replace(/0+$/u, '');
+  let trimmedLength = fraction.length;
+  while (
+    trimmedLength > 0 &&
+    fraction.charCodeAt(trimmedLength - 1) === 48
+  ) {
+    trimmedLength -= 1;
+  }
+  const trimmed = fraction.slice(0, trimmedLength);
   if (!trimmed) return whole;
   if (trimmed.length <= 6) return `${whole}.${trimmed}`;
   if (whole !== '0') return `${whole}.${trimmed.slice(0, 6)}`;
