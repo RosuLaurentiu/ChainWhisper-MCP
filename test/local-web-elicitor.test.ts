@@ -440,6 +440,265 @@ describe('local Agent Control elicitor', () => {
     await browserDone;
   });
 
+  it('accepts each one-time CSRF token from concurrent same-session pages', async () => {
+    let bootstrapUrl = '';
+    const submitted: string[] = [];
+    const elicitor = new LocalWebFormElicitor({
+      openUrl: (url) => {
+        bootstrapUrl = url;
+      },
+      getControlSummary: () => ({
+        wallet: '0x1111111111111111111111111111111111111111',
+        network: 'COTI Mainnet',
+        balance: '1 COTI',
+        privacyStatus: 'onboarding-required',
+        signerStatus: 'ready',
+        autonomy: { mode: 'manual' },
+        pendingOperations: 0,
+        recentOperations: [],
+        diagnostics: [],
+        controlActions: { onboardPrivacy: true },
+      }),
+      onControlAction: (action) => {
+        submitted.push(action);
+        return { ok: true, message: 'Local action accepted.' };
+      },
+    });
+    eliciters.push(elicitor);
+
+    await elicitor.openControlPanel();
+    const session = await establishSession(bootstrapUrl);
+    const concurrentPage = await rawRequest(session.controlUrl, {
+      headers: {
+        Cookie: session.cookie,
+        'Sec-Fetch-Site': 'same-origin',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Dest': 'document',
+      },
+    });
+    expect(concurrentPage.status).toBe(200);
+
+    const firstSubmission = new URLSearchParams({
+      csrf: hiddenValue(session.page.body, 'csrf'),
+      intent: 'control',
+      action: 'onboard-privacy',
+    });
+    const secondSubmission = new URLSearchParams({
+      csrf: hiddenValue(concurrentPage.body, 'csrf'),
+      intent: 'control',
+      action: 'onboard-privacy',
+    });
+
+    expect((await submit(session, firstSubmission)).status).toBe(200);
+    expect((await submit(session, secondSubmission)).status).toBe(200);
+    expect(submitted).toEqual(['onboard-privacy', 'onboard-privacy']);
+    expect((await submit(session, firstSubmission)).status).toBe(403);
+    expect((await submit(session, secondSubmission)).status).toBe(403);
+  });
+
+  it('lets an active control page receive a prompt without opening a duplicate tab', async () => {
+    const openedUrls: string[] = [];
+    const elicitor = new LocalWebFormElicitor({
+      openUrl: (url) => {
+        openedUrls.push(url);
+      },
+      activeBrowserGraceMs: 500,
+    });
+    eliciters.push(elicitor);
+
+    await elicitor.openControlPanel();
+    const session = await establishSession(openedUrls[0] ?? '');
+    const confirmation = elicitor.requestConfirmation(
+      CONFIRMATION,
+      5_000,
+    );
+    expect(openedUrls).toHaveLength(1);
+
+    const promptPage = await rawRequest(session.controlUrl, {
+      headers: {
+        Cookie: session.cookie,
+        'Sec-Fetch-Site': 'same-origin',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Dest': 'document',
+      },
+    });
+    expect(promptPage.status).toBe(200);
+    expect(
+      await submit(
+        session,
+        new URLSearchParams({
+          csrf: hiddenValue(promptPage.body, 'csrf'),
+          promptId: hiddenValue(promptPage.body, 'promptId'),
+          intent: 'prompt',
+          action: 'confirm',
+        }),
+      ),
+    ).toMatchObject({ status: 200 });
+    await expect(confirmation).resolves.toEqual({
+      outcome: 'accepted',
+    });
+    expect(openedUrls).toHaveLength(1);
+  });
+
+  it('reopens Agent Control when the previous page activity is stale', async () => {
+    const openedUrls: string[] = [];
+    const elicitor = new LocalWebFormElicitor({
+      openUrl: (url) => {
+        openedUrls.push(url);
+      },
+      activeBrowserGraceMs: 10,
+    });
+    eliciters.push(elicitor);
+
+    await elicitor.openControlPanel();
+    await establishSession(openedUrls[0] ?? '');
+    await new Promise<void>((resolve) => setTimeout(resolve, 25));
+
+    const confirmation = elicitor.requestConfirmation(
+      CONFIRMATION,
+      5_000,
+    );
+    await expect.poll(() => openedUrls.length).toBe(2);
+    expect(openedUrls[1]).toMatch(/\/control$/u);
+
+    await elicitor.close();
+    await expect(confirmation).resolves.toEqual({
+      outcome: 'cancelled',
+    });
+  });
+
+  it('keeps watching when the active control page closes after the first check', async () => {
+    const openedUrls: string[] = [];
+    const elicitor = new LocalWebFormElicitor({
+      openUrl: (url) => {
+        openedUrls.push(url);
+      },
+      activeBrowserGraceMs: 50,
+    });
+    eliciters.push(elicitor);
+
+    await elicitor.openControlPanel();
+    const session = await establishSession(openedUrls[0] ?? '');
+    const confirmation = elicitor.requestConfirmation(
+      CONFIRMATION,
+      5_000,
+    );
+
+    await new Promise<void>((resolve) => setTimeout(resolve, 125));
+    expect(
+      (
+        await rawRequest(session.controlUrl, {
+          headers: {
+            Cookie: session.cookie,
+            'Sec-Fetch-Site': 'same-origin',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Dest': 'document',
+          },
+        })
+      ).status,
+    ).toBe(200);
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+    expect(openedUrls).toHaveLength(1);
+
+    await expect.poll(() => openedUrls.length).toBe(2);
+    expect(openedUrls[1]).toMatch(/\/control$/u);
+
+    await elicitor.close();
+    await expect(confirmation).resolves.toEqual({
+      outcome: 'cancelled',
+    });
+  });
+
+  it('does not issue a new-session CSRF token from an old delayed response', async () => {
+    let initialSession:
+      | Awaited<ReturnType<typeof establishSession>>
+      | undefined;
+    let replacementSession:
+      | Awaited<ReturnType<typeof establishSession>>
+      | undefined;
+    let openAttempt = 0;
+    let releaseFirstAction!: () => void;
+    const firstActionRelease = new Promise<void>((resolve) => {
+      releaseFirstAction = resolve;
+    });
+    let firstActionStarted!: () => void;
+    const firstActionStart = new Promise<void>((resolve) => {
+      firstActionStarted = resolve;
+    });
+    let actionCount = 0;
+    const elicitor = new LocalWebFormElicitor({
+      requireBrowserArrival: true,
+      browserArrivalTimeoutMs: 500,
+      openUrl: async (url) => {
+        openAttempt += 1;
+        if (openAttempt === 1) {
+          initialSession = await establishSession(url);
+        } else if (openAttempt === 3) {
+          replacementSession = await establishSession(url);
+        }
+      },
+      getControlSummary: () => ({
+        wallet: '0x1111111111111111111111111111111111111111',
+        network: 'COTI Mainnet',
+        balance: '1 COTI',
+        privacyStatus: 'onboarding-required',
+        signerStatus: 'ready',
+        autonomy: { mode: 'manual' },
+        pendingOperations: 0,
+        recentOperations: [],
+        diagnostics: [],
+        controlActions: { onboardPrivacy: true },
+      }),
+      onControlAction: async () => {
+        actionCount += 1;
+        if (actionCount === 1) {
+          firstActionStarted();
+          await firstActionRelease;
+        }
+        return { ok: true, message: 'Local action accepted.' };
+      },
+    });
+    eliciters.push(elicitor);
+
+    await elicitor.openControlPanel();
+    if (!initialSession) throw new Error('Initial session was not opened.');
+    const firstSession = initialSession;
+    const delayedResponse = submit(
+      firstSession,
+      new URLSearchParams({
+        csrf: hiddenValue(firstSession.page.body, 'csrf'),
+        intent: 'control',
+        action: 'onboard-privacy',
+      }),
+    );
+    await firstActionStart;
+
+    await expect(elicitor.openControlPanel()).resolves.toMatchObject({
+      opened: true,
+      ready: true,
+    });
+    if (!replacementSession) {
+      throw new Error('Replacement session was not opened.');
+    }
+    releaseFirstAction();
+
+    const staleResponse = await delayedResponse;
+    expect(staleResponse.status).toBe(401);
+    expect(staleResponse.body).not.toContain('name="csrf"');
+    const currentSession = replacementSession;
+    expect(
+      await submit(
+        currentSession,
+        new URLSearchParams({
+          csrf: hiddenValue(currentSession.page.body, 'csrf'),
+          intent: 'control',
+          action: 'onboard-privacy',
+        }),
+      ),
+    ).toMatchObject({ status: 200 });
+    expect(actionCount).toBe(2);
+  });
+
   it('rotates an unconsumed bootstrap token and returns no URL', async () => {
     const bootstrapUrls: string[] = [];
     const elicitor = new LocalWebFormElicitor({
