@@ -306,12 +306,29 @@ class DeferredTestElicitor extends TestElicitor {
 class BusyDeclinesElicitor extends TestElicitor {
   concurrentDeclines = 0;
   readonly releases: Array<() => void> = [];
+  readonly #requestWaiters: Array<{
+    count: number;
+    resolve: () => void;
+  }> = [];
   #active = false;
+
+  async waitForRequests(count: number): Promise<void> {
+    if (this.requests.length >= count) return;
+    await new Promise<void>((resolve) => {
+      this.#requestWaiters.push({ count, resolve });
+    });
+  }
 
   override async requestConfirmation(
     request: ConfirmationRequest,
   ): Promise<{ outcome: 'accepted' } | { outcome: 'declined' }> {
     this.requests.push(request);
+    for (let index = this.#requestWaiters.length - 1; index >= 0; index -= 1) {
+      const waiter = this.#requestWaiters[index]!;
+      if (this.requests.length < waiter.count) continue;
+      this.#requestWaiters.splice(index, 1);
+      waiter.resolve();
+    }
     if (this.#active) {
       this.concurrentDeclines += 1;
       return { outcome: 'declined' };
@@ -889,44 +906,21 @@ describe('local ChainWhisper signer core', () => {
 
     await setup.engine.queueAction(first);
     await setup.engine.queueAction(second);
-    for (
-      let attempt = 0;
-      elicitor.requests.length < 1 && attempt < 50;
-      attempt += 1
-    ) {
-      await new Promise<void>((resolve) => setTimeout(resolve, 5));
-    }
+    await elicitor.waitForRequests(1);
     expect(elicitor.requests).toHaveLength(1);
     expect(
       await setup.engine.getOperationStatus(second.operationId),
     ).toMatchObject({ status: 'queued' });
 
     elicitor.releases.shift()?.();
-    for (
-      let attempt = 0;
-      elicitor.requests.length < 2 && attempt < 50;
-      attempt += 1
-    ) {
-      await new Promise<void>((resolve) => setTimeout(resolve, 5));
-    }
+    await elicitor.waitForRequests(2);
     expect(elicitor.requests).toHaveLength(2);
     expect(elicitor.concurrentDeclines).toBe(0);
 
     elicitor.releases.shift()?.();
-    let secondStatus = await setup.engine.getOperationStatus(
-      second.operationId,
-    );
-    for (
-      let attempt = 0;
-      secondStatus?.status !== 'completed' && attempt < 50;
-      attempt += 1
-    ) {
-      await new Promise<void>((resolve) => setTimeout(resolve, 5));
-      secondStatus = await setup.engine.getOperationStatus(
-        second.operationId,
-      );
-    }
-    expect(secondStatus).toMatchObject({ status: 'completed' });
+    await expect(setup.engine.executeAction(second)).resolves.toMatchObject({
+      status: 'completed',
+    });
   });
 
   it('rechecks runtime around confirmation and confirms every write', async () => {
@@ -1622,16 +1616,14 @@ describe('local ChainWhisper signer core', () => {
     });
 
     await setup.engine.queueAction(envelope, 'policy-1');
-    await expect
-      .poll(() => wallet.broadcastCount, { timeout: 15_000 })
-      .toBe(1);
-    await expect
-      .poll(
-        async () =>
-          (await setup.journal.get(envelope.operationId))?.stage,
-        { timeout: 15_000 },
-      )
-      .toBe('broadcast');
+    await expect(
+      setup.engine.executeAction(envelope, 'policy-1'),
+    ).resolves.toMatchObject({ status: 'processing' });
+    expect(wallet.broadcastCount).toBe(1);
+    expect(await setup.journal.get(envelope.operationId)).toMatchObject({
+      stage: 'broadcast',
+      nextStepIndex: 0,
+    });
 
     wallet.receiptStatus = 'success';
     const restored = new SignerEngine({
@@ -1667,18 +1659,18 @@ describe('local ChainWhisper signer core', () => {
     });
 
     await restored.restorePendingOperations();
-    await expect
-      .poll(
-        async () =>
-          (await setup.journal.get(envelope.operationId))?.errorCodes.at(
-            -1,
-          ),
-        { timeout: 15_000 },
-      )
-      .toBe('OPERATION_REPREPARE_REQUIRED');
+    await expect(
+      restored.executeAction(envelope, 'policy-1'),
+    ).resolves.toMatchObject({
+      status: 'retryable',
+      errorCode: 'OPERATION_REPREPARE_REQUIRED',
+    });
+    expect(
+      (await setup.journal.get(envelope.operationId))?.errorCodes.at(-1),
+    ).toBe('OPERATION_REPREPARE_REQUIRED');
     expect(wallet.prepareCount).toBe(1);
     expect(wallet.broadcastCount).toBe(1);
-  }, 30_000);
+  });
 
   it('keeps a pending receipt in processing and does not resubmit it', async () => {
     const wallet = new TestWallet();
