@@ -32,6 +32,9 @@ Initial public beta release candidate.
   action before disabling buttons and using an authenticated-page referrer
   policy that lets Chrome provide the exact same-origin value required by the
   signer.
+- Serialized signer-state reads and atomic replacements, with bounded retries
+  for transient Windows file locks, so concurrent autonomy and status polling
+  cannot misclassify a valid operation as a transaction failure.
 
 ### Signing and autonomy
 
