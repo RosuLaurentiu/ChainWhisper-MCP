@@ -145,11 +145,44 @@ const sidePrice = (
   return `${side.price} ${side.priceUnit}${offset}`;
 };
 
+const removeWeiParentheticals = (value: string): string => {
+  let cursor = 0;
+  let result = '';
+  while (cursor < value.length) {
+    const open = value.indexOf('(', cursor);
+    if (open === -1) {
+      result += value.slice(cursor);
+      break;
+    }
+    const close = value.indexOf(')', open + 1);
+    if (close === -1) {
+      result += value.slice(cursor);
+      break;
+    }
+    result += value.slice(cursor, open);
+    const detail = value.slice(open + 1, close);
+    if (!detail.toLowerCase().includes('wei')) {
+      result += value.slice(open, close + 1);
+    }
+    cursor = close + 1;
+  }
+  return result;
+};
+
 const humanFee = (value: string): string =>
-  value
-    .replace(/\s*\([^)]*\bwei\b[^)]*\)/giu, '')
-    .replace(/\s*;\s*/gu, ' · ')
-    .trim();
+  removeWeiParentheticals(value)
+    .split(';')
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .join(' · ');
+
+const withoutTrailingSlashes = (value: string): string => {
+  let end = value.length;
+  while (end > 0 && value.charCodeAt(end - 1) === 47) {
+    end -= 1;
+  }
+  return value.slice(0, end);
+};
 
 export const buildLocalActivitySnapshot = (
   request: ConfirmationRequestWithOrderReview,
@@ -488,7 +521,7 @@ export class AgentActivityReader {
     this.#vault = options.vault;
     this.#orders = options.orders;
     this.#getOperationStatus = options.getOperationStatus;
-    this.#explorerUrl = options.explorerUrl.replace(/\/+$/u, '');
+    this.#explorerUrl = withoutTrailingSlashes(options.explorerUrl);
   }
 
   async #readOrders(count: number): Promise<{
@@ -640,6 +673,11 @@ export class AgentActivityReader {
       Math.min(MAX_ACTIVITY_PAGE, Math.trunc(requestedPage)),
     );
     const required = (page + 1) * ACTIVITY_PAGE_SIZE;
+    const chainPromise = this.#readOrders(required).catch(() => ({
+      orders: [] as SafeOrderSummary[],
+      activities: [] as WalletOrderActivityRecord[],
+      hasMore: false,
+    }));
     const records = await this.#journal.list();
     const [local, chain] = await Promise.all([
       Promise.all(
@@ -652,11 +690,7 @@ export class AgentActivityReader {
           ),
         ),
       ),
-      this.#readOrders(required).catch(() => ({
-        orders: [] as SafeOrderSummary[],
-        activities: [] as WalletOrderActivityRecord[],
-        hasMore: false,
-      })),
+      chainPromise,
     ]);
     const merged = new Map<string, ActivityEntryV1>();
     const transactionOwners = new Map<string, string>();

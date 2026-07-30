@@ -14,7 +14,9 @@ import {
   EncryptedSecretVault,
   OperationJournal,
   activitySnapshotReference,
+  buildLocalActivitySnapshot,
   type Address,
+  type ConfirmationRequestWithOrderReview,
   type HexString,
   type LocalActivitySnapshotV1,
   type OperationStatusV2,
@@ -27,6 +29,27 @@ const CONTRACT =
 const OPERATION_HASH = `0x${'33'.repeat(32)}` as HexString;
 const FILL_TRANSACTION =
   `0x${'55'.repeat(32)}` as HexString;
+
+const activityConfirmation = (
+  fee: string,
+): ConfirmationRequestWithOrderReview => ({
+  operationId: 'activity-formatting',
+  operationHash: OPERATION_HASH,
+  stepId: 'activity-formatting',
+  stepIndex: 0,
+  stepCount: 1,
+  wallet: WALLET,
+  contract: CONTRACT,
+  action: 'create_trade',
+  assets: ['WISP', 'COTI'],
+  amounts: ['1 WISP', '1 COTI'],
+  counterparty: null,
+  fee,
+  nativeValue: '0',
+  gasCap: '100000',
+  expectedResult: 'An order is created.',
+  summary: 'Create order',
+});
 
 const recurringOrder = (
   localId: string,
@@ -97,6 +120,57 @@ const recurringOrder = (
 });
 
 describe('AgentActivityReader', () => {
+  it('formats untrusted fee details in linear passes while preserving human terms', () => {
+    const repeated = ' '.repeat(100_000);
+    const snapshot = buildLocalActivitySnapshot(
+      activityConfirmation(
+        `5 COTI ${repeated}(5000000000000000000 wei); 0.48 COTI network`,
+      ),
+    );
+
+    expect(snapshot.fee).toBe('5 COTI · 0.48 COTI network');
+    expect(
+      buildLocalActivitySnapshot(
+        activityConfirmation('5 COTI (estimated); 0.48 COTI network'),
+      ).fee,
+    ).toBe('5 COTI (estimated) · 0.48 COTI network');
+  });
+
+  it('normalizes long untrusted explorer suffixes without changing transaction links', async () => {
+    const stateDirectory = await mkdtemp(
+      join(tmpdir(), 'cw-wallet-activity-explorer-'),
+    );
+    const journal = new OperationJournal(stateDirectory);
+    await journal.begin('explorer-activity', OPERATION_HASH);
+    await journal.recordExternalReceipt('explorer-activity', {
+      transactionHash: FILL_TRANSACTION,
+      status: 'success',
+    });
+    const reader = new AgentActivityReader({
+      wallet: WALLET,
+      journal,
+      vault: new EncryptedSecretVault(
+        stateDirectory,
+        'explorer-passphrase',
+      ),
+      orders: {
+        listOrders: async () => ({
+          orders: [],
+          nextCursor: null,
+          truncated: false,
+        }),
+      },
+      getOperationStatus: async () => null,
+      explorerUrl: `https://mainnet.cotiscan.io${'/'.repeat(100_000)}`,
+    });
+
+    const page = await reader.page();
+
+    expect(page.entries[0]?.transactionUrls).toEqual([
+      `https://mainnet.cotiscan.io/tx/${FILL_TRANSACTION}`,
+    ]);
+  });
+
   it('merges a local exact review with the latest on-chain order status', async () => {
     const stateDirectory = await mkdtemp(
       join(tmpdir(), 'cw-agent-activity-'),
@@ -510,7 +584,6 @@ describe('AgentActivityReader', () => {
       expect(listOrders).toHaveBeenCalledTimes(1);
     });
     const secondPage = reader.page(1);
-    await new Promise<void>((resolve) => setTimeout(resolve, 0));
     releaseFirstPage();
     const [first, second] = await Promise.all([
       firstPage,
