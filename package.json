@@ -42,6 +42,7 @@
     "smoke": "node scripts/package-smoke.mjs",
     "smoke:live": "node scripts/package-smoke.mjs --live-status",
     "smoke:live:readonly": "node scripts/live-readonly-smoke.mjs",
+    "audit:contract-provenance": "node scripts/verify-contract-provenance.mjs",
     "verify:tarball": "npm run build && node scripts/package-tarball-smoke.mjs",
     "pack:dry-run": "npm run build && npm pack --dry-run",
     "audit:dependencies": "npm audit --omit=dev --audit-level=low",
@@ -64,6 +65,7 @@
     "@types/node": "22.19.15",
     "eslint": "10.8.0",
     "globals": "17.8.0",
+    "solc": "0.8.19",
     "typescript": "5.9.3",
     "typescript-eslint": "8.65.0",
     "vitest": "4.1.10"

@@ -1,0 +1,65 @@
+{
+  "schemaVersion": "chainwhisper.contract-provenance/1",
+  "network": {
+    "name": "COTI Mainnet",
+    "chainId": 2632500
+  },
+  "contract": {
+    "name": "ChainWhisperRecurringOTCEscrowV1",
+    "address": "0x7235B18b9CD59fB9853BC3BF3a0A65bc32162cd5",
+    "verifiedSource": "https://mainnet.cotiscan.io/address/0x7235B18b9CD59fB9853BC3BF3a0A65bc32162cd5#code",
+    "sourceApi": "https://mainnet.cotiscan.io/api?module=contract&action=getsourcecode&address=0x7235B18b9CD59fB9853BC3BF3a0A65bc32162cd5",
+    "creationApi": "https://mainnet.cotiscan.io/api?module=contract&action=getcontractcreation&contractaddresses=0x7235B18b9CD59fB9853BC3BF3a0A65bc32162cd5",
+    "constructorArguments": "0x000000000000000000000000bf01185a70cdfef1858659836d57bff085ebed55000000000000000000000000bf01185a70cdfef1858659836d57bff085ebed550000000000000000000000000000000000000000000000000001c6bf52634000"
+  },
+  "deployment": {
+    "transactionHash": "0xc5275a6f7c528a8857db9ac63eeea1ce62b4dd34883bff81c6a17759a0747243",
+    "blockNumber": 7117488,
+    "timestamp": 1778265662,
+    "creator": "0xbf01185A70CDfEF1858659836D57BFf085ebed55",
+    "creationBytecodeBytes": 25648,
+    "creationBytecodeKeccak256": "0x9d91e52ced32b9b97bd9d064ddab45fdc6c56d2501e769e9854a5d05554f3122"
+  },
+  "compiler": {
+    "version": "0.8.19+commit.7dd6d404",
+    "longVersion": "0.8.19+commit.7dd6d404.Emscripten.clang",
+    "settings": {
+      "libraries": {},
+      "metadata": {
+        "bytecodeHash": "none"
+      },
+      "optimizer": {
+        "enabled": true,
+        "runs": 1
+      },
+      "viaIR": true
+    }
+  },
+  "sources": {
+    "contracts/ChainWhisperRecurringOTCEscrowV1.sol": {
+      "sha256": "f7eb6a7c316b7c9b4444abffe763093c3f1cbdf985faf81addc4e93f4bc8a92a"
+    },
+    "@coti-io/coti-contracts/contracts/utils/mpc/MpcCore.sol": {
+      "sha256": "92784ce2cb6bfaf24d099c78692306fb427f6c3748cec36f5cda9d56e66c9e4a"
+    },
+    "@coti-io/coti-contracts/contracts/utils/mpc/MpcInterface.sol": {
+      "sha256": "73c7f0bea0bd413a901bcdbd4097256344b026117b000be5d5f78910e6af9c10"
+    },
+    "contracts/interfaces/IPrivateERC20Latest.sol": {
+      "sha256": "92dca95fd065a7215ed5b08db7532b3a51075a7863ed58d3427ccb0fb4265f4b"
+    }
+  },
+  "abi": {
+    "canonicalJsonSha256": "6290a21e9f2bfd63783aa1a9411cbc1b0f500544c3471b74cfb504b3304b6918"
+  },
+  "runtime": {
+    "bytes": 24514,
+    "keccak256": "0x3ebc1ca2d3bc2cb25af2aa8b0c5cb5e3997f3ece1287c786ad65d807efa0febd"
+  },
+  "selectors": {
+    "fillBuySideWithSecret": "0x451903f0",
+    "fillSellSideWithSecret": "0xb916c07a",
+    "fillPrivateBuySideWithSecret": "0xe07ad3b3",
+    "fillPrivateSellSideWithSecret": "0x25c2920e"
+  }
+}

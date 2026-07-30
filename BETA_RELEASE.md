@@ -81,15 +81,20 @@ and safely skips republishing.
 
 ## Deployed recurring source identity
 
-- [ ] Synchronize the active recurring Solidity source and exported ABI with
+- [x] Synchronize the active recurring Solidity source and exported ABI with
       the deployed `WithSecret` fill selectors used by the app, runtime
       manifest, and attested Mainnet bytecode.
-- [ ] Reproduce the attested recurring bytecode from the synchronized release
+- [x] Reproduce the attested recurring bytecode from the synchronized release
       source or attach equivalent reviewed deployment provenance.
 
-The signer already fails closed against the live bytecode hash and selector
-set. This repository drift does not authorize a wrong call, but it must be
-resolved before describing the beta contract artifacts as reproducible.
+`npm run audit:contract-provenance` retrieves the COTI Scan verified four-source
+compiler bundle, verifies every source and ABI digest, compiles it with exact
+Solidity settings, reproduces the 24,514-byte deployed runtime, and checks its
+hash and selectors against the committed runtime manifest. The protected
+release attaches that proof as `contract-provenance.json`.
+The exact reviewed four-source Standard JSON compiler input is attached as
+`contract-standard-input.json`; `SHA256SUMS` covers both files and every other
+release artifact.
 
 ## Local release checks
 
@@ -112,6 +117,7 @@ Run the read-only COTI Mainnet checks:
 npm run smoke:live
 npm run smoke:live:readonly
 npm run audit:runtime
+npm run audit:contract-provenance
 ```
 
 Confirm:
@@ -281,7 +287,8 @@ Push the exact protected tag. The workflow:
 5. runs lint, build, tests, smoke, and production audit;
 6. builds and clean-installs one exact tarball;
 7. writes `runtime-audit.json`, `SHA256SUMS`, production-only
-   `sbom.cdx.json`, and `RELEASE_NOTES.md`;
+   `sbom.cdx.json`, `contract-provenance.json`,
+   `contract-standard-input.json`, and `RELEASE_NOTES.md`;
 8. uploads the immutable evidence artifact;
 9. waits at protected `npm-beta`;
 10. downloads and re-verifies the same evidence;

@@ -109,6 +109,8 @@ assert.deepEqual(packageJson.scripts, {
   smoke: 'node scripts/package-smoke.mjs',
   'smoke:live': 'node scripts/package-smoke.mjs --live-status',
   'smoke:live:readonly': 'node scripts/live-readonly-smoke.mjs',
+  'audit:contract-provenance':
+    'node scripts/verify-contract-provenance.mjs',
   'verify:tarball':
     'npm run build && node scripts/package-tarball-smoke.mjs',
   'pack:dry-run': 'npm run build && npm pack --dry-run',

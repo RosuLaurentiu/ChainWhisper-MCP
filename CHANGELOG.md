@@ -80,8 +80,12 @@ Initial public beta release candidate.
 - Split unprivileged evidence building from protected publish-only execution.
 - Bound release identity to the exact protected tag, package version, and
   centralized source version.
+- Added exact-source Solidity reproduction for the deployed recurring
+  contract, including compiler input, creation-bytecode, runtime, ABI, and
+  selector evidence.
 - Publish the previously built tarball and attach checksum, production SBOM,
-  runtime audit, and release notes to a GitHub prerelease.
+  runtime audit, contract provenance, and release notes to a GitHub
+  prerelease.
 
 ### Known beta constraints
 
