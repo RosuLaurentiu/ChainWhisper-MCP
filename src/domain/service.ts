@@ -1,10 +1,14 @@
-import { canonicalDecimal, compareDecimals, invertDecimal, isPositiveDecimal } from './decimal.js';
-import { DomainInputError, toolFailure } from './errors.js';
 import {
-  ORDER_CLASSIFICATION_IDS_V1,
-  deriveOrderClassificationV1,
-  type OrderClassificationIdV1
-} from '../shared/orderClassification.js';
+  canonicalDecimal,
+  compareDecimals,
+  divideDecimals,
+  invertDecimal,
+  isPositiveDecimal,
+  multiplyDecimals,
+  parseDecimal
+} from './decimal.js';
+import { DomainInputError, toolFailure } from './errors.js';
+import { deriveOrderClassificationV1 } from '../shared/orderClassification.js';
 import type {
   Address,
   ComparePriceReferencesInput,
@@ -26,6 +30,7 @@ import type {
   FillIntent,
   ListOrdersInput,
   ListOrdersResult,
+  MarketReferencePriceInput,
   MissingDetail,
   NormalizedPriceReference,
   OrderIdentityInput,
@@ -36,11 +41,14 @@ import type {
   PrivacyBridgeStatus,
   PrivacyBridgeStatusInput,
   PrivateAmountMode,
+  PrepareSwapInput,
+  PrepareSwapResult,
   PrepareResult,
   RawPriceReference,
   ResolvedAsset,
   SafeOrderSummary,
   SecretPolicy,
+  SwapSelection,
   ToolResult
 } from './types.js';
 import { privacyBridgePair } from '../shared/privacyBridge.js';
@@ -63,97 +71,21 @@ import {
 import { CHAINWHISPER_CHAIN_ID, MAX_ORDER_PAGE_SIZE } from './types.js';
 
 const safeString = (value: unknown, fallback = ''): string => (typeof value === 'string' ? value : fallback);
-
-type CreateCadence = 'one-off' | 'recurring';
-
-const CREATE_ORDER_TYPES = new Set<string>(ORDER_CLASSIFICATION_IDS_V1);
-
-const axesForOrderType = (
-  value: unknown,
-  cadence: CreateCadence
-): {
-  id: OrderClassificationIdV1 | null;
-  access: 'public' | 'unlisted' | 'direct';
-  amountVisibility: 'visible' | 'private';
-} | null => {
-  if (value === undefined || value === null || value === '') return null;
-  if (typeof value !== 'string' || !CREATE_ORDER_TYPES.has(value)) {
-    throw new DomainInputError('Choose a canonical ChainWhisper order type.', [
-      {
-        field: 'orderType',
-        message: `Use a ${cadence} order type returned by the tool schema.`
-      }
-    ]);
-  }
-  const id = value as OrderClassificationIdV1;
-  if (
-    (cadence === 'one-off' && !id.startsWith('one-off.')) ||
-    (cadence === 'recurring' && !id.startsWith('recurring.'))
-  ) {
-    throw new DomainInputError(
-      `${id} cannot be used for a ${cadence} order.`,
-      [{ field: 'orderType', message: 'Order cadence does not match this tool.' }]
-    );
-  }
-  const privateLiquidity = id.includes('.private-liquidity.');
-  const access =
-    id.endsWith('.unlisted') || id === 'one-off.unlisted'
-      ? 'unlisted'
-      : id.endsWith('.direct') || id === 'one-off.direct'
-        ? 'direct'
-        : 'public';
-  return {
-    id,
-    access,
-    amountVisibility: privateLiquidity ? 'private' : 'visible'
-  };
-};
+const MAX_MARKET_REFERENCE_AGE_MS = 5 * 60 * 1_000;
+const MAX_MARKET_REFERENCE_FUTURE_SKEW_MS = 30 * 1_000;
 
 const resolveCreateAxes = (
   input: {
-    orderType?: unknown;
     access?: unknown;
-    amountVisibility?: unknown;
-  },
-  cadence: CreateCadence
+    liquidityVisibility?: unknown;
+  }
 ): {
   access: 'public' | 'unlisted' | 'direct';
   amountVisibility: 'visible' | 'private';
-  explicitlySelected: boolean;
-} => {
-  const selected = axesForOrderType(input.orderType, cadence);
-  const legacyAccess = normalizeAccess(input.access);
-  const legacyVisibility = normalizeAmountVisibility(input.amountVisibility);
-  if (
-    selected &&
-    input.access !== undefined &&
-    legacyAccess !== selected.access
-  ) {
-    throw new DomainInputError('orderType conflicts with access.', [
-      { field: 'access', message: `Expected ${selected.access}.` }
-    ]);
-  }
-  if (
-    selected &&
-    input.amountVisibility !== undefined &&
-    legacyVisibility !== selected.amountVisibility
-  ) {
-    throw new DomainInputError('orderType conflicts with amountVisibility.', [
-      {
-        field: 'amountVisibility',
-        message: `Expected ${selected.amountVisibility}.`
-      }
-    ]);
-  }
-  return {
-    access: selected?.access ?? legacyAccess,
-    amountVisibility: selected?.amountVisibility ?? legacyVisibility,
-    // Keep legacy axes useful for internal draft rendering, but never let
-    // them authorize a new create flow. Public MCP callers must choose one
-    // canonical orderType.
-    explicitlySelected: Boolean(selected)
-  };
-};
+} => ({
+  access: normalizeAccess(input.access),
+  amountVisibility: normalizeAmountVisibility(input.liquidityVisibility)
+});
 
 const rejectSignerLocalAmount = (
   value: unknown,
@@ -186,7 +118,7 @@ const normalizePrivateAmountMode = (
         {
           field: 'privateAmountMode',
           message:
-            'Use signer-input for local entry, or agent-provided only when a local autonomy policy permits agent-visible private amounts.'
+            'Use signer-input for local entry, or agent-provided to bind agent-visible private values for local confirmation or an active policy with agentVisiblePrivateAmounts enabled.'
         }
       ]
     );
@@ -511,6 +443,17 @@ const normalizeReference = (
     reference.baseAsset.id === quoteAsset.id && reference.quoteAsset.id === baseAsset.id;
   if (!direct && !reversed) return null;
   if (!isPositiveDecimal(reference.price)) return null;
+  const observedAt = Date.parse(reference.observedAt);
+  const expiresAt =
+    reference.expiresAt === undefined || reference.expiresAt === null
+      ? null
+      : Date.parse(reference.expiresAt);
+  if (
+    !Number.isFinite(observedAt) ||
+    (expiresAt !== null && !Number.isFinite(expiresAt))
+  ) {
+    return null;
+  }
 
   const invert = direct
     ? reference.basis === 'base_per_quote'
@@ -560,13 +503,293 @@ const sortExecutableReferences = (
     return timeOrder || left.id.localeCompare(right.id);
   });
 
+const decimalToAtomic = (value: string, decimals: number): bigint | null => {
+  const parsed = parseDecimal(value);
+  if (!parsed || parsed.coefficient <= 0n || parsed.scale > decimals) {
+    return null;
+  }
+  return parsed.coefficient * 10n ** BigInt(decimals - parsed.scale);
+};
+
+const isFreshMarketReference = (
+  reference: NormalizedPriceReference,
+  now: number
+): boolean => {
+  const observedAt = Date.parse(reference.observedAt);
+  const expiresAt = reference.expiresAt
+    ? Date.parse(reference.expiresAt)
+    : null;
+  return (
+    Number.isFinite(observedAt) &&
+    observedAt <= now + MAX_MARKET_REFERENCE_FUTURE_SKEW_MS &&
+    now - observedAt <= MAX_MARKET_REFERENCE_AGE_MS &&
+    (expiresAt === null || (Number.isFinite(expiresAt) && expiresAt > now))
+  );
+};
+
+const atomicToDecimal = (value: bigint, decimals: number): string => {
+  const digits = value.toString().padStart(decimals + 1, '0');
+  return canonicalDecimal(
+    decimals === 0
+      ? digits
+      : `${digits.slice(0, -decimals)}.${digits.slice(-decimals)}`
+  );
+};
+
+const floorDecimalToScale = (value: string, decimals: number): string => {
+  const parsed = parseDecimal(value);
+  if (!parsed || parsed.coefficient <= 0n) {
+    throw new DomainInputError('The market reference price is invalid.', [], 'provider_error');
+  }
+  const coefficient =
+    parsed.scale <= decimals
+      ? parsed.coefficient * 10n ** BigInt(decimals - parsed.scale)
+      : parsed.coefficient / 10n ** BigInt(parsed.scale - decimals);
+  if (coefficient <= 0n) {
+    throw new DomainInputError(
+      'The market reference price is below the supported token precision.',
+      [],
+      'provider_error'
+    );
+  }
+  return atomicToDecimal(coefficient, decimals);
+};
+
+const ceilDecimalToScale = (value: string, decimals: number): string => {
+  const parsed = parseDecimal(value);
+  if (!parsed || parsed.coefficient <= 0n) {
+    throw new DomainInputError('The market reference price is invalid.', [], 'provider_error');
+  }
+  if (parsed.scale <= decimals) {
+    return atomicToDecimal(
+      parsed.coefficient * 10n ** BigInt(decimals - parsed.scale),
+      decimals
+    );
+  }
+  const divisor = 10n ** BigInt(parsed.scale - decimals);
+  return atomicToDecimal(
+    (parsed.coefficient + divisor - 1n) / divisor,
+    decimals
+  );
+};
+
+const basisPointFactor = (offsetBps: number): string => {
+  if (
+    !Number.isInteger(offsetBps) ||
+    offsetBps < -9_999 ||
+    offsetBps > 10_000
+  ) {
+    throw new DomainInputError(
+      'A market price offset must be an integer from -9,999 to 10,000 basis points.',
+      [
+        {
+          field: 'offsetBps',
+          message: 'Use -1000 for 10% below or 1000 for 10% above.'
+        }
+      ]
+    );
+  }
+  return atomicToDecimal(BigInt(10_000 + offsetBps), 4);
+};
+
+type NormalizedRecurringPriceInput =
+  | { kind: 'exact'; price: string }
+  | { kind: 'market'; offsetBps: number }
+  | null;
+
+const normalizeRecurringPriceInput = (
+  value: unknown,
+  field: 'buyPrice' | 'sellPrice',
+  decimals: number
+): NormalizedRecurringPriceInput => {
+  if (value === undefined || value === null || value === '') return null;
+  if (typeof value === 'string') {
+    return {
+      kind: 'exact',
+      price: normalizePositiveAmount(value, field, decimals, true)!
+    };
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new DomainInputError(
+      `${field} must be an exact decimal or a market-reference offset.`,
+      [{ field, message: 'Use a decimal string or { reference: "market", offsetBps }.' }]
+    );
+  }
+  assertAllowedKeys(value, ['reference', 'offsetBps'], `input.${field}`);
+  const price = value as Partial<MarketReferencePriceInput>;
+  if (price.reference !== 'market') {
+    throw new DomainInputError(
+      `${field} has an unsupported price reference.`,
+      [{ field: `${field}.reference`, message: 'Use market.' }]
+    );
+  }
+  basisPointFactor(price.offsetBps as number);
+  return { kind: 'market', offsetBps: price.offsetBps! };
+};
+
+type SwapCandidate = {
+  order: SafeOrderSummary;
+  source: SwapSelection['source'];
+  recurringSide: SwapSelection['recurringSide'];
+  unitSell: bigint;
+  unitBuy: bigint;
+  maxSell: bigint | null;
+  maxBuy: bigint;
+};
+
+const recurringCandidate = (
+  order: SafeOrderSummary,
+  sellAsset: ResolvedAsset,
+  buyAsset: ResolvedAsset
+): SwapCandidate | null => {
+  const recurring = order.recurring;
+  if (!recurring || order.kind !== 'recurring') return null;
+  const baseIsBuy =
+    recurring.baseAsset.id === buyAsset.id &&
+    recurring.quoteAsset.id === sellAsset.id;
+  const baseIsSell =
+    recurring.baseAsset.id === sellAsset.id &&
+    recurring.quoteAsset.id === buyAsset.id;
+  if (!baseIsBuy && !baseIsSell) return null;
+  const recurringSide = baseIsBuy ? 'buy' : 'sell';
+  if (
+    (recurringSide === 'buy' && !recurring.sellSideOpen) ||
+    (recurringSide === 'sell' && !recurring.buySideOpen)
+  ) {
+    return null;
+  }
+  const unitSellText = baseIsBuy
+    ? recurring.sellQuoteAmount
+    : recurring.buyBaseAmount;
+  const unitBuyText = baseIsBuy
+    ? recurring.sellBaseAmount
+    : recurring.buyQuoteAmount;
+  const unitSell =
+    (unitSellText && decimalToAtomic(unitSellText, sellAsset.decimals)) ??
+    (baseIsBuy && recurring.sellPrice
+      ? decimalToAtomic(
+          floorDecimalToScale(recurring.sellPrice, sellAsset.decimals),
+          sellAsset.decimals
+        )
+      : 10n ** BigInt(sellAsset.decimals));
+  const unitBuy =
+    (unitBuyText && decimalToAtomic(unitBuyText, buyAsset.decimals)) ??
+    (baseIsSell && recurring.buyPrice
+      ? decimalToAtomic(
+          floorDecimalToScale(recurring.buyPrice, buyAsset.decimals),
+          buyAsset.decimals
+        )
+      : 10n ** BigInt(buyAsset.decimals));
+  const maxBuyText = baseIsBuy
+    ? recurring.sellBaseLiquidity
+    : recurring.buyQuoteLiquidity;
+  const maxBuy =
+    maxBuyText && decimalToAtomic(maxBuyText, buyAsset.decimals);
+  if (!unitSell || !unitBuy || !maxBuy) return null;
+  return {
+    order,
+    source: 'recurring',
+    recurringSide,
+    unitSell,
+    unitBuy,
+    maxSell: null,
+    maxBuy
+  };
+};
+
+const oneOffCandidate = (
+  order: SafeOrderSummary,
+  sellAsset: ResolvedAsset,
+  buyAsset: ResolvedAsset
+): SwapCandidate | null => {
+  if (
+    order.kind !== 'trade' ||
+    order.offerAsset.id !== buyAsset.id ||
+    order.requestAsset.id !== sellAsset.id
+  ) {
+    return null;
+  }
+  const buyAmount = order.remainingOfferAmount ?? order.offerAmount;
+  const sellAmount = order.remainingRequestAmount ?? order.requestAmount;
+  const maxBuy =
+    buyAmount && decimalToAtomic(buyAmount, buyAsset.decimals);
+  const maxSell =
+    sellAmount && decimalToAtomic(sellAmount, sellAsset.decimals);
+  if (!maxBuy || !maxSell) return null;
+  return {
+    order,
+    source: 'one-off',
+    recurringSide: null,
+    unitSell: maxSell,
+    unitBuy: maxBuy,
+    maxSell,
+    maxBuy
+  };
+};
+
+const quoteSwapCandidate = (
+  candidate: SwapCandidate,
+  amount: bigint,
+  inputMode: PrepareSwapInput['inputMode'],
+  sellDecimals: number
+): (SwapCandidate & { sellAmount: bigint; buyAmount: bigint }) | null => {
+  const sellAmount =
+    inputMode === 'buy'
+      ? (amount * candidate.unitSell + candidate.unitBuy - 1n) /
+        candidate.unitBuy
+      : amount;
+  const buyAmount =
+    (sellAmount * candidate.unitBuy) / candidate.unitSell;
+  if (
+    sellAmount <= 0n ||
+    buyAmount <= 0n ||
+    (inputMode === 'buy' && buyAmount < amount) ||
+    buyAmount > candidate.maxBuy ||
+    (candidate.maxSell !== null && sellAmount > candidate.maxSell)
+  ) {
+    return null;
+  }
+  const policy = candidate.order.fillPolicy;
+  if (candidate.source === 'one-off' && policy && candidate.maxSell !== null) {
+    const maximum = policy.maxRequestAmountPerWallet
+      ? decimalToAtomic(policy.maxRequestAmountPerWallet, sellDecimals)
+      : null;
+    if (maximum !== null && maximum > 0n && sellAmount > maximum) return null;
+
+    const finalFill = sellAmount === candidate.maxSell;
+    if (!finalFill) {
+      if (!policy.partialFillsAllowed) return null;
+      const configuredMinimum = policy.minRequestAmount
+        ? decimalToAtomic(policy.minRequestAmount, sellDecimals) ?? 0n
+        : 0n;
+      const originalRequestAmount = candidate.order.requestAmount
+        ? decimalToAtomic(candidate.order.requestAmount, sellDecimals)
+        : null;
+      if (!originalRequestAmount) return null;
+      const bpsMinimum =
+        (originalRequestAmount * BigInt(policy.minPartialFillBps)) / 10_000n;
+      const minimum = [1n, configuredMinimum, bpsMinimum].reduce(
+        (highest, value) => (value > highest ? value : highest)
+      );
+      if (sellAmount < minimum) return null;
+    }
+  }
+  return { ...candidate, sellAmount, buyAmount };
+};
+
 export class ChainWhisperDomainService {
   readonly #gateway: DomainGateway;
   readonly #envelopeFactory: DomainEnvelopeFactory;
+  readonly #now: () => number;
 
-  constructor(gateway: DomainGateway, envelopeFactory: DomainEnvelopeFactory) {
+  constructor(
+    gateway: DomainGateway,
+    envelopeFactory: DomainEnvelopeFactory,
+    now: () => number = Date.now
+  ) {
     this.#gateway = gateway;
     this.#envelopeFactory = envelopeFactory;
+    this.#now = now;
   }
 
   async status(): Promise<ToolResult<DomainStatus>> {
@@ -776,19 +999,295 @@ export class ChainWhisperDomainService {
     }
   }
 
+  async prepareSwap(
+    input: PrepareSwapInput
+  ): Promise<ToolResult<PrepareSwapResult>> {
+    try {
+      rejectSensitiveOrArbitraryInput(input);
+      assertAllowedKeys(input, [
+        'wallet',
+        'sellAsset',
+        'buyAsset',
+        'inputMode',
+        'amount'
+      ]);
+      const wallet = normalizeWallet(input.wallet);
+      const sellAsset = await resolveAsset(
+        this.#gateway,
+        input.sellAsset,
+        'sellAsset',
+        false
+      );
+      const buyAsset = await resolveAsset(
+        this.#gateway,
+        input.buyAsset,
+        'buyAsset',
+        false
+      );
+      assertDistinctAssets(sellAsset, buyAsset, ['sellAsset', 'buyAsset']);
+      const inputMode = input.inputMode ?? 'sell';
+      if (inputMode !== 'sell' && inputMode !== 'buy') {
+        throw new DomainInputError('Choose whether the entered amount is sold or bought.', [
+          { field: 'inputMode', message: 'Expected sell or buy.' }
+        ]);
+      }
+      const amountAsset = inputMode === 'sell' ? sellAsset : buyAsset;
+      const amount = amountAsset
+        ? normalizePositiveAmount(
+            input.amount,
+            'amount',
+            amountAsset.decimals
+          )
+        : null;
+      const missing: MissingDetail[] = [];
+      requireMissing(missing, Boolean(wallet), 'wallet', 'Choose the local signer wallet.');
+      requireMissing(missing, Boolean(sellAsset), 'sellAsset', 'Choose the asset to sell.');
+      requireMissing(missing, Boolean(buyAsset), 'buyAsset', 'Choose the asset to buy.');
+      requireMissing(missing, Boolean(amount), 'amount', 'Enter the swap amount.');
+      if (!sellAsset || !buyAsset || !amount) {
+        return {
+          ok: true,
+          data: {
+            status: 'needs_input',
+            intent: null,
+            selection: null,
+            missing,
+            warnings: [],
+            envelope: null
+          }
+        };
+      }
+      const amountAtomic = decimalToAtomic(amount, amountAsset!.decimals)!;
+      const pages = await Promise.all([
+        this.#gateway.listOrders({
+          wallet: null,
+          role: 'all',
+          kind: 'all',
+          status: 'open',
+          access: 'public',
+          baseAsset: buyAsset,
+          quoteAsset: sellAsset,
+          cursor: null,
+          limit: MAX_ORDER_PAGE_SIZE
+        }),
+        this.#gateway.listOrders({
+          wallet: null,
+          role: 'all',
+          kind: 'all',
+          status: 'open',
+          access: 'public',
+          baseAsset: sellAsset,
+          quoteAsset: buyAsset,
+          cursor: null,
+          limit: MAX_ORDER_PAGE_SIZE
+        })
+      ]);
+      if (
+        pages.some(
+          (page) => page.truncated || page.nextCursor !== null
+        )
+      ) {
+        return {
+          ok: true,
+          data: {
+            status: 'unsupported',
+            intent: null,
+            selection: null,
+            missing: [],
+            warnings: [],
+            envelope: null,
+            reason:
+              'Best-single-order Swap selection requires a complete order listing, but this market has additional pages.'
+          }
+        };
+      }
+      const orders = new Map<string, SafeOrderSummary>();
+      for (const order of pages.flatMap((page) => page.orders)) {
+        if (
+          order.status === 'open' &&
+          order.access === 'public' &&
+          order.amountVisibility === 'visible' &&
+          !order.recipient
+        ) {
+          orders.set(order.identity.handle, sanitizeOrder(order));
+        }
+      }
+      const candidates = [...orders.values()].flatMap((order) => {
+        const candidate =
+          recurringCandidate(order, sellAsset, buyAsset) ??
+          oneOffCandidate(order, sellAsset, buyAsset);
+        return candidate ? [candidate] : [];
+      });
+      const executable = candidates
+        .flatMap((candidate) => {
+          const quoted = quoteSwapCandidate(
+            candidate,
+            amountAtomic,
+            inputMode,
+            sellAsset.decimals
+          );
+          return quoted ? [quoted] : [];
+        })
+        .sort((left, right) => {
+          if (inputMode === 'buy' && left.sellAmount !== right.sellAmount) {
+            return left.sellAmount < right.sellAmount ? -1 : 1;
+          }
+          if (inputMode === 'sell' && left.buyAmount !== right.buyAmount) {
+            return left.buyAmount > right.buyAmount ? -1 : 1;
+          }
+          const observed =
+            Date.parse(right.order.updatedAt) -
+            Date.parse(left.order.updatedAt);
+          return (
+            observed ||
+            left.order.identity.handle.localeCompare(
+              right.order.identity.handle
+            )
+          );
+        });
+      if (executable.length === 0) {
+        return {
+          ok: true,
+          data: {
+            status: 'unsupported',
+            intent: null,
+            selection: null,
+            missing: missing.filter(({ field }) => field === 'wallet'),
+            warnings: [],
+            envelope: null,
+            reason:
+              'No single visible public ChainWhisper order can fill the requested amount.'
+          }
+        };
+      }
+      let selected: (typeof executable)[number] | null = null;
+      let prepared: { ok: true; data: PrepareResult } | null = null;
+      const unsupportedWarnings = new Set<string>();
+      for (const candidate of executable) {
+        if (
+          !(await this.#gateway.isTrustedEscrow(
+            candidate.order.identity.escrowContract
+          ))
+        ) {
+          throw new DomainInputError(
+            'The selected swap order is not from a verified ChainWhisper contract.',
+            [],
+            'provider_error'
+          );
+        }
+        const attempt = await this.prepareFill({
+          ...(input.wallet ? { wallet: input.wallet } : {}),
+          order: { handle: candidate.order.identity.handle },
+          inputAmount: atomicToDecimal(
+            candidate.sellAmount,
+            sellAsset.decimals
+          ),
+          minOutputAmount: atomicToDecimal(
+            candidate.buyAmount,
+            buyAsset.decimals
+          ),
+          ...(candidate.recurringSide
+            ? { recurringSide: candidate.recurringSide }
+            : {})
+        });
+        if (!attempt.ok) return attempt;
+        if (attempt.data.status === 'unsupported') {
+          for (const warning of attempt.data.warnings) {
+            unsupportedWarnings.add(warning);
+          }
+          continue;
+        }
+        selected = candidate;
+        prepared = attempt;
+        break;
+      }
+      if (!selected || !prepared) {
+        return {
+          ok: true,
+          data: {
+            status: 'unsupported',
+            intent: null,
+            selection: null,
+            missing: missing.filter(({ field }) => field === 'wallet'),
+            warnings: [...unsupportedWarnings],
+            envelope: null,
+            reason:
+              'No ranked single-order Swap candidate passed canonical preparation.'
+          }
+        };
+      }
+      if (prepared.data.intent.action !== 'fill') {
+        throw new DomainInputError(
+          'The selected swap did not produce a fill intent.',
+          [],
+          'provider_error'
+        );
+      }
+      const sellAmount = atomicToDecimal(
+        selected.sellAmount,
+        sellAsset.decimals
+      );
+      const buyAmount = atomicToDecimal(
+        selected.buyAmount,
+        buyAsset.decimals
+      );
+      const selectedPolicy =
+        selected.source === 'one-off' ? selected.order.fillPolicy : null;
+      const selectedMaxPerWallet = selectedPolicy?.maxRequestAmountPerWallet
+        ? decimalToAtomic(
+            selectedPolicy.maxRequestAmountPerWallet,
+            sellAsset.decimals
+          )
+        : null;
+      const warnings = [...prepared.data.warnings];
+      if (
+        selectedPolicy?.oneFillPerWallet ||
+        (selectedMaxPerWallet !== null && selectedMaxPerWallet > 0n)
+      ) {
+        warnings.push(
+          'Wallet fill-history eligibility is verified again during preparation and execution; oneFillPerWallet or prior maxRequestAmountPerWallet usage can make this quote ineligible.'
+        );
+      }
+      const selection: SwapSelection = {
+        source: selected.source,
+        order: sanitizeIdentity(selected.order.identity),
+        orderType: selected.order.orderType ?? null,
+        recurringSide: selected.recurringSide,
+        inputMode,
+        sellAsset: sanitizeAsset(sellAsset),
+        buyAsset: sanitizeAsset(buyAsset),
+        sellAmount,
+        buyAmount,
+        price: divideDecimals(sellAmount, buyAmount),
+        priceBasis: 'sell_per_buy',
+        visibleCandidateCount: candidates.length
+      };
+      return {
+        ok: true,
+        data: {
+          ...prepared.data,
+          intent: prepared.data.intent,
+          warnings,
+          selection
+        }
+      };
+    } catch (error) {
+      return toolFailure(error);
+    }
+  }
+
   async prepareCreateTrade(input: CreateTradeInput): Promise<ToolResult<PrepareResult>> {
     try {
       rejectSensitiveOrArbitraryInput(input);
       assertAllowedKeys(input, [
         'wallet',
-        'orderType',
         'offerAsset',
         'requestAsset',
         'offerAmount',
         'requestAmount',
         'access',
         'recipient',
-        'amountVisibility',
+        'liquidityVisibility',
         'privateAmountMode',
         'expiresAt',
         'fillPolicy'
@@ -804,7 +1303,7 @@ export class ChainWhisperDomainService {
       const offerAsset = await resolveAsset(this.#gateway, input.offerAsset, 'offerAsset', false);
       const requestAsset = await resolveAsset(this.#gateway, input.requestAsset, 'requestAsset', false);
       assertDistinctAssets(offerAsset, requestAsset, ['offerAsset', 'requestAsset']);
-      const selectedAxes = resolveCreateAxes(input, 'one-off');
+      const selectedAxes = resolveCreateAxes(input);
       const access = selectedAxes.access;
       const recipient = normalizeAddress(input.recipient, 'recipient', false);
       const amountVisibility = selectedAxes.amountVisibility;
@@ -842,8 +1341,8 @@ export class ChainWhisperDomainService {
         (!confidentialRequest || privateAmountMode === 'agent-provided')
         ? normalizePositiveAmount(input.requestAmount, 'requestAmount', requestAsset.decimals)
         : null;
-      if (access === 'public' && recipient) {
-        throw new DomainInputError('Public orders cannot be recipient-bound.', [
+      if (access !== 'direct' && recipient) {
+        throw new DomainInputError('Only Direct orders can be recipient-bound.', [
           { field: 'recipient', message: 'Choose Direct access to bind a recipient.' }
         ]);
       }
@@ -884,12 +1383,6 @@ export class ChainWhisperDomainService {
         secretPolicy: secretPolicyFor(access, recipient)
       };
       const missing: MissingDetail[] = [];
-      requireMissing(
-        missing,
-        selectedAxes.explicitlySelected,
-        'orderType',
-        'Choose the exact one-off order type before preparing a transaction.'
-      );
       requireMissing(missing, Boolean(wallet), 'wallet', 'Choose the local signer wallet.');
       requireMissing(missing, Boolean(offerAsset), 'offerAsset', 'Choose the asset to sell.');
       requireMissing(missing, Boolean(requestAsset), 'requestAsset', 'Choose the asset to receive.');
@@ -1007,7 +1500,6 @@ export class ChainWhisperDomainService {
       rejectSensitiveOrArbitraryInput(input);
       assertAllowedKeys(input, [
         'wallet',
-        'orderType',
         'baseAsset',
         'quoteAsset',
         'buyPrice',
@@ -1016,23 +1508,96 @@ export class ChainWhisperDomainService {
         'sellBaseLiquidity',
         'access',
         'recipient',
-        'amountVisibility',
+        'liquidityVisibility',
         'privateAmountMode'
       ]);
       const wallet = normalizeWallet(input.wallet);
       const baseAsset = await resolveAsset(this.#gateway, input.baseAsset, 'baseAsset', false);
       const quoteAsset = await resolveAsset(this.#gateway, input.quoteAsset, 'quoteAsset', false);
       assertDistinctAssets(baseAsset, quoteAsset, ['baseAsset', 'quoteAsset']);
-      const selectedAxes = resolveCreateAxes(input, 'recurring');
+      const selectedAxes = resolveCreateAxes(input);
       const access = selectedAxes.access;
+      if (access === 'unlisted') {
+        throw new DomainInputError(
+          'Recurring orders support only public or fixed-recipient access.',
+          [{ field: 'access', message: 'Choose public or direct access.' }]
+        );
+      }
       const recipient = normalizeAddress(input.recipient, 'recipient', false);
       const amountVisibility = selectedAxes.amountVisibility;
       const privateAmountMode = normalizePrivateAmountMode(
         input.privateAmountMode
       );
       const privateLiquidity = amountVisibility === 'private';
-      const buyPrice = normalizePositiveAmount(input.buyPrice, 'buyPrice', quoteAsset?.decimals ?? 78);
-      const sellPrice = normalizePositiveAmount(input.sellPrice, 'sellPrice', quoteAsset?.decimals ?? 78);
+      const buyPriceInput = normalizeRecurringPriceInput(
+        input.buyPrice,
+        'buyPrice',
+        quoteAsset?.decimals ?? 78
+      );
+      const sellPriceInput = normalizeRecurringPriceInput(
+        input.sellPrice,
+        'sellPrice',
+        quoteAsset?.decimals ?? 78
+      );
+      const needsMarketReference =
+        buyPriceInput?.kind === 'market' ||
+        sellPriceInput?.kind === 'market';
+      let marketReference: NormalizedPriceReference | null = null;
+      if (needsMarketReference && baseAsset && quoteAsset) {
+        const references = (
+          await this.#gateway.getPriceReferences({
+            baseAsset,
+            quoteAsset,
+            side: 'buy',
+            amount: null
+          })
+        )
+          .map((reference) =>
+            normalizeReference(reference, baseAsset, quoteAsset)
+          )
+          .filter(
+            (reference): reference is NormalizedPriceReference =>
+              Boolean(
+                reference?.source === 'market' &&
+                isFreshMarketReference(reference, this.#now())
+              )
+          )
+          .sort((left, right) => {
+            const time =
+              Date.parse(right.observedAt) - Date.parse(left.observedAt);
+            return time || left.id.localeCompare(right.id);
+          });
+        marketReference = references[0] ?? null;
+        if (!marketReference) {
+          throw new DomainInputError(
+            'No compatible live market reference is available for this pair.',
+            [
+              {
+                field: 'buyPrice',
+                message: 'Use exact buy and sell prices or retry the market reference.'
+              }
+            ],
+            'provider_error'
+          );
+        }
+      }
+      const resolvePrice = (
+        price: NormalizedRecurringPriceInput,
+        roundUp: boolean
+      ): string | null => {
+        if (!price) return null;
+        if (price.kind === 'exact') return price.price;
+        if (!marketReference || !quoteAsset) return null;
+        const adjusted = multiplyDecimals(
+          marketReference.price,
+          basisPointFactor(price.offsetBps)
+        );
+        return roundUp
+          ? ceilDecimalToScale(adjusted, quoteAsset.decimals)
+          : floorDecimalToScale(adjusted, quoteAsset.decimals);
+      };
+      const buyPrice = resolvePrice(buyPriceInput, false);
+      const sellPrice = resolvePrice(sellPriceInput, true);
       if (
         privateLiquidity &&
         quoteAsset?.kind === 'private-erc20' &&
@@ -1075,8 +1640,8 @@ export class ChainWhisperDomainService {
             'sellBaseLiquidity',
             baseAsset?.decimals ?? 78
           );
-      if (access === 'public' && recipient) {
-        throw new DomainInputError('Public recurring orders cannot be recipient-bound.', [
+      if (access !== 'direct' && recipient) {
+        throw new DomainInputError('Only Direct recurring orders can be recipient-bound.', [
           { field: 'recipient', message: 'Choose Direct access to bind a recipient.' }
         ]);
       }
@@ -1088,7 +1653,7 @@ export class ChainWhisperDomainService {
         quoteAsset.kind !== 'private-erc20'
       ) {
         throw new DomainInputError('Private recurring liquidity requires a verified private token.', [
-          { field: 'amountVisibility', message: 'Use visible amounts for a fully public-token pair.' }
+          { field: 'liquidityVisibility', message: 'Use visible liquidity for a fully public-token pair.' }
         ]);
       }
       const intent: CreateRecurringIntent = {
@@ -1111,15 +1676,27 @@ export class ChainWhisperDomainService {
         recipient: access === 'direct' ? recipient : null,
         amountVisibility,
         privateAmountMode,
+        ...(marketReference
+          ? {
+              priceReference: {
+                id: marketReference.id,
+                venue: marketReference.venue,
+                price: marketReference.price,
+                observedAt: marketReference.observedAt,
+                buyOffsetBps:
+                  buyPriceInput?.kind === 'market'
+                    ? buyPriceInput.offsetBps
+                    : null,
+                sellOffsetBps:
+                  sellPriceInput?.kind === 'market'
+                    ? sellPriceInput.offsetBps
+                    : null
+              }
+            }
+          : {}),
         secretPolicy: secretPolicyFor(access, recipient)
       };
       const missing: MissingDetail[] = [];
-      requireMissing(
-        missing,
-        selectedAxes.explicitlySelected,
-        'orderType',
-        'Choose the exact recurring order type before preparing a transaction.'
-      );
       requireMissing(missing, Boolean(wallet), 'wallet', 'Choose the local signer wallet.');
       requireMissing(missing, Boolean(baseAsset), 'baseAsset', 'Choose the recurring base asset.');
       requireMissing(missing, Boolean(quoteAsset), 'quoteAsset', 'Choose the recurring quote asset.');

@@ -4,6 +4,7 @@ import type {
   HexString,
   JournalReceipt,
   OperationJournalRecord,
+  OperationSemanticResultV2,
   OperationStage,
 } from './types.js';
 import { AtomicJsonStore } from './atomicStore.js';
@@ -33,6 +34,23 @@ const cloneRecord = (
   nonces: [...record.nonces],
   transactionHashes: [...record.transactionHashes],
   receipts: record.receipts.map((receipt) => ({ ...receipt })),
+  ...(record.semanticResult
+    ? {
+        semanticResult: {
+          ...record.semanticResult,
+          ...(record.semanticResult.canonicalType
+            ? {
+                canonicalType: {
+                  ...record.semanticResult.canonicalType,
+                },
+              }
+            : {}),
+          ...(record.semanticResult.order
+            ? { order: { ...record.semanticResult.order } }
+            : {}),
+        },
+      }
+    : {}),
   errorCodes: [...record.errorCodes],
 });
 
@@ -185,6 +203,7 @@ export class OperationJournal {
   async recordReceipt(
     operationId: string,
     receipt: JournalReceipt,
+    semanticResult?: OperationSemanticResultV2,
   ): Promise<OperationJournalRecord | null> {
     assertOperationId(operationId);
     return this.#store.mutate((state) => {
@@ -202,6 +221,17 @@ export class OperationJournal {
       };
       if (index >= 0) record.receipts[index] = safeReceipt;
       else record.receipts.push(safeReceipt);
+      if (semanticResult) {
+        record.semanticResult = {
+          ...semanticResult,
+          ...(semanticResult.canonicalType
+            ? { canonicalType: { ...semanticResult.canonicalType } }
+            : {}),
+          ...(semanticResult.order
+            ? { order: { ...semanticResult.order } }
+            : {}),
+        };
+      }
       record.updatedAt = this.#clock().toISOString();
       return cloneRecord(record);
     });
@@ -216,8 +246,14 @@ export class OperationJournal {
     return this.#store.mutate((state) => {
       const record = ownOperation(state.operations, operationId);
       if (!record) return null;
-      record.errorCodes.push(safeErrorCode(errorCode));
+      const code = safeErrorCode(errorCode);
+      record.errorCodes.push(code);
       if (
+        code === 'CONFIRMATION_DECLINED' ||
+        code === 'CONFIRMATION_TIMEOUT'
+      ) {
+        record.stage = 'declined';
+      } else if (
         retryable &&
         ![
           'awaiting-broadcast',

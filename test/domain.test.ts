@@ -65,6 +65,17 @@ const privateQuoteAsset: ResolvedAsset = {
   verified: true,
   publicCounterpart: { symbol: 'QUOTE', address: addresses.quote }
 };
+const privateWispAsset: ResolvedAsset = {
+  ...privateBaseAsset,
+  symbol: 'p.WISP',
+  publicCounterpart: { symbol: 'WISP', address: addresses.base }
+};
+const privateCotiAsset: ResolvedAsset = {
+  ...privateQuoteAsset,
+  symbol: 'p.COTI',
+  decimals: 18,
+  publicCounterpart: { symbol: 'COTI', address: addresses.quote }
+};
 
 const status = (recurringWritesEnabled = true): DomainStatus => ({
   service: 'chainwhisper-mcp',
@@ -170,7 +181,14 @@ class MockGateway implements DomainGateway {
       typeof reference === 'string'
         ? reference.toLowerCase()
         : reference.address?.toLowerCase() ?? reference.symbol?.toLowerCase();
-    return [baseAsset, quoteAsset, privateBaseAsset, privateQuoteAsset].find(
+    return [
+      baseAsset,
+      quoteAsset,
+      privateBaseAsset,
+      privateQuoteAsset,
+      privateWispAsset,
+      privateCotiAsset
+    ].find(
       (asset) => asset.id === key || asset.symbol.toLowerCase() === key
     ) ?? null;
   }
@@ -183,8 +201,15 @@ class MockGateway implements DomainGateway {
     };
   }
 
-  async getOrder() {
-    return this.orders[0] ?? null;
+  async getOrder(identity: Parameters<DomainGateway['getOrder']>[0]) {
+    const handle =
+      'handle' in identity
+        ? identity.handle
+        : `cw_${identity.escrowContract.slice(2)}_${identity.localId}`;
+    return (
+      this.orders.find((order) => order.identity.handle === handle) ??
+      null
+    );
   }
 
   async getPriceReferences() {
@@ -205,9 +230,14 @@ const envelopeFactory: DomainEnvelopeFactory = {
   }
 };
 
-const makeService = () => {
+const makeService = (
+  now: () => number = () => Date.parse('2026-07-27T00:01:00.000Z')
+) => {
   const gateway = new MockGateway();
-  return { gateway, service: new ChainWhisperDomainService(gateway, envelopeFactory) };
+  return {
+    gateway,
+    service: new ChainWhisperDomainService(gateway, envelopeFactory, now)
+  };
 };
 
 describe('ChainWhisperDomainService price references', () => {
@@ -329,6 +359,429 @@ describe('ChainWhisperDomainService price references', () => {
     expect(result).toMatchObject({
       ok: true,
       data: { ranking: { bestReferenceId: 'order-1' } }
+    });
+  });
+
+  it('prepares the best complete single-order Swap as a canonical fill', async () => {
+    const { gateway, service } = makeService();
+    gateway.orders = [
+      order(),
+      order({
+        identity: {
+          escrowContract: addresses.standard,
+          localId: '8',
+          handle: `cw_${addresses.standard.slice(2)}_8`
+        },
+        offerAmount: '10',
+        requestAmount: '18',
+        remainingOfferAmount: '10',
+        remainingRequestAmount: '18',
+        price: '1.8',
+        updatedAt: '2026-07-27T00:00:01.000Z'
+      })
+    ];
+
+    const result = await service.prepareSwap({
+      wallet: addresses.wallet,
+      sellAsset: 'QUOTE',
+      buyAsset: 'BASE',
+      inputMode: 'buy',
+      amount: '3'
+    });
+
+    expect(result).toMatchObject({
+      ok: true,
+      data: {
+        status: 'ready',
+        intent: {
+          action: 'fill',
+          inputAmount: '5.4',
+          minOutputAmount: '3',
+          order: { identity: { localId: '8' } }
+        },
+        selection: {
+          source: 'one-off',
+          order: { localId: '8' },
+          inputMode: 'buy',
+          sellAmount: '5.4',
+          buyAmount: '3',
+          price: '1.8',
+          priceBasis: 'sell_per_buy',
+          visibleCandidateCount: 2
+        },
+        envelope: { version: 'ActionEnvelopeV1' }
+      }
+    });
+    expect(gateway.buildExecutionPlan).toHaveBeenCalledOnce();
+  });
+
+  it('refuses best-single-order selection when either order listing is paginated', async () => {
+    const { gateway, service } = makeService();
+    vi.spyOn(gateway, 'listOrders')
+      .mockResolvedValueOnce({
+        orders: gateway.orders,
+        nextCursor: 'next-page',
+        truncated: true
+      })
+      .mockResolvedValueOnce({
+        orders: gateway.orders,
+        nextCursor: null,
+        truncated: false
+      });
+
+    const result = await service.prepareSwap({
+      wallet: addresses.wallet,
+      sellAsset: 'QUOTE',
+      buyAsset: 'BASE',
+      inputMode: 'buy',
+      amount: '1'
+    });
+
+    expect(result).toMatchObject({
+      ok: true,
+      data: {
+        status: 'unsupported',
+        envelope: null,
+        reason: expect.stringContaining('complete order listing')
+      }
+    });
+    expect(gateway.buildExecutionPlan).not.toHaveBeenCalled();
+  });
+
+  it('refuses best-single-order selection when a listing is truncated without a cursor', async () => {
+    const { gateway, service } = makeService();
+    vi.spyOn(gateway, 'listOrders')
+      .mockResolvedValueOnce({
+        orders: gateway.orders,
+        nextCursor: null,
+        truncated: true
+      })
+      .mockResolvedValueOnce({
+        orders: gateway.orders,
+        nextCursor: null,
+        truncated: false
+      });
+
+    const result = await service.prepareSwap({
+      wallet: addresses.wallet,
+      sellAsset: 'QUOTE',
+      buyAsset: 'BASE',
+      inputMode: 'buy',
+      amount: '1'
+    });
+
+    expect(result).toMatchObject({
+      ok: true,
+      data: {
+        status: 'unsupported',
+        selection: null,
+        envelope: null,
+        reason: expect.stringContaining('complete order listing')
+      }
+    });
+    expect(gateway.buildExecutionPlan).not.toHaveBeenCalled();
+  });
+
+  it('falls back to the next ranked order only when canonical preparation rejects the best', async () => {
+    const { gateway, service } = makeService();
+    gateway.orders = [
+      order(),
+      order({
+        identity: {
+          escrowContract: addresses.standard,
+          localId: '8',
+          handle: `cw_${addresses.standard.slice(2)}_8`
+        },
+        offerAmount: '10',
+        requestAmount: '18',
+        remainingOfferAmount: '10',
+        remainingRequestAmount: '18',
+        price: '1.8',
+        updatedAt: '2026-07-27T00:00:01.000Z'
+      })
+    ];
+    gateway.buildExecutionPlan.mockImplementation(async (intent) => {
+      const plan = executionPlan(intent);
+      return intent.action === 'fill' &&
+        intent.order.identity.localId === '8'
+        ? {
+            ...plan,
+            simulation: {
+              ...plan.simulation,
+              ok: false,
+              warnings: ['The best order is unavailable to this wallet.'],
+              errorCode: 'wallet_fill_history_ineligible'
+            }
+          }
+        : plan;
+    });
+
+    const result = await service.prepareSwap({
+      wallet: addresses.wallet,
+      sellAsset: 'QUOTE',
+      buyAsset: 'BASE',
+      inputMode: 'buy',
+      amount: '3'
+    });
+
+    expect(result).toMatchObject({
+      ok: true,
+      data: {
+        status: 'ready',
+        selection: {
+          order: { localId: '7' },
+          sellAmount: '6',
+          buyAmount: '3'
+        },
+        intent: {
+          order: { identity: { localId: '7' } }
+        },
+        envelope: { version: 'ActionEnvelopeV1' }
+      }
+    });
+    expect(gateway.buildExecutionPlan).toHaveBeenCalledTimes(2);
+  });
+
+  it('returns safe unsupported when canonical preparation rejects every ranked order', async () => {
+    const { gateway, service } = makeService();
+    gateway.orders = [
+      order(),
+      order({
+        identity: {
+          escrowContract: addresses.standard,
+          localId: '8',
+          handle: `cw_${addresses.standard.slice(2)}_8`
+        },
+        offerAmount: '10',
+        requestAmount: '18',
+        remainingOfferAmount: '10',
+        remainingRequestAmount: '18',
+        price: '1.8'
+      })
+    ];
+    gateway.buildExecutionPlan.mockImplementation(async (intent) => {
+      const plan = executionPlan(intent);
+      return {
+        ...plan,
+        simulation: {
+          ...plan.simulation,
+          ok: false,
+          warnings: ['Wallet eligibility could not be established.'],
+          errorCode: 'wallet_fill_history_ineligible'
+        }
+      };
+    });
+
+    const result = await service.prepareSwap({
+      wallet: addresses.wallet,
+      sellAsset: 'QUOTE',
+      buyAsset: 'BASE',
+      inputMode: 'buy',
+      amount: '3'
+    });
+
+    expect(result).toMatchObject({
+      ok: true,
+      data: {
+        status: 'unsupported',
+        intent: null,
+        selection: null,
+        warnings: ['Wallet eligibility could not be established.'],
+        envelope: null,
+        reason: expect.stringContaining('canonical preparation')
+      }
+    });
+    expect(gateway.buildExecutionPlan).toHaveBeenCalledTimes(2);
+  });
+
+  it('allows a final one-off fill regardless of partial-fill minimums', async () => {
+    const { gateway, service } = makeService();
+    gateway.orders = [
+      order({
+        offerAmount: '10',
+        requestAmount: '100',
+        remainingOfferAmount: '1',
+        remainingRequestAmount: '10',
+        fillPolicy: {
+          partialFillsAllowed: false,
+          minPartialFillBps: 5_000,
+          minRequestAmount: '25',
+          maxRequestAmountPerWallet: null,
+          oneFillPerWallet: false
+        }
+      })
+    ];
+
+    const result = await service.prepareSwap({
+      wallet: addresses.wallet,
+      sellAsset: 'QUOTE',
+      buyAsset: 'BASE',
+      inputMode: 'buy',
+      amount: '1'
+    });
+
+    expect(result).toMatchObject({
+      ok: true,
+      data: {
+        status: 'ready',
+        selection: { source: 'one-off', sellAmount: '10', buyAmount: '1' }
+      }
+    });
+  });
+
+  it('requires partial fills and the largest configured one-off minimum for non-final fills', async () => {
+    const { gateway, service } = makeService();
+    gateway.orders = [
+      order({
+        offerAmount: '10',
+        requestAmount: '100',
+        remainingOfferAmount: '10',
+        remainingRequestAmount: '100',
+        fillPolicy: {
+          partialFillsAllowed: false,
+          minPartialFillBps: 500,
+          minRequestAmount: '3',
+          maxRequestAmountPerWallet: null,
+          oneFillPerWallet: false
+        }
+      })
+    ];
+
+    const partialDisabled = await service.prepareSwap({
+      wallet: addresses.wallet,
+      sellAsset: 'QUOTE',
+      buyAsset: 'BASE',
+      inputMode: 'buy',
+      amount: '0.5'
+    });
+    expect(partialDisabled).toMatchObject({
+      ok: true,
+      data: { status: 'unsupported', envelope: null }
+    });
+
+    gateway.orders[0]!.fillPolicy!.partialFillsAllowed = true;
+    const belowFivePercentOfOriginal = await service.prepareSwap({
+      wallet: addresses.wallet,
+      sellAsset: 'QUOTE',
+      buyAsset: 'BASE',
+      inputMode: 'buy',
+      amount: '0.4'
+    });
+    expect(belowFivePercentOfOriginal).toMatchObject({
+      ok: true,
+      data: { status: 'unsupported', envelope: null }
+    });
+
+    const atFivePercentOfOriginal = await service.prepareSwap({
+      wallet: addresses.wallet,
+      sellAsset: 'QUOTE',
+      buyAsset: 'BASE',
+      inputMode: 'buy',
+      amount: '0.5'
+    });
+    expect(atFivePercentOfOriginal).toMatchObject({
+      ok: true,
+      data: {
+        status: 'ready',
+        selection: { sellAmount: '5', buyAmount: '0.5' }
+      }
+    });
+  });
+
+  it('keeps the per-wallet amount guard and warns when fill history affects eligibility', async () => {
+    const { gateway, service } = makeService();
+    gateway.orders = [
+      order({
+        fillPolicy: {
+          partialFillsAllowed: true,
+          minPartialFillBps: 0,
+          minRequestAmount: null,
+          maxRequestAmountPerWallet: '5',
+          oneFillPerWallet: true
+        }
+      })
+    ];
+
+    const eligibleAmount = await service.prepareSwap({
+      wallet: addresses.wallet,
+      sellAsset: 'QUOTE',
+      buyAsset: 'BASE',
+      inputMode: 'buy',
+      amount: '2'
+    });
+    expect(eligibleAmount).toMatchObject({
+      ok: true,
+      data: {
+        status: 'ready',
+        warnings: [
+          expect.stringContaining('fill-history eligibility')
+        ]
+      }
+    });
+
+    const overMaximum = await service.prepareSwap({
+      wallet: addresses.wallet,
+      sellAsset: 'QUOTE',
+      buyAsset: 'BASE',
+      inputMode: 'buy',
+      amount: '3'
+    });
+    expect(overMaximum).toMatchObject({
+      ok: true,
+      data: { status: 'unsupported', envelope: null }
+    });
+  });
+
+  it('reports the actual recurring output after exact-buy input rounding', async () => {
+    const { gateway, service } = makeService();
+    gateway.orders = [
+      order({
+        identity: {
+          escrowContract: addresses.recurring,
+          localId: '9',
+          handle: `cw_${addresses.recurring.slice(2)}_9`
+        },
+        kind: 'recurring',
+        recurring: {
+          baseAsset,
+          quoteAsset,
+          buyPrice: null,
+          sellPrice: null,
+          buyBaseAmount: '0.000003',
+          buyQuoteAmount: '0.000002',
+          sellBaseAmount: '0.000003',
+          sellQuoteAmount: '0.000002',
+          buyQuoteLiquidity: '1',
+          sellBaseLiquidity: '1',
+          buySideOpen: true,
+          sellSideOpen: true
+        }
+      })
+    ];
+
+    const result = await service.prepareSwap({
+      wallet: addresses.wallet,
+      sellAsset: 'QUOTE',
+      buyAsset: 'BASE',
+      inputMode: 'buy',
+      amount: '0.000002'
+    });
+
+    expect(result).toMatchObject({
+      ok: true,
+      data: {
+        status: 'ready',
+        intent: {
+          recurringSide: 'buy',
+          inputAmount: '0.000002',
+          minOutputAmount: '0.000003'
+        },
+        selection: {
+          source: 'recurring',
+          sellAmount: '0.000002',
+          buyAmount: '0.000003'
+        }
+      }
     });
   });
 });
@@ -458,7 +911,6 @@ describe('ChainWhisperDomainService preparation', () => {
         status: 'needs_input',
         intent: { action: 'create_trade', offerAsset: { symbol: 'BASE' }, requestAsset: { symbol: 'QUOTE' } },
         missing: [
-          { field: 'orderType' },
           { field: 'wallet' },
           { field: 'offerAmount' },
           { field: 'requestAmount' }
@@ -469,7 +921,7 @@ describe('ChainWhisperDomainService preparation', () => {
     expect(gateway.buildExecutionPlan).not.toHaveBeenCalled();
   });
 
-  it('does not let legacy access axes authorize a create without a canonical orderType', async () => {
+  it('derives the canonical order type from economic create fields', async () => {
     const { gateway, service } = makeService();
     const result = await service.prepareCreateTrade({
       wallet: addresses.wallet,
@@ -478,15 +930,44 @@ describe('ChainWhisperDomainService preparation', () => {
       offerAmount: '1',
       requestAmount: '2',
       access: 'public',
-      amountVisibility: 'visible'
+      liquidityVisibility: 'visible'
     });
 
     expect(result).toMatchObject({
       ok: true,
       data: {
-        status: 'needs_input',
-        missing: [{ field: 'orderType' }],
-        envelope: null
+        status: 'ready',
+        intent: {
+          orderType: { id: 'one-off.standard-public' },
+          access: 'public',
+          amountVisibility: 'visible'
+        },
+        missing: [],
+        envelope: { version: 'ActionEnvelopeV1' }
+      }
+    });
+    expect(gateway.buildExecutionPlan).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ['orderType', 'one-off.direct'],
+    ['amountVisibility', 'private']
+  ] as const)('rejects the removed create alias %s', async (field, value) => {
+    const { gateway, service } = makeService();
+    const result = await service.prepareCreateTrade({
+      wallet: addresses.wallet,
+      offerAsset: 'BASE',
+      requestAsset: 'QUOTE',
+      offerAmount: '1',
+      requestAmount: '2',
+      [field]: value
+    } as never);
+
+    expect(result).toMatchObject({
+      ok: false,
+      error: {
+        code: 'invalid_input',
+        details: [{ field: `input.${field}` }]
       }
     });
     expect(gateway.buildExecutionPlan).not.toHaveBeenCalled();
@@ -496,11 +977,10 @@ describe('ChainWhisperDomainService preparation', () => {
     ['one-off.standard-public', 'public', undefined, { kind: 'none' }],
     ['one-off.unlisted', 'unlisted', undefined, { kind: 'generate-local', share: 'encrypted-coti-message-only' }],
     ['one-off.direct', 'direct', addresses.recipient, { kind: 'recipient-bound', recipient: addresses.recipient }]
-  ] as const)('prepares the explicit %s route without accepting an access secret', async (orderType, access, recipient, policy) => {
+  ] as const)('derives the explicit %s route without accepting an access secret', async (orderType, access, recipient, policy) => {
     const { service } = makeService();
     const result = await service.prepareCreateTrade({
       wallet: addresses.wallet,
-      orderType,
       offerAsset: 'BASE',
       requestAsset: 'QUOTE',
       offerAmount: '1',
@@ -571,7 +1051,6 @@ describe('ChainWhisperDomainService preparation', () => {
     });
     const result = await service.prepareCreateTrade({
       wallet: addresses.wallet,
-      orderType: 'one-off.standard-public',
       offerAsset: 'BASE',
       requestAsset: 'QUOTE',
       offerAmount: '1',
@@ -593,7 +1072,6 @@ describe('ChainWhisperDomainService preparation', () => {
     const { service } = makeService();
     const result = await service.prepareCreateTrade({
       wallet: addresses.wallet,
-      orderType: 'one-off.direct',
       offerAsset: 'BASE',
       requestAsset: 'QUOTE',
       offerAmount: '1',
@@ -614,19 +1092,19 @@ describe('ChainWhisperDomainService preparation', () => {
     const { gateway, service } = makeService();
     const invalid = await service.prepareCreateTrade({
       wallet: addresses.wallet,
-      orderType: 'one-off.private-liquidity.public',
       offerAsset: 'BASE',
-      requestAsset: 'QUOTE'
+      requestAsset: 'QUOTE',
+      liquidityVisibility: 'private'
     });
     expect(invalid).toMatchObject({ ok: false, error: { code: 'invalid_input' } });
 
     const leaked = await service.prepareCreateTrade({
       wallet: addresses.wallet,
-      orderType: 'one-off.private-liquidity.public',
       offerAsset: 'p.BASE',
       requestAsset: 'QUOTE',
       offerAmount: '987654.321',
-      requestAmount: '123456.789'
+      requestAmount: '123456.789',
+      liquidityVisibility: 'private'
     });
     expect(leaked).toMatchObject({
       ok: false,
@@ -639,9 +1117,9 @@ describe('ChainWhisperDomainService preparation', () => {
 
     const valid = await service.prepareCreateTrade({
       wallet: addresses.wallet,
-      orderType: 'one-off.private-liquidity.public',
       offerAsset: 'p.BASE',
-      requestAsset: 'QUOTE'
+      requestAsset: 'QUOTE',
+      liquidityVisibility: 'private'
     });
     expect(valid).toMatchObject({
       ok: true,
@@ -669,11 +1147,11 @@ describe('ChainWhisperDomainService preparation', () => {
     const { gateway, service } = makeService();
     const result = await service.prepareCreateTrade({
       wallet: addresses.wallet,
-      orderType: 'one-off.private-liquidity.public',
       offerAsset: 'p.BASE',
       requestAsset: 'QUOTE',
       offerAmount: '1.25',
       requestAmount: '2.5',
+      liquidityVisibility: 'private',
       privateAmountMode: 'agent-provided'
     });
 
@@ -701,19 +1179,19 @@ describe('ChainWhisperDomainService preparation', () => {
   });
 
   it.each([
-    ['one-off.unlisted', undefined],
-    ['one-off.direct', addresses.recipient]
+    ['unlisted', undefined],
+    ['direct', addresses.recipient]
   ] as const)(
     'keeps private-token amounts signer-local for %s creation',
-    async (orderType, recipient) => {
+    async (access, recipient) => {
       const { gateway, service } = makeService();
       const leaked = await service.prepareCreateTrade({
         wallet: addresses.wallet,
-        orderType,
         offerAsset: 'p.BASE',
         requestAsset: 'QUOTE',
         offerAmount: '987654.321',
         requestAmount: '2',
+        access,
         recipient
       });
       expect(leaked).toMatchObject({
@@ -726,10 +1204,10 @@ describe('ChainWhisperDomainService preparation', () => {
 
       const valid = await service.prepareCreateTrade({
         wallet: addresses.wallet,
-        orderType,
         offerAsset: 'p.BASE',
         requestAsset: 'QUOTE',
         requestAmount: '2',
+        access,
         recipient
       });
       expect(valid).toMatchObject({
@@ -751,7 +1229,6 @@ describe('ChainWhisperDomainService preparation', () => {
     const { gateway, service } = makeService();
     const result = await service.prepareCreateTrade({
       wallet: addresses.wallet,
-      orderType: 'one-off.standard-public',
       offerAsset: 'p.BASE',
       requestAsset: 'QUOTE',
       offerAmount: '987654.321',
@@ -778,7 +1255,6 @@ describe('ChainWhisperDomainService preparation', () => {
     gateway.currentStatus = status(false);
     const result = await service.prepareCreateRecurring({
       wallet: addresses.wallet,
-      orderType: 'recurring.public',
       baseAsset: 'BASE',
       quoteAsset: 'QUOTE',
       buyPrice: '1.9',
@@ -795,11 +1271,249 @@ describe('ChainWhisperDomainService preparation', () => {
     });
   });
 
+  it('rejects a recipient on an unlisted order instead of silently dropping it', async () => {
+    const { gateway, service } = makeService();
+    const result = await service.prepareCreateTrade({
+      wallet: addresses.wallet,
+      offerAsset: 'BASE',
+      requestAsset: 'QUOTE',
+      offerAmount: '1',
+      requestAmount: '2',
+      access: 'unlisted',
+      recipient: addresses.recipient
+    });
+
+    expect(result).toMatchObject({
+      ok: false,
+      error: {
+        code: 'invalid_input',
+        details: [{ field: 'recipient' }]
+      }
+    });
+    expect(gateway.buildExecutionPlan).not.toHaveBeenCalled();
+  });
+
+  it('resolves recurring buy and sell prices from signed market-reference offsets', async () => {
+    const { gateway, service } = makeService();
+    gateway.references = [
+      {
+        id: 'carbon-base-quote',
+        venue: 'carbon',
+        source: 'market',
+        baseAsset,
+        quoteAsset,
+        price: '2',
+        basis: 'quote_per_base',
+        observedAt: '2026-07-27T00:00:00.000Z',
+        executable: false,
+        liquidityChecked: false
+      }
+    ];
+
+    const result = await service.prepareCreateRecurring({
+      wallet: addresses.wallet,
+      baseAsset: 'BASE',
+      quoteAsset: 'QUOTE',
+      buyPrice: { reference: 'market', offsetBps: -1000 },
+      sellPrice: { reference: 'market', offsetBps: 1000 },
+      buyQuoteLiquidity: '10',
+      sellBaseLiquidity: '10',
+      liquidityVisibility: 'visible'
+    });
+
+    expect(result).toMatchObject({
+      ok: true,
+      data: {
+        status: 'ready',
+        intent: {
+          orderType: { id: 'recurring.public' },
+          buyPrice: '1.8',
+          sellPrice: '2.2',
+          priceReference: {
+            id: 'carbon-base-quote',
+            venue: 'carbon',
+            price: '2',
+            buyOffsetBps: -1000,
+            sellOffsetBps: 1000
+          }
+        },
+        missing: [],
+        envelope: { version: 'ActionEnvelopeV1' }
+      }
+    });
+    expect(gateway.buildExecutionPlan).toHaveBeenCalledOnce();
+  });
+
+  it('prepares the exact private p.WISP/p.COTI recurring strategy an autonomous agent chose', async () => {
+    const { gateway, service } = makeService();
+    gateway.references = [
+      {
+        id: 'chainwhisper-pwisp-pcoti',
+        venue: 'carbon',
+        source: 'market',
+        baseAsset: privateWispAsset,
+        quoteAsset: privateCotiAsset,
+        price: '1',
+        basis: 'quote_per_base',
+        observedAt: '2026-07-27T00:00:00.000Z',
+        executable: false,
+        liquidityChecked: false
+      }
+    ];
+
+    const result = await service.prepareCreateRecurring({
+      wallet: addresses.wallet,
+      baseAsset: 'p.WISP',
+      quoteAsset: 'p.COTI',
+      buyPrice: { reference: 'market', offsetBps: -1000 },
+      sellPrice: { reference: 'market', offsetBps: 1000 },
+      buyQuoteLiquidity: '10',
+      sellBaseLiquidity: '10',
+      liquidityVisibility: 'private',
+      privateAmountMode: 'agent-provided'
+    });
+
+    expect(result).toMatchObject({
+      ok: true,
+      data: {
+        status: 'ready',
+        intent: {
+          orderType: {
+            id: 'recurring.private-liquidity.public',
+            assetPrivacy: 'fully-private'
+          },
+          amountVisibility: 'private',
+          privateAmountMode: 'agent-provided',
+          buyPrice: '0.9',
+          sellPrice: '1.1',
+          buyQuoteLiquidity: '10',
+          sellBaseLiquidity: '10',
+          priceReference: {
+            id: 'chainwhisper-pwisp-pcoti',
+            price: '1',
+            buyOffsetBps: -1000,
+            sellOffsetBps: 1000
+          }
+        },
+        missing: [],
+        envelope: { version: 'ActionEnvelopeV1' }
+      }
+    });
+    expect(gateway.buildExecutionPlan).toHaveBeenCalledOnce();
+  });
+
+  it('rounds market-derived buy and sell prices in the maker-safe direction', async () => {
+    const { gateway, service } = makeService();
+    gateway.references = [
+      {
+        id: 'carbon-precision',
+        venue: 'carbon',
+        source: 'market',
+        baseAsset,
+        quoteAsset,
+        price: '1.23456789',
+        basis: 'quote_per_base',
+        observedAt: '2026-07-27T00:00:30.000Z',
+        executable: false,
+        liquidityChecked: false
+      }
+    ];
+
+    await expect(service.prepareCreateRecurring({
+      wallet: addresses.wallet,
+      baseAsset: 'BASE',
+      quoteAsset: 'QUOTE',
+      buyPrice: { reference: 'market', offsetBps: 0 },
+      sellPrice: { reference: 'market', offsetBps: 0 },
+      buyQuoteLiquidity: '10'
+    })).resolves.toMatchObject({
+      ok: true,
+      data: {
+        status: 'ready',
+        intent: {
+          buyPrice: '1.234567',
+          sellPrice: '1.234568'
+        }
+      }
+    });
+  });
+
+  it('rejects stale, expired, future, and malformed recurring market references', async () => {
+    const now = Date.parse('2026-07-27T00:10:00.000Z');
+    const { gateway, service } = makeService(() => now);
+    gateway.references = [
+      {
+        id: 'stale',
+        venue: 'carbon',
+        source: 'market',
+        baseAsset,
+        quoteAsset,
+        price: '2',
+        basis: 'quote_per_base',
+        observedAt: '2026-07-27T00:04:59.999Z',
+        executable: false,
+        liquidityChecked: false
+      },
+      {
+        id: 'expired',
+        venue: 'carbon',
+        source: 'market',
+        baseAsset,
+        quoteAsset,
+        price: '2',
+        basis: 'quote_per_base',
+        observedAt: '2026-07-27T00:09:00.000Z',
+        expiresAt: '2026-07-27T00:09:59.999Z',
+        executable: false,
+        liquidityChecked: false
+      },
+      {
+        id: 'future',
+        venue: 'carbon',
+        source: 'market',
+        baseAsset,
+        quoteAsset,
+        price: '2',
+        basis: 'quote_per_base',
+        observedAt: '2026-07-27T00:10:30.001Z',
+        executable: false,
+        liquidityChecked: false
+      },
+      {
+        id: 'malformed',
+        venue: 'carbon',
+        source: 'market',
+        baseAsset,
+        quoteAsset,
+        price: '2',
+        basis: 'quote_per_base',
+        observedAt: 'not-a-date',
+        executable: false,
+        liquidityChecked: false
+      }
+    ];
+
+    await expect(service.prepareCreateRecurring({
+      wallet: addresses.wallet,
+      baseAsset: 'BASE',
+      quoteAsset: 'QUOTE',
+      buyPrice: { reference: 'market', offsetBps: -1000 },
+      sellPrice: { reference: 'market', offsetBps: 1000 },
+      buyQuoteLiquidity: '10'
+    })).resolves.toMatchObject({
+      ok: false,
+      error: {
+        code: 'provider_error',
+        message: expect.stringContaining('No compatible live market reference')
+      }
+    });
+    expect(gateway.buildExecutionPlan).not.toHaveBeenCalled();
+  });
+
   it('returns missing recurring liquidity without rejecting the draft', async () => {
     const { service } = makeService();
     const result = await service.prepareCreateRecurring({
       wallet: addresses.wallet,
-      orderType: 'recurring.public',
       baseAsset: 'BASE',
       quoteAsset: 'QUOTE',
       buyPrice: '1.9',
@@ -815,7 +1529,6 @@ describe('ChainWhisperDomainService preparation', () => {
     const { gateway, service } = makeService();
     const result = await service.prepareCreateRecurring({
       wallet: addresses.wallet,
-      orderType: 'recurring.public',
       baseAsset: 'BASE',
       quoteAsset: 'QUOTE',
       buyPrice: '1.9',
@@ -842,13 +1555,13 @@ describe('ChainWhisperDomainService preparation', () => {
     const { gateway, service } = makeService();
     const leaked = await service.prepareCreateRecurring({
       wallet: addresses.wallet,
-      orderType: 'recurring.private-liquidity.public',
       baseAsset: 'p.BASE',
       quoteAsset: 'QUOTE',
       buyPrice: '1.9',
       sellPrice: '2.1',
       buyQuoteLiquidity: '998877.66',
-      sellBaseLiquidity: '112233.44'
+      sellBaseLiquidity: '112233.44',
+      liquidityVisibility: 'private'
     });
     expect(leaked).toMatchObject({
       ok: false,
@@ -861,12 +1574,12 @@ describe('ChainWhisperDomainService preparation', () => {
 
     const result = await service.prepareCreateRecurring({
       wallet: addresses.wallet,
-      orderType: 'recurring.private-liquidity.public',
       baseAsset: 'p.BASE',
       quoteAsset: 'QUOTE',
       buyPrice: '1.9',
       sellPrice: '2.1',
-      buyQuoteLiquidity: '998877.66'
+      buyQuoteLiquidity: '998877.66',
+      liquidityVisibility: 'private'
     });
 
     expect(result).toMatchObject({
@@ -894,7 +1607,6 @@ describe('ChainWhisperDomainService preparation', () => {
     const { gateway, service } = makeService();
     const result = await service.prepareCreateRecurring({
       wallet: addresses.wallet,
-      orderType: 'recurring.public',
       baseAsset: 'p.BASE',
       quoteAsset: 'QUOTE',
       buyPrice: '1.9',
@@ -922,12 +1634,12 @@ describe('ChainWhisperDomainService preparation', () => {
     const { gateway, service } = makeService();
     const result = await service.prepareCreateRecurring({
       wallet: addresses.wallet,
-      orderType: 'recurring.direct',
       baseAsset: 'BASE',
       quoteAsset: 'QUOTE',
       buyPrice: '1.9',
       sellPrice: '2.1',
       buyQuoteLiquidity: '100',
+      access: 'direct',
       recipient: addresses.recipient
     });
 
@@ -946,16 +1658,16 @@ describe('ChainWhisperDomainService preparation', () => {
     expect(gateway.buildExecutionPlan).toHaveBeenCalledOnce();
   });
 
-  it('rejects nonexistent unlisted recurring order types', async () => {
+  it('rejects unsupported unlisted recurring access', async () => {
     const { gateway, service } = makeService();
     const result = await service.prepareCreateRecurring({
       wallet: addresses.wallet,
-      orderType: 'recurring.unlisted' as never,
       baseAsset: 'BASE',
       quoteAsset: 'QUOTE',
       buyPrice: '1.9',
       sellPrice: '2.1',
-      buyQuoteLiquidity: '100'
+      buyQuoteLiquidity: '100',
+      access: 'unlisted'
     });
 
     expect(result).toMatchObject({
@@ -1600,6 +2312,7 @@ describe('domain tool surface', () => {
       'chainwhisper_list_orders',
       'chainwhisper_get_order',
       'chainwhisper_compare_price_references',
+      'chainwhisper_prepare_swap',
       'chainwhisper_privacy_bridge_status',
       'chainwhisper_prepare_privacy_bridge',
       'chainwhisper_prepare_create_trade',
@@ -1620,10 +2333,8 @@ describe('domain tool surface', () => {
     expect(publicSchemas).not.toMatch(
       /accessSecret|privateKey|mnemonic|hiddenAmount|privateLiquidityAmount/u
     );
-    expect(publicSchemas).toContain('one-off.standard-public');
-    expect(publicSchemas).toContain(
-      'recurring.private-liquidity.direct'
-    );
+    expect(publicSchemas).toContain('liquidityVisibility');
+    expect(publicSchemas).not.toContain('recurring.private-liquidity.direct');
     expect(publicSchemas).toContain(
       'including private-token amounts on public Standard and explicitly labeled legacy Standard orders'
     );
@@ -1631,21 +2342,33 @@ describe('domain tool surface', () => {
       'visibly bound private-token amounts when superseding an explicitly labeled legacy Standard counter'
     );
     expect(publicSchemas).toContain(
-      'the signer collects those locally'
+      'agent-provided binds agent-visible private values'
     );
 
-    for (const name of [
-      'chainwhisper_prepare_create_trade',
-      'chainwhisper_prepare_create_recurring'
-    ]) {
-      const schema = tools.find((tool) => tool.name === name)?.inputSchema as {
-        required?: string[];
-        properties?: Record<string, unknown>;
-      };
-      expect(schema.required).toContain('orderType');
-      expect(schema.properties).not.toHaveProperty('access');
-      expect(schema.properties).not.toHaveProperty('amountVisibility');
-    }
+    const tradeSchema = tools.find(
+      (tool) => tool.name === 'chainwhisper_prepare_create_trade'
+    )?.inputSchema as {
+      required?: string[];
+      properties?: Record<string, unknown>;
+    };
+    expect(tradeSchema.required ?? []).not.toContain('orderType');
+    expect(tradeSchema.properties).toHaveProperty('access');
+    expect(tradeSchema.properties).toHaveProperty('liquidityVisibility');
+    expect(tradeSchema.properties).not.toHaveProperty('orderType');
+    expect(tradeSchema.properties).not.toHaveProperty('amountVisibility');
+
+    const recurringSchema = tools.find(
+      (tool) => tool.name === 'chainwhisper_prepare_create_recurring'
+    )?.inputSchema as {
+      required?: string[];
+      properties?: Record<string, unknown>;
+    };
+    expect(recurringSchema.required ?? []).not.toContain('orderType');
+    expect(recurringSchema.properties).toHaveProperty('liquidityVisibility');
+    expect(recurringSchema.properties).not.toHaveProperty('access');
+    expect(recurringSchema.properties).not.toHaveProperty('recipient');
+    expect(recurringSchema.properties).not.toHaveProperty('orderType');
+    expect(recurringSchema.properties).not.toHaveProperty('amountVisibility');
   });
 
   it('explains every actual canonical order type without inventing recurring unlisted variants', async () => {
@@ -1671,12 +2394,14 @@ describe('domain tool surface', () => {
     const orderTypes = (result.data as {
       orderTypes: Array<{ id: string; liquidity: string }>;
     }).orderTypes;
-    expect(orderTypes).toHaveLength(10);
+    expect(orderTypes).toHaveLength(8);
     expect(
       orderTypes.some(
         ({ id }) =>
           id === 'recurring.unlisted' ||
-          id === 'recurring.private-liquidity.unlisted'
+          id === 'recurring.private-liquidity.unlisted' ||
+          id === 'recurring.direct' ||
+          id === 'recurring.private-liquidity.direct'
       )
     ).toBe(false);
     expect(
@@ -1685,6 +2410,34 @@ describe('domain tool surface', () => {
       )
     ).toMatchObject({
       liquidity: 'private-token sides hidden; public-token sides visible'
+    });
+  });
+
+  it('keeps direct-recipient recurring creation outside the public MCP call surface', async () => {
+    const { service } = makeService();
+    const tool = createChainWhisperDomainTools(service).find(
+      ({ name }) => name === 'chainwhisper_prepare_create_recurring'
+    )!;
+    await expect(
+      tool.execute({
+        wallet: addresses.wallet,
+        orderType: 'recurring.direct',
+        baseAsset: 'BASE',
+        quoteAsset: 'QUOTE',
+        buyPrice: '1.9',
+        sellPrice: '2.1',
+        buyQuoteLiquidity: '10',
+        recipient: addresses.recipient
+      })
+    ).resolves.toMatchObject({
+      ok: false,
+      error: {
+        code: 'invalid_input',
+        details: expect.arrayContaining([
+          expect.objectContaining({ field: 'input.orderType' }),
+          expect.objectContaining({ field: 'input.recipient' })
+        ])
+      }
     });
   });
 

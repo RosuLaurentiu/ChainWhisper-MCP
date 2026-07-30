@@ -4,9 +4,12 @@ import {
   connectStdioMcpServer,
   writeFatalMcpError
 } from '../server/index.js';
-import { createChainWhisperPlanningServer } from '../planner/server.js';
+import { removeSignerOnlyEnvironment } from '../planner/environment.js';
 
 const main = async (): Promise<void> => {
+  removeSignerOnlyEnvironment(process.env);
+  const { createChainWhisperPlanningServer } =
+    await import('../planner/server.js');
   const server = await createChainWhisperPlanningServer();
   await connectStdioMcpServer(server);
 };

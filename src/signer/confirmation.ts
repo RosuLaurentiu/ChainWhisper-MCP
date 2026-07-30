@@ -1,6 +1,5 @@
 import type {
   Address,
-  ConfirmationDiagnosticResult,
   ConfirmationRequest,
   FormElicitor,
   HexString,
@@ -41,6 +40,18 @@ const assetLabel = (
 const privateAmountLabel = (id: string): string => {
   const normalized = id.toLowerCase();
   if (
+    normalized.includes('recurring-base-inventory') ||
+    normalized.includes('recurring-sell-base-liquidity')
+  ) {
+    return 'Private sell-side inventory';
+  }
+  if (
+    normalized.includes('recurring-quote-inventory') ||
+    normalized.includes('recurring-buy-quote-liquidity')
+  ) {
+    return 'Private buy-side budget';
+  }
+  if (
     normalized.includes('offer') ||
     normalized.includes('sell') ||
     normalized.includes('input')
@@ -57,6 +68,14 @@ const privateAmountLabel = (id: string): string => {
   if (normalized.includes('inventory')) return 'Private inventory';
   if (normalized.includes('allowance')) return 'Exact private allowance';
   return 'Private signer amount';
+};
+
+const formatCotiAtomic = (atomic: string): string =>
+  `${formatUnits(BigInt(atomic), 18)} COTI (${atomic} wei)`;
+
+const formatBasisPointDeviation = (basisPoints: number): string => {
+  const sign = basisPoints > 0 ? '+' : '';
+  return `${sign}${basisPoints / 100}% (${sign}${basisPoints} bps)`;
 };
 
 const LEGACY_STANDARD_ORDER_TYPE_LABEL =
@@ -190,27 +209,130 @@ export const buildActionConfirmation = (
       value: `${maximumNetworkFeeCoti} COTI (${maximumNetworkFeeWei.toString()} wei)`,
     });
   }
-  const metadataDetails = [
-    ['Expiry', envelope.intent.expiresAt],
-    ['Recurring side', envelope.intent.metadata?.recurringSide],
-    ['Buy price', envelope.intent.metadata?.buyPrice],
-    ['Sell price', envelope.intent.metadata?.sellPrice],
-    [
-      'Buy-side liquidity',
-      envelope.intent.metadata?.buyQuoteLiquidity,
-    ],
-    [
-      'Sell-side liquidity',
-      envelope.intent.metadata?.sellBaseLiquidity,
-    ],
-    ['Bridge direction', envelope.intent.metadata?.bridgeDirection],
-    ['Privacy pair', envelope.intent.metadata?.bridgePair],
-  ] as const;
-  for (const [label, value] of metadataDetails) {
+  const addDetail = (label: string, value: unknown): void => {
     if (typeof value === 'string' && value) {
       details.push({ label, value });
     }
+  };
+  addDetail('Expiry', envelope.intent.expiresAt);
+  addDetail('Recurring side', envelope.intent.metadata?.recurringSide);
+  const recurringPriceUnit =
+    sellAsset && buyAsset ? `${buyAsset} per ${sellAsset}` : null;
+  const privateRecurring =
+    envelope.intent.orderType?.cadence === 'recurring' &&
+    envelope.intent.orderType.id.includes('private-liquidity');
+  const addRecurringPrice = (label: string, value: unknown): void => {
+    if (typeof value !== 'string' || !value) return;
+    details.push({
+      label: recurringPriceUnit ? `${label} (${recurringPriceUnit})` : label,
+      value: recurringPriceUnit ? `${value} ${recurringPriceUnit}` : value,
+    });
+  };
+  addRecurringPrice(
+    privateRecurring ? 'Buy price · public on-chain' : 'Buy price',
+    envelope.intent.metadata?.buyPrice,
+  );
+  addRecurringPrice(
+    privateRecurring ? 'Sell price · public on-chain' : 'Sell price',
+    envelope.intent.metadata?.sellPrice,
+  );
+  if (privateRecurring) {
+    const sellIsPrivate =
+      envelope.intent.sellAsset?.kind === 'private-erc20';
+    const buyIsPrivate =
+      envelope.intent.buyAsset?.kind === 'private-erc20';
+    const privateSides = [
+      ...(sellIsPrivate ? ['sell inventory'] : []),
+      ...(buyIsPrivate ? ['buy budget'] : []),
+    ];
+    const publicSides = [
+      ...(!sellIsPrivate ? ['sell inventory'] : []),
+      ...(!buyIsPrivate ? ['buy budget'] : []),
+    ];
+    const visibilityClause = (
+      sides: string[],
+      visibility: 'encrypted' | 'public',
+    ): string =>
+      `${sides.join(' and ')} ${sides.length === 1 ? 'is' : 'are'} ${visibility}.`;
+    const amountVisibility =
+      privateSides.length === 2
+        ? 'Sell inventory and buy budget are encrypted.'
+        : [
+            ...(privateSides.length
+              ? [visibilityClause(privateSides, 'encrypted')]
+              : []),
+            ...(publicSides.length
+              ? [visibilityClause(publicSides, 'public')]
+              : []),
+          ].join(' ');
+    details.push({
+      label: 'On-chain visibility',
+      value:
+        `${amountVisibility} Buy and sell prices, addresses, and order activity are public.`,
+    });
   }
+  const buyBudget = envelope.intent.metadata?.buyQuoteLiquidity;
+  if (typeof buyBudget === 'string' && buyBudget) {
+    const privacySuffix = privateRecurring
+      ? envelope.intent.buyAsset?.kind === 'private-erc20'
+        ? ' · encrypted on-chain'
+        : ' · public on-chain'
+      : '';
+    details.push({
+      label: buyAsset
+        ? `Buy-side budget${privacySuffix} (${buyAsset})`
+        : `Buy-side budget${privacySuffix}`,
+      value: buyAsset ? `${buyBudget} ${buyAsset}` : buyBudget,
+    });
+  }
+  const sellInventory = envelope.intent.metadata?.sellBaseLiquidity;
+  if (typeof sellInventory === 'string' && sellInventory) {
+    const privacySuffix = privateRecurring
+      ? envelope.intent.sellAsset?.kind === 'private-erc20'
+        ? ' · encrypted on-chain'
+        : ' · public on-chain'
+      : '';
+    details.push({
+      label: sellAsset
+        ? `Sell-side inventory${privacySuffix} (${sellAsset})`
+        : `Sell-side inventory${privacySuffix}`,
+      value: sellAsset
+        ? `${sellInventory} ${sellAsset}`
+        : sellInventory,
+    });
+  }
+  addDetail(
+    'Signed market reference source',
+    envelope.intent.metadata?.marketReferenceId,
+  );
+  addDetail(
+    'Signed market reference venue',
+    envelope.intent.metadata?.marketReferenceVenue,
+  );
+  addRecurringPrice(
+    'Signed market reference price',
+    envelope.intent.metadata?.marketReferencePrice,
+  );
+  addDetail(
+    'Signed market reference observed at',
+    envelope.intent.metadata?.marketReferenceObservedAt,
+  );
+  const buyOffset = envelope.intent.metadata?.buyPriceOffsetBps;
+  if (typeof buyOffset === 'number' && Number.isInteger(buyOffset)) {
+    details.push({
+      label: 'Buy-price deviation from market',
+      value: formatBasisPointDeviation(buyOffset),
+    });
+  }
+  const sellOffset = envelope.intent.metadata?.sellPriceOffsetBps;
+  if (typeof sellOffset === 'number' && Number.isInteger(sellOffset)) {
+    details.push({
+      label: 'Sell-price deviation from market',
+      value: formatBasisPointDeviation(sellOffset),
+    });
+  }
+  addDetail('Bridge direction', envelope.intent.metadata?.bridgeDirection);
+  addDetail('Privacy pair', envelope.intent.metadata?.bridgePair);
   const signedLegacyOrderTypeLabel =
     envelope.intent.metadata?.legacyCompatibility ===
       'standard-recipient-bound' &&
@@ -243,10 +365,12 @@ export const buildActionConfirmation = (
     spender: spenders[0] ?? null,
     fee:
       standaloneApproval
-        ? '0 native on this approval step'
+        ? '0 COTI (0 wei; approval step)'
         : envelope.intent.action === 'privacy_bridge'
-        ? `${String(envelope.intent.metadata?.portalFeeAtomic ?? '0')} atomic COTI portal fee`
-        : `${envelope.fee.amount} native`,
+        ? `${formatCotiAtomic(
+            String(envelope.intent.metadata?.portalFeeAtomic ?? '0'),
+          )}; Privacy Portal fee`
+        : formatCotiAtomic(envelope.fee.amount),
     nativeValue: steps
       .reduce((total, step) => total + BigInt(step.value), 0n)
       .toString(),
@@ -288,62 +412,6 @@ export class ConfirmationGate {
 
   get isWriteAvailable(): boolean {
     return this.#elicitor.isSupported();
-  }
-
-  async diagnoseForm(
-    wallet: Address,
-  ): Promise<ConfirmationDiagnosticResult> {
-    if (!this.#elicitor.isSupported()) {
-      return {
-        supported: false,
-        outcome: 'unsupported',
-        writeAttempted: false,
-      };
-    }
-    const result = await withTimeout(
-      this.#elicitor.requestConfirmation(
-        {
-          operationId: 'confirmation-form-diagnostic',
-          operationHash: `0x${'00'.repeat(32)}`,
-          stepId: 'diagnostic',
-          stepIndex: 0,
-          stepCount: 1,
-          wallet,
-          contract: '0x0000000000000000000000000000000000000000',
-          action: 'confirmation_form_diagnostic',
-          orderType: null,
-          orderTypeLabel: 'Not applicable',
-          assets: [],
-          amounts: [],
-          counterparty: null,
-          spender: null,
-          fee: '0',
-          nativeValue: '0',
-          gasCap: '0',
-          expectedResult:
-            'Only the MCP confirmation response is returned.',
-          summary:
-            'Read-only signer confirmation-form diagnostic; no transaction is prepared, signed, or broadcast.',
-        },
-        this.#timeoutMs,
-      ),
-      this.#timeoutMs,
-    );
-    if (result === 'timeout') {
-      return {
-        supported: true,
-        outcome: 'timeout',
-        writeAttempted: false,
-      };
-    }
-    return {
-      supported: true,
-      outcome: result.outcome,
-      ...('reason' in result && result.reason
-        ? { reason: result.reason }
-        : {}),
-      writeAttempted: false,
-    };
   }
 
   async confirm(

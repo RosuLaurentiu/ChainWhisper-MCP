@@ -10,6 +10,8 @@ Initial public beta release candidate.
   `chainwhisper_open_control_panel`.
 - Added local existing-wallet import and cryptographically secure wallet
   generation with one-time raw-key backup.
+- Kept one public signer tool catalog from startup and activated the first
+  configured wallet in-process without reconnecting MCP or Agent Control.
 - Added selected `.env` support, safe atomic files, state path validation,
   process-over-file precedence, and one-beta legacy JSON migration.
 - Removed normal setup requirements for user-supplied privacy and storage
@@ -20,29 +22,54 @@ Initial public beta release candidate.
   privacy re-onboarding.
 - Added a persistent ChainWhisper-branded loopback Agent Control page with
   one rotated session, CSRF/replay/origin protections, strict CSP, no remote
-  assets, no telemetry, redacted diagnostics, and responsive accessible forms.
+  assets, no telemetry, redacted diagnostics, responsive accessible forms,
+  coalesced browser opens, and authenticated-page arrival checks.
 
 ### Signing and autonomy
 
 - Changed multi-step writes to one complete logical-action confirmation.
-- Added complete technical step digests and post-authorization re-simulation
-  with exact fee ceilings.
+- Added complete technical step digests, per-step fee ceilings, and fresh
+  full-action materialization before autonomous retry or restart signing.
 - Added `AutonomyPolicyV1`, bounded policies up to 30 days, and full audited
   economic autonomy up to 24 hours.
 - Added local activation, two explicit full-autonomy acknowledgements, atomic
   budgets, structured policy denials, pause, local resume, and local revoke.
 - Added optional `policyId` to planned execution and private-message writes.
 - Added `signer-input` and policy-gated `agent-provided` private amount modes.
+- Added one policy-or-local-confirmation-gated private-state tool for verified
+  private balances, owned hidden inventory, recurring progress, and
+  wallet-scoped fill receipts.
+- Defined `agentVisiblePrivateAmounts` as one explicit policy-wide consent for
+  both choosing private amounts and viewing policy-scoped private balances,
+  hidden order inventory/progress, and participant receipts, with the combined
+  authority shown throughout Agent Control.
 - Hardened operation discard with exact hash and mandatory local confirmation.
+- Changed action execution to a durable asynchronous queue with safe semantic
+  operation polling and signer-restart restoration, including exact-hash
+  private-message receipt recovery.
+- Bound fill policy scope to the verified source maker rather than the fill
+  recipient.
+- Added verified create-event decoding so completed Standard, Direct,
+  private-liquidity, and recurring operations return their canonical order
+  handle, status, and ChainWhisper app link.
+- Reduced the public signer surface to ChainWhisper execution, status,
+  gated wallet-scoped private reads, autonomy request/pause, and structured
+  `cw.otc/1` negotiation. Privacy setup, token setup, resume, revoke, discard,
+  and manual recovery remain local to Agent Control.
 
 ### Protocol surface
 
 - Added the canonical ten ChainWhisper one-off and recurring order types.
+- Made create tools derive the canonical type from economic intent and kept
+  direct-recipient recurring creation internal until it exists in the app.
+- Added best-single-visible-order Swap preparation and exact or
+  market-offset recurring prices.
 - Added create, fill, counter, edit, lifecycle, recurring inventory, Privacy
   Portal, private-token, and structured private-messaging support for the
   audited deployed runtime.
 - Embedded the official COTI private-messaging SDK; no separate messaging MCP
   or ChainWhisper skill is needed.
+- Stopped republishing the SDK's seven generic COTI messaging tools.
 - Added bytecode attestations for ChainWhisper contracts, COTI onboarding,
   verified private tokens, Privacy Portal contracts, and private messaging.
 

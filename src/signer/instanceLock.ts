@@ -3,9 +3,11 @@ import {
   mkdir,
   open,
   readFile,
+  rename,
   unlink,
   type FileHandle,
 } from 'node:fs/promises';
+import { connect } from 'node:net';
 import { resolve } from 'node:path';
 
 import { SignerError } from './errors.js';
@@ -22,6 +24,7 @@ type LockOwnerV1 = {
   token: string;
   pid: number;
   createdAt: string;
+  controlPort?: number;
 };
 
 const parseOwner = (serialized: string): LockOwnerV1 | null => {
@@ -31,12 +34,72 @@ const parseOwner = (serialized: string): LockOwnerV1 | null => {
       typeof value.token === 'string' &&
       /^[0-9a-f]{64}$/u.test(value.token) &&
       Number.isSafeInteger(value.pid) &&
-      typeof value.createdAt === 'string'
+      typeof value.createdAt === 'string' &&
+      (value.controlPort === undefined ||
+        (Number.isSafeInteger(value.controlPort) &&
+          value.controlPort >= 1 &&
+          value.controlPort <= 65_535))
       ? (value as LockOwnerV1)
       : null;
   } catch {
     return null;
   }
+};
+
+const pidIsAlive = (pid: number): boolean => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return errorCode(error) !== 'ESRCH';
+  }
+};
+
+const loopbackPortIsClosed = async (port: number): Promise<boolean> =>
+  new Promise((resolveClosed) => {
+    let settled = false;
+    const socket = connect({ host: '127.0.0.1', port });
+    const finish = (closed: boolean): void => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolveClosed(closed);
+    };
+    socket.setTimeout(500);
+    socket.once('connect', () => finish(false));
+    socket.once('timeout', () => finish(false));
+    socket.once('error', (error) =>
+      finish(errorCode(error) === 'ECONNREFUSED'),
+    );
+  });
+
+const ownerIsGone = async (owner: LockOwnerV1): Promise<boolean> =>
+  !pidIsAlive(owner.pid) &&
+  owner.controlPort !== undefined &&
+  (await loopbackPortIsClosed(owner.controlPort));
+
+const reclaimDeadOwner = async (
+  path: string,
+  observed: LockOwnerV1,
+): Promise<boolean> => {
+  if (!(await ownerIsGone(observed))) return false;
+  const stalePath = `${path}.${process.pid}.${randomBytes(8).toString('hex')}.stale`;
+  try {
+    await rename(path, stalePath);
+  } catch (error) {
+    return errorCode(error) === 'ENOENT';
+  }
+  const moved = parseOwner(await readFile(stalePath, 'utf8').catch(() => ''));
+  if (
+    !moved ||
+    moved.token !== observed.token ||
+    !(await ownerIsGone(moved))
+  ) {
+    await rename(stalePath, path).catch(() => undefined);
+    return false;
+  }
+  await unlink(stalePath);
+  return true;
 };
 
 export class SignerInstanceLock {
@@ -49,6 +112,32 @@ export class SignerInstanceLock {
     this.path = path;
     this.#token = token;
     this.#handle = handle;
+  }
+
+  async setControlPort(controlPort: number): Promise<void> {
+    if (
+      this.#released ||
+      !Number.isSafeInteger(controlPort) ||
+      controlPort < 1 ||
+      controlPort > 65_535
+    ) {
+      throw new SignerError(
+        'SIGNER_LOCK_OWNERSHIP_LOST',
+        'The signer control health binding could not be recorded safely.',
+      );
+    }
+    const owner = parseOwner(await readFile(this.path, 'utf8').catch(() => ''));
+    if (!owner || owner.token !== this.#token || owner.pid !== process.pid) {
+      throw new SignerError(
+        'SIGNER_LOCK_OWNERSHIP_LOST',
+        'The signer lock ownership changed; its control health binding was not updated.',
+      );
+    }
+    const updated: LockOwnerV1 = { ...owner, controlPort };
+    const serialized = Buffer.from(`${JSON.stringify(updated)}\n`, 'utf8');
+    await this.#handle.truncate(0);
+    await this.#handle.write(serialized, 0, serialized.length, 0);
+    await this.#handle.sync();
   }
 
   async release(): Promise<void> {
@@ -89,17 +178,33 @@ export const acquireSignerInstanceLock = async (
   const path = resolve(directory, LOCK_FILE_NAME);
   await mkdir(directory, { recursive: true, mode: 0o700 });
 
-  let handle: FileHandle;
-  try {
-    handle = await open(path, 'wx', 0o600);
-  } catch (error) {
-    if (errorCode(error) === 'EEXIST') {
+  let handle: FileHandle | null = null;
+  for (let attempt = 0; attempt < 2 && !handle; attempt += 1) {
+    try {
+      handle = await open(path, 'wx', 0o600);
+    } catch (error) {
+      if (errorCode(error) !== 'EEXIST') throw error;
+      const observed = parseOwner(
+        await readFile(path, 'utf8').catch(() => ''),
+      );
+      if (
+        attempt === 0 &&
+        observed &&
+        (await reclaimDeadOwner(path, observed))
+      ) {
+        continue;
+      }
       throw new SignerError(
         'SIGNER_ALREADY_RUNNING',
-        'The signer state directory is already locked. Stale locks are not removed automatically.',
+        'The signer state directory is locked by a live or unverifiable signer.',
       );
     }
-    throw error;
+  }
+  if (!handle) {
+    throw new SignerError(
+      'SIGNER_ALREADY_RUNNING',
+      'The signer state directory could not be locked.',
+    );
   }
 
   const token = randomBytes(32).toString('hex');

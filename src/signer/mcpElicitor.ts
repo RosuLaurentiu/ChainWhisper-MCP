@@ -38,14 +38,6 @@ const orderTypeDisplay = (request: ConfirmationRequest): string => {
 export const buildConfirmationMessage = (
   request: ConfirmationRequest,
 ): string => {
-  if (request.action === 'confirmation_form_diagnostic') {
-    return [
-      'Test the ChainWhisper signer confirmation form.',
-      `Wallet: ${request.wallet}`,
-      'This diagnostic never prepares, signs, or broadcasts a transaction.',
-      'Enable the confirmation field and submit only to verify that the MCP client returns an accepted form response.',
-    ].join('\n');
-  }
   return [
     'Confirm one ChainWhisper signer write.',
     `Wallet: ${request.wallet}`,

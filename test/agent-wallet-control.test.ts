@@ -157,6 +157,31 @@ describe('Agent Wallet control integration', () => {
     });
   });
 
+  it('marks a first wallet for in-process activation without losing its backup', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'cw-wallet-hot-'));
+    const environmentFile = join(root, 'agent.env');
+    const state = controlState(environmentFile);
+
+    const result = await saveAgentWallet({
+      action: 'generate-wallet',
+      fields: { environmentFilePath: environmentFile },
+      state,
+      replacing: false,
+      activateInProcess: true,
+      environment: {},
+    });
+
+    expect(result).toMatchObject({
+      ok: true,
+      message: expect.stringContaining('activat'),
+    });
+    expect(state.restartRequired).toBe(false);
+    expect(state.lastDiagnostic).toBe('agent-wallet-saved-activating');
+    expect(state.generatedBackup?.privateKey).toMatch(
+      /^0x[0-9a-f]{64}$/u,
+    );
+  });
+
   it('blocks replacement for missing local approval, process overrides, pending operations, and active policies', async () => {
     const root = await mkdtemp(join(tmpdir(), 'cw-wallet-block-'));
     const environmentFile = join(root, 'agent.env');

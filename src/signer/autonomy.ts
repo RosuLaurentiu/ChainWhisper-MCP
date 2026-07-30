@@ -99,6 +99,11 @@ type AutonomyPolicyProposalCommonV1 = {
   manifestHash: HexString;
   startsAt: string;
   expiresAt: string;
+  /**
+   * Policy-wide consent for the agent to both choose private amounts and view
+   * policy-scoped private balances, hidden order inventory/progress, and
+   * participant receipts.
+   */
   agentVisiblePrivateAmounts: boolean;
 };
 
@@ -155,9 +160,33 @@ export type PolicyExposureV1 = {
   messageCount: number;
   nativeValue: string;
   maximumNetworkFee: string;
+  /**
+   * True only when the signer derived every spend and price-band term needed
+   * for bounded-policy evaluation from the exact materialized action.
+   */
+  boundedRiskComplete: boolean;
   agentProvidedPrivateAmounts: boolean;
   /** Hashes of the exact materialized transaction/message steps. */
   stepDigests: HexString[];
+};
+
+/**
+ * Wallet-scoped read authorization derived from verified ChainWhisper state.
+ * Asset aliases let a bounded policy match either a manifest symbol or its
+ * canonical token address without exposing decrypted values to this manager.
+ */
+export type PrivateStatePolicyScopeV1 = {
+  wallet: string;
+  chainId: number;
+  manifestHash: HexString;
+  assets: Array<{ aliases: string[] }>;
+  pair?: {
+    firstAliases: string[];
+    secondAliases: string[];
+    bidirectional: boolean;
+  };
+  orderType?: OrderClassificationIdV1;
+  counterparties: string[];
 };
 
 export type AutonomyReservationState =
@@ -209,6 +238,7 @@ export type AutonomyDenialCode =
   | 'BRIDGE_NOT_ALLOWED'
   | 'MESSAGING_NOT_ALLOWED'
   | 'PRIVATE_AMOUNT_DISCLOSURE_NOT_ALLOWED'
+  | 'ECONOMIC_EXPOSURE_INCOMPLETE'
   | 'PER_ACTION_SPEND_EXCEEDED'
   | 'CUMULATIVE_SPEND_EXCEEDED'
   | 'NATIVE_VALUE_EXCEEDED'
@@ -1300,15 +1330,30 @@ export const validatePolicyExposure = (
       buyAmount: buyAmount.value.toString(),
     });
   }
+  if (typeof value.boundedRiskComplete !== 'boolean') {
+    return denial(
+      'INVALID_EXPOSURE',
+      'boundedRiskComplete must be a boolean.',
+      { field: 'boundedRiskComplete' },
+    );
+  }
   const pairsSet = new Set(pairs.value.map(pairKey));
   const quotePairs = new Set(priceQuotes.map(pairKey));
   if (
-    pairsSet.size !== quotePairs.size ||
-    [...pairsSet].some((key) => !quotePairs.has(key))
+    (
+      value.boundedRiskComplete &&
+      (
+        pairsSet.size !== quotePairs.size ||
+        [...pairsSet].some((key) => !quotePairs.has(key))
+      )
+    ) ||
+    [...quotePairs].some((key) => !pairsSet.has(key))
   ) {
     return denial(
       'INVALID_EXPOSURE',
-      'Every trade pair requires exactly one signer-derived price quote.',
+      value.boundedRiskComplete
+        ? 'Every bounded-compatible trade pair requires exactly one signer-derived price quote.'
+        : 'Exposure price quotes must belong to a declared trade pair.',
       { field: 'priceQuotes' },
     );
   }
@@ -1324,6 +1369,45 @@ export const validatePolicyExposure = (
     'INVALID_EXPOSURE',
   );
   if (!minimumReceive.allowed) return minimumReceive;
+  const action = value.action as ChainWhisperActionKind;
+  const recurringEdit =
+    action === 'edit' &&
+    typeof value.orderType === 'string' &&
+    value.orderType.startsWith('recurring.');
+  const requiresPrincipalSpend =
+    action === 'create_trade' ||
+    action === 'create_recurring' ||
+    action === 'fill' ||
+    action === 'counter' ||
+    action === 'privacy_bridge' ||
+    (action === 'edit' && !recurringEdit);
+  if (
+    value.boundedRiskComplete &&
+    requiresPrincipalSpend &&
+    !grossSpend.value.some((entry) => BigInt(entry.amount) > 0n)
+  ) {
+    return denial(
+      'INVALID_EXPOSURE',
+      'A bounded-compatible economic write requires exact positive principal exposure.',
+      { field: 'grossSpend' },
+    );
+  }
+  const requiresMinimumReceive =
+    action === 'create_trade' ||
+    action === 'fill' ||
+    action === 'counter' ||
+    (action === 'edit' && !recurringEdit);
+  if (
+    value.boundedRiskComplete &&
+    requiresMinimumReceive &&
+    !minimumReceive.value.some((entry) => BigInt(entry.amount) > 0n)
+  ) {
+    return denial(
+      'INVALID_EXPOSURE',
+      'A bounded-compatible trade requires an exact positive minimum receive amount.',
+      { field: 'minimumReceive' },
+    );
+  }
   if (
     value.counterparty !== undefined &&
     (typeof value.counterparty !== 'string' ||
@@ -1332,6 +1416,13 @@ export const validatePolicyExposure = (
     return denial('INVALID_EXPOSURE', 'Exposure counterparty is invalid.', {
       field: 'counterparty',
     });
+  }
+  if (action === 'fill' && value.counterparty === undefined) {
+    return denial(
+      'INVALID_EXPOSURE',
+      'Fill exposure must bind the source order maker as its counterparty.',
+      { field: 'counterparty' },
+    );
   }
   let bridge: AutonomyBridgeScopeV1 | undefined;
   if (value.bridge !== undefined) {
@@ -1432,6 +1523,7 @@ export const validatePolicyExposure = (
     messageCount: value.messageCount as number,
     nativeValue: nativeValue.value.toString(),
     maximumNetworkFee: networkFee.value.toString(),
+    boundedRiskComplete: value.boundedRiskComplete,
     agentProvidedPrivateAmounts: value.agentProvidedPrivateAmounts,
     stepDigests: value.stepDigests as HexString[],
   });
@@ -1891,10 +1983,16 @@ const remainingBudget = (
   };
 };
 
-const evaluateAgainstSnapshot = (
+type PolicyBindingV1 = {
+  wallet: string;
+  chainId: number;
+  manifestHash: HexString;
+};
+
+const activePolicyAgainstSnapshot = (
   snapshot: AutonomyStoreSnapshotV1,
   policyId: string,
-  exposure: PolicyExposureV1,
+  binding: PolicyBindingV1,
   now: Date,
 ): AutonomyDecision<ActiveAutonomyPolicyV1> => {
   const policy = snapshot.policies[policyId];
@@ -1935,20 +2033,20 @@ const evaluateAgainstSnapshot = (
       { policyId },
     );
   }
-  if (normalizeAddress(exposure.wallet) !== normalizeAddress(policy.wallet)) {
+  if (normalizeAddress(binding.wallet) !== normalizeAddress(policy.wallet)) {
     return denial('WALLET_MISMATCH', 'Exposure wallet is outside the policy.', {
       policyId,
       field: 'wallet',
     });
   }
-  if (exposure.chainId !== policy.chainId) {
+  if (binding.chainId !== policy.chainId) {
     return denial('CHAIN_MISMATCH', 'Exposure chain is outside the policy.', {
       policyId,
       field: 'chainId',
     });
   }
   if (
-    normalizeHash(exposure.manifestHash) !==
+    normalizeHash(binding.manifestHash) !==
     normalizeHash(policy.manifestHash)
   ) {
     return denial(
@@ -1957,14 +2055,38 @@ const evaluateAgainstSnapshot = (
       { policyId, field: 'manifestHash' },
     );
   }
+  return allowed(policy);
+};
+
+const evaluateAgainstSnapshot = (
+  snapshot: AutonomyStoreSnapshotV1,
+  policyId: string,
+  exposure: PolicyExposureV1,
+  now: Date,
+): AutonomyDecision<ActiveAutonomyPolicyV1> => {
+  const active = activePolicyAgainstSnapshot(
+    snapshot,
+    policyId,
+    exposure,
+    now,
+  );
+  if (!active.allowed) return active;
+  const policy = active.value;
   if (
     exposure.agentProvidedPrivateAmounts &&
     !policy.agentVisiblePrivateAmounts
   ) {
     return denial(
       'PRIVATE_AMOUNT_DISCLOSURE_NOT_ALLOWED',
-      'Policy does not permit agent-provided private amounts.',
+      'agentVisiblePrivateAmounts is disabled. Enabling that policy-wide consent would let the agent both choose private amounts and view policy-scoped private balances, hidden order inventory/progress, and participant receipts.',
       { policyId, field: 'agentProvidedPrivateAmounts' },
+    );
+  }
+  if (policy.mode === 'bounded' && !exposure.boundedRiskComplete) {
+    return denial(
+      'ECONOMIC_EXPOSURE_INCOMPLETE',
+      'The signer could not derive every spend and price term required by a bounded policy.',
+      { policyId, field: 'boundedRiskComplete' },
     );
   }
   if (policy.mode === 'full') {
@@ -2184,6 +2306,99 @@ const evaluateAgainstSnapshot = (
   return allowed(policy);
 };
 
+const assetAliasesInclude = (
+  aliases: readonly string[],
+  reference: string,
+): boolean => {
+  const normalizedReference = normalizeAsset(reference);
+  return aliases.some(
+    (alias) => normalizeAsset(alias) === normalizedReference,
+  );
+};
+
+const evaluatePrivateStateAgainstSnapshot = (
+  snapshot: AutonomyStoreSnapshotV1,
+  policyId: string,
+  scope: PrivateStatePolicyScopeV1,
+  now: Date,
+): AutonomyDecision<ActiveAutonomyPolicyV1> => {
+  const active = activePolicyAgainstSnapshot(
+    snapshot,
+    policyId,
+    scope,
+    now,
+  );
+  if (!active.allowed) return active;
+  const policy = active.value;
+  if (!policy.agentVisiblePrivateAmounts) {
+    return denial(
+      'PRIVATE_AMOUNT_DISCLOSURE_NOT_ALLOWED',
+      'The policy does not allow private amounts to be returned to the agent.',
+      { policyId, field: 'agentVisiblePrivateAmounts' },
+    );
+  }
+  if (policy.mode === 'full') return allowed(policy);
+
+  const blockedAsset = scope.assets.find(
+    ({ aliases }) =>
+      !policy.scope.allowedAssets.some((allowedAsset) =>
+        assetAliasesInclude(aliases, allowedAsset),
+      ),
+  );
+  if (blockedAsset) {
+    return denial(
+      'ASSET_NOT_ALLOWED',
+      'The private-state request includes an asset outside the bounded policy.',
+      { policyId, field: 'assets' },
+    );
+  }
+  if (
+    scope.orderType &&
+    !policy.scope.allowedOrderTypes.includes(scope.orderType)
+  ) {
+    return denial(
+      'ORDER_TYPE_NOT_ALLOWED',
+      'The requested order type is outside the bounded policy.',
+      { policyId, field: 'orderType' },
+    );
+  }
+  if (scope.pair) {
+    const pairAllowed = policy.scope.allowedPairs.some((pair) => {
+      const forward =
+        assetAliasesInclude(scope.pair!.firstAliases, pair.sellAsset) &&
+        assetAliasesInclude(scope.pair!.secondAliases, pair.buyAsset);
+      const reverse =
+        scope.pair!.bidirectional &&
+        assetAliasesInclude(scope.pair!.secondAliases, pair.sellAsset) &&
+        assetAliasesInclude(scope.pair!.firstAliases, pair.buyAsset);
+      return forward || reverse;
+    });
+    if (!pairAllowed) {
+      return denial(
+        'PAIR_NOT_ALLOWED',
+        'The private-state request targets a pair outside the bounded policy.',
+        { policyId, field: 'pair' },
+      );
+    }
+  }
+  const allowedCounterparties = new Set(
+    policy.scope.allowedCounterparties.map(normalizeAddress),
+  );
+  if (
+    scope.counterparties.some(
+      (counterparty) =>
+        !allowedCounterparties.has(normalizeAddress(counterparty)),
+    )
+  ) {
+    return denial(
+      'COUNTERPARTY_NOT_ALLOWED',
+      'The private-state request includes a counterparty outside the bounded policy.',
+      { policyId, field: 'allowedCounterparties' },
+    );
+  }
+  return allowed(policy);
+};
+
 type SnapshotOperationResult<T> = {
   snapshot: AutonomyStoreSnapshotV1;
   decision: AutonomyDecision<T>;
@@ -2368,6 +2583,23 @@ export class AutonomyPolicyManager {
     );
   }
 
+  async authorizePrivateStateDisclosure(
+    policyId: string,
+    scope: PrivateStatePolicyScopeV1,
+  ): Promise<AutonomyDecision<ActiveAutonomyPolicyV1>> {
+    return this.#transact((snapshot, now) =>
+      snapshotResult(
+        snapshot,
+        evaluatePrivateStateAgainstSnapshot(
+          snapshot,
+          policyId,
+          scope,
+          now,
+        ),
+      ),
+    );
+  }
+
   /**
    * Atomically evaluates and reserves every bounded budget. Repeating the same
    * policy/operation/exposure is idempotent; changing any bound term is denied.
@@ -2505,6 +2737,100 @@ export class AutonomyPolicyManager {
     });
   }
 
+  /**
+   * Rechecks the durable emergency-stop and policy lifecycle inside the shared
+   * write queue, immediately before an autonomous signer can create a
+   * signature or invoke an SDK write.
+   */
+  async authorizeReservedWrite(
+    reservationId: string,
+  ): Promise<AutonomyDecision<AutonomyReservationV1>> {
+    return this.#transact((snapshot, now) => {
+      const reservation = snapshot.reservations[reservationId];
+      if (!reservation) {
+        return snapshotResult(
+          snapshot,
+          denial(
+            'RESERVATION_NOT_FOUND',
+            'Autonomy reservation was not found.',
+          ),
+        );
+      }
+      if (
+        !['reserved', 'signed', 'pending', 'uncertain'].includes(
+          reservation.state,
+        )
+      ) {
+        return snapshotResult(
+          snapshot,
+          denial(
+            'RESERVATION_STATE_INVALID',
+            'Only an active, unsettled reservation can authorize a write.',
+            { policyId: reservation.policyId },
+          ),
+        );
+      }
+      if (snapshot.globalPaused) {
+        return snapshotResult(
+          snapshot,
+          denial('GLOBAL_PAUSED', 'Autonomy is globally paused.', {
+            policyId: reservation.policyId,
+          }),
+        );
+      }
+      const policy = snapshot.policies[reservation.policyId];
+      if (!policy) {
+        return snapshotResult(
+          snapshot,
+          denial('POLICY_NOT_FOUND', 'Autonomy policy was not found.', {
+            policyId: reservation.policyId,
+          }),
+        );
+      }
+      if (Date.parse(policy.expiresAt) <= now.getTime()) {
+        return snapshotResult(
+          snapshot,
+          denial('POLICY_EXPIRED', 'Autonomy policy has expired.', {
+            policyId: policy.id,
+          }),
+        );
+      }
+      if (Date.parse(policy.startsAt) > now.getTime()) {
+        return snapshotResult(
+          snapshot,
+          denial('POLICY_NOT_STARTED', 'Autonomy policy has not started.', {
+            policyId: policy.id,
+          }),
+        );
+      }
+      if (policy.lifecycle.state !== 'active') {
+        const code =
+          policy.lifecycle.state === 'revoked'
+            ? 'POLICY_REVOKED'
+            : policy.lifecycle.state === 'expired'
+              ? 'POLICY_EXPIRED'
+              : 'POLICY_PAUSED';
+        return snapshotResult(
+          snapshot,
+          denial(code, `Autonomy policy is ${policy.lifecycle.state}.`, {
+            policyId: policy.id,
+          }),
+        );
+      }
+      if (reservation.policyTermsDigest !== policy.termsDigest) {
+        return snapshotResult(
+          snapshot,
+          denial(
+            'STORE_TAMPERED',
+            'Autonomy reservation no longer matches its policy.',
+            { policyId: policy.id },
+          ),
+        );
+      }
+      return snapshotResult(snapshot, allowed(clone(reservation)));
+    });
+  }
+
   async #transitionReservation(
     reservationId: string,
     target: 'pending' | 'uncertain' | 'settled',
@@ -2562,6 +2888,61 @@ export class AutonomyPolicyManager {
     reservationId: string,
   ): Promise<AutonomyDecision<AutonomyReservationV1>> {
     return this.#transitionReservation(reservationId, 'settled');
+  }
+
+  async settleByOperationHash(
+    operationHash: HexString,
+  ): Promise<AutonomyDecision<AutonomyReservationV1>> {
+    if (!HASH_PATTERN.test(operationHash)) {
+      return denial(
+        'INVALID_EXPOSURE',
+        'Operation hash must be a 32-byte hash.',
+        { field: 'operationHash' },
+      );
+    }
+    return this.#transact((snapshot, now) => {
+      const matches = Object.values(snapshot.reservations).filter(
+        (reservation) =>
+          normalizeHash(reservation.operationHash) ===
+          normalizeHash(operationHash),
+      );
+      if (matches.length !== 1) {
+        return snapshotResult(
+          snapshot,
+          denial(
+            matches.length === 0
+              ? 'RESERVATION_NOT_FOUND'
+              : 'STORE_TAMPERED',
+            matches.length === 0
+              ? 'Autonomy reservation was not found.'
+              : 'Multiple autonomy reservations share one operation hash.',
+          ),
+        );
+      }
+      const reservation = matches[0]!;
+      if (
+        !['signed', 'pending', 'uncertain', 'settled'].includes(
+          reservation.state,
+        )
+      ) {
+        return snapshotResult(
+          snapshot,
+          denial(
+            'RESERVATION_STATE_INVALID',
+            `Reservation cannot transition from ${reservation.state} to settled.`,
+            { policyId: reservation.policyId },
+          ),
+        );
+      }
+      if (reservation.state === 'settled') {
+        return snapshotResult(snapshot, allowed(clone(reservation)));
+      }
+      const next = clone(snapshot);
+      const updated = next.reservations[reservation.id]!;
+      updated.state = 'settled';
+      updated.updatedAt = now.toISOString();
+      return snapshotResult(next, allowed(clone(updated)));
+    });
   }
 
   /**

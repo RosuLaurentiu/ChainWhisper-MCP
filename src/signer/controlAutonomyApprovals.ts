@@ -9,6 +9,12 @@ import type {
 import { ConfirmationGate } from './confirmation.js';
 import { SignerError } from './errors.js';
 import type { Address, ConfirmationRequest } from './types.js';
+import {
+  policyAmountDisplay,
+  policyAssetMetadata,
+  policyDuration,
+  policyPriceDisplay,
+} from './autonomyPresentation.js';
 
 const ZERO_ADDRESS =
   '0x0000000000000000000000000000000000000000' as Address;
@@ -16,18 +22,144 @@ const ZERO_ADDRESS =
 const safeId = (prefix: string, hash: string): string =>
   `${prefix}-${hash.slice(2, 18)}`;
 
+const privateAmountAuthority = (
+  enabled: boolean,
+): string =>
+  enabled
+    ? 'The agent may both choose private amounts and view policy-scoped private balances, hidden order inventory/progress, and participant receipts.'
+    : 'The agent may neither choose private amounts nor view policy-scoped private balances, hidden order inventory/progress, or participant receipts under this policy.';
+
+type PolicyDetail = { label: string; value: string };
+
+const localTime = (iso: string): string =>
+  `${new Date(iso).toLocaleString()} (local time)`;
+
+const amountDisplay = (
+  manifestHash: string,
+  asset: string,
+  amount: string,
+): string => {
+  const metadata = policyAssetMetadata(manifestHash, asset);
+  const display = policyAmountDisplay(amount, metadata);
+  return display === undefined
+    ? `${amount} atomic units ${asset}`
+    : `${display} ${metadata?.symbol ?? asset}`;
+};
+
+const amountEditor = (
+  manifestHash: string,
+  entry: { asset: string; amount: string },
+) => {
+  const metadata = policyAssetMetadata(manifestHash, entry.asset);
+  const displayAmount = policyAmountDisplay(entry.amount, metadata);
+  return {
+    ...entry,
+    ...(metadata
+      ? {
+          symbol: metadata.symbol,
+          decimals: metadata.decimals,
+          ...(displayAmount === undefined ? {} : { displayAmount }),
+        }
+      : {}),
+  };
+};
+
+const priceBandEditor = (
+  manifestHash: string,
+  band: Extract<
+    AutonomyPolicyProposalV1,
+    { mode: 'bounded' }
+  >['limits']['priceBands'][number],
+) => {
+  const sell = policyAssetMetadata(manifestHash, band.sellAsset);
+  const buy = policyAssetMetadata(manifestHash, band.buyAsset);
+  return {
+    sellAsset: band.sellAsset,
+    buyAsset: band.buyAsset,
+    minimumNumerator: band.minimumBuyPerSellNumerator,
+    minimumDenominator: band.minimumBuyPerSellDenominator,
+    maximumNumerator: band.maximumBuyPerSellNumerator,
+    maximumDenominator: band.maximumBuyPerSellDenominator,
+    ...(sell
+      ? { sellSymbol: sell.symbol, sellDecimals: sell.decimals }
+      : {}),
+    ...(buy ? { buySymbol: buy.symbol, buyDecimals: buy.decimals } : {}),
+    minimumDisplay: policyPriceDisplay(
+      band.minimumBuyPerSellNumerator,
+      band.minimumBuyPerSellDenominator,
+      sell?.decimals,
+      buy?.decimals,
+    ),
+    maximumDisplay: policyPriceDisplay(
+      band.maximumBuyPerSellNumerator,
+      band.maximumBuyPerSellDenominator,
+      sell?.decimals,
+      buy?.decimals,
+    ),
+  };
+};
+
+const boundedScopeDetails = (
+  proposal: Extract<AutonomyPolicyProposalV1, { mode: 'bounded' }>,
+): PolicyDetail[] => [
+  {
+    label: 'Allowed actions',
+    value: proposal.scope.allowedActions.join(', ') || 'None',
+  },
+  {
+    label: 'Allowed assets',
+    value: proposal.scope.allowedAssets.join(', ') || 'None',
+  },
+  {
+    label: 'Allowed pairs',
+    value:
+      proposal.scope.allowedPairs
+        .map(({ sellAsset, buyAsset }) => `${sellAsset} -> ${buyAsset}`)
+        .join(', ') || 'None',
+  },
+  {
+    label: 'Allowed order types',
+    value: proposal.scope.allowedOrderTypes.join(', ') || 'None',
+  },
+  {
+    label: 'Allowed counterparties',
+    value: proposal.scope.allowedCounterparties.join(', ') || 'None',
+  },
+  {
+    label: 'Allowed Privacy Portal routes',
+    value:
+      proposal.scope.allowedBridgeRoutes
+        .map(({ pair, direction }) => `${pair}: ${direction.replaceAll('-', ' ')}`)
+        .join(', ') || 'None',
+  },
+  {
+    label: 'Private messaging',
+    value: proposal.scope.messaging.enabled
+      ? `Enabled only for: ${
+          proposal.scope.messaging.counterparties.join(', ') || 'None'
+        }`
+      : 'Disabled',
+  },
+];
+
 const policyDetails = (
   proposal: AutonomyPolicyProposalV1,
-): Array<{ label: string; value: string }> => {
+): PolicyDetail[] => {
   const common = [
     { label: 'Mode', value: proposal.mode },
-    { label: 'Starts', value: proposal.startsAt },
-    { label: 'Expires', value: proposal.expiresAt },
+    { label: 'Starts', value: localTime(proposal.startsAt) },
+    { label: 'Expires', value: localTime(proposal.expiresAt) },
     {
-      label: 'Agent-visible private amounts',
-      value: proposal.agentVisiblePrivateAmounts ? 'Allowed' : 'Not allowed',
+      label: 'Duration',
+      value: policyDuration(proposal.startsAt, proposal.expiresAt),
     },
-    { label: 'Runtime manifest', value: proposal.manifestHash },
+    {
+      label: 'Private amount choice and policy-scoped state viewing',
+      value: privateAmountAuthority(
+        proposal.agentVisiblePrivateAmounts,
+      ),
+    },
+    { label: 'Runtime manifest digest', value: proposal.manifestHash },
   ];
   if (proposal.mode === 'full') {
     return [
@@ -46,25 +178,96 @@ const policyDetails = (
   }
   return [
     ...common,
+    ...boundedScopeDetails(proposal),
     {
-      label: 'Allowed actions',
-      value: proposal.scope.allowedActions.join(', ') || 'None',
+      label: 'Per-action asset budgets',
+      value:
+        proposal.limits.perActionSpend
+          .map(({ asset, amount }) =>
+            amountDisplay(proposal.manifestHash, asset, amount),
+          )
+          .join(', ') || 'None',
     },
     {
-      label: 'Allowed assets',
-      value: proposal.scope.allowedAssets.join(', ') || 'None',
+      label: 'Cumulative asset budgets',
+      value:
+        proposal.limits.cumulativeSpend
+          .map(({ asset, amount }) =>
+            amountDisplay(proposal.manifestHash, asset, amount),
+          )
+          .join(', ') || 'None',
     },
     {
-      label: 'Allowed order types',
-      value: proposal.scope.allowedOrderTypes.join(', ') || 'None',
+      label: 'Allowed price bands',
+      value:
+        proposal.limits.priceBands
+          .map((band) => {
+            const display = priceBandEditor(proposal.manifestHash, band);
+            const unit =
+              display.sellSymbol && display.buySymbol
+                ? `${display.buySymbol} per ${display.sellSymbol}`
+                : `atomic ${band.buyAsset} per atomic ${band.sellAsset}`;
+            return `${display.minimumDisplay ?? 'Unavailable'} – ${
+              display.maximumDisplay ?? 'Unavailable'
+            } ${unit}`;
+          })
+          .join(', ') || 'None',
     },
     {
       label: 'Maximum actions / messages',
       value: `${proposal.limits.maximumActions} / ${proposal.limits.maximumMessages}`,
     },
     {
+      label: 'Maximum native value',
+      value: `${amountDisplay(
+        proposal.manifestHash,
+        'native',
+        proposal.limits.maximumNativeValuePerAction,
+      )} per action; ${amountDisplay(
+        proposal.manifestHash,
+        'native',
+        proposal.limits.maximumNativeValueCumulative,
+      )} cumulative`,
+    },
+    {
       label: 'Maximum network fees',
+      value: `${amountDisplay(
+        proposal.manifestHash,
+        'native',
+        proposal.limits.maximumNetworkFeePerAction,
+      )} per action; ${amountDisplay(
+        proposal.manifestHash,
+        'native',
+        proposal.limits.maximumNetworkFeeCumulative,
+      )} cumulative`,
+    },
+    {
+      label: 'Exact atomic per-action budgets',
+      value:
+        proposal.limits.perActionSpend
+          .map(({ asset, amount }) => `${amount} ${asset}`)
+          .join(', ') || 'None',
+    },
+    {
+      label: 'Exact atomic cumulative budgets',
+      value:
+        proposal.limits.cumulativeSpend
+          .map(({ asset, amount }) => `${amount} ${asset}`)
+          .join(', ') || 'None',
+    },
+    {
+      label: 'Exact atomic network fee limits',
       value: `${proposal.limits.maximumNetworkFeePerAction} wei per action; ${proposal.limits.maximumNetworkFeeCumulative} wei cumulative`,
+    },
+    {
+      label: 'Exact atomic price bands',
+      value:
+        proposal.limits.priceBands
+          .map(
+            (band) =>
+              `${band.minimumBuyPerSellNumerator}/${band.minimumBuyPerSellDenominator} – ${band.maximumBuyPerSellNumerator}/${band.maximumBuyPerSellDenominator} atomic ${band.buyAsset} per atomic ${band.sellAsset}`,
+          )
+          .join(', ') || 'None',
     },
   ];
 };
@@ -100,7 +303,8 @@ const confirmationForPolicy = (
     amounts:
       proposal.mode === 'bounded'
         ? proposal.limits.cumulativeSpend.map(
-            ({ asset, amount }) => `${amount} base units ${asset}`,
+            ({ asset, amount }) =>
+              amountDisplay(proposal.manifestHash, asset, amount),
           )
         : [],
     details: policyDetails(proposal),
@@ -110,11 +314,11 @@ const confirmationForPolicy = (
     nativeValue: '0',
     gasCap: '0',
     expectedResult:
-      'The signer stores a wallet-bound local autonomy policy. Every later action must still match the audited runtime and the exact policy.',
+      `The signer stores a wallet-bound local autonomy policy. Every later action must still match the audited runtime and the exact policy. ${privateAmountAuthority(proposal.agentVisiblePrivateAmounts)}`,
     summary:
       proposal.mode === 'full'
-        ? 'Allow this dedicated Agent Wallet to perform all audited ChainWhisper economic actions for no more than 24 hours.'
-        : 'Allow only the displayed actions, assets, pairs, counterparties, limits, and duration.',
+        ? `Allow this dedicated Agent Wallet to perform all audited ChainWhisper economic actions for no more than 24 hours. ${privateAmountAuthority(proposal.agentVisiblePrivateAmounts)}`
+        : `Allow only the displayed actions, assets, pairs, counterparties, limits, and duration. ${privateAmountAuthority(proposal.agentVisiblePrivateAmounts)}`,
     authorizationScope: 'complete-logical-action',
     actionButtonLabel:
       proposal.mode === 'full'
@@ -123,16 +327,22 @@ const confirmationForPolicy = (
     maximumNetworkFeeWei: '0',
     maximumNetworkFeeCoti: '0',
     autonomyEditor: {
+      startsAt: proposal.startsAt,
       expiresAt: proposal.expiresAt,
+      duration: policyDuration(proposal.startsAt, proposal.expiresAt),
       agentVisiblePrivateAmounts:
         proposal.agentVisiblePrivateAmounts,
       perActionSpend:
         proposal.mode === 'bounded'
-          ? proposal.limits.perActionSpend.map((entry) => ({ ...entry }))
+          ? proposal.limits.perActionSpend.map((entry) =>
+              amountEditor(proposal.manifestHash, entry),
+            )
           : [],
       cumulativeSpend:
         proposal.mode === 'bounded'
-          ? proposal.limits.cumulativeSpend.map((entry) => ({ ...entry }))
+          ? proposal.limits.cumulativeSpend.map((entry) =>
+              amountEditor(proposal.manifestHash, entry),
+            )
           : [],
       ...(proposal.mode === 'bounded'
         ? {
@@ -146,18 +356,9 @@ const confirmationForPolicy = (
               proposal.limits.maximumNetworkFeeCumulative,
             maximumActions: proposal.limits.maximumActions,
             maximumMessages: proposal.limits.maximumMessages,
-            priceBands: proposal.limits.priceBands.map((band) => ({
-              sellAsset: band.sellAsset,
-              buyAsset: band.buyAsset,
-              minimumNumerator:
-                band.minimumBuyPerSellNumerator,
-              minimumDenominator:
-                band.minimumBuyPerSellDenominator,
-              maximumNumerator:
-                band.maximumBuyPerSellNumerator,
-              maximumDenominator:
-                band.maximumBuyPerSellDenominator,
-            })),
+            priceBands: proposal.limits.priceBands.map((band) =>
+              priceBandEditor(proposal.manifestHash, band),
+            ),
           }
         : { priceBands: [] }),
     },
@@ -165,7 +366,7 @@ const confirmationForPolicy = (
       ? {
           acknowledgements: [
             'I am using a dedicated, minimally funded Agent Wallet and understand the beta trusts this local host.',
-            'I understand full autonomy covers only the audited ChainWhisper economic surface and lasts no more than 24 hours.',
+            'I understand full autonomy covers only the audited ChainWhisper economic surface and lasts no more than 24 hours. If agentVisiblePrivateAmounts remains enabled, the agent may both choose private amounts and view policy-scoped private balances, hidden order inventory/progress, and participant receipts.',
           ],
         }
       : {}),
@@ -255,7 +456,27 @@ const lifecycleConfirmation = (
     details: [
       { label: 'Policy id', value: policy.id },
       { label: 'Policy mode', value: policy.mode },
-      { label: 'Expires', value: policy.expiresAt },
+      { label: 'Expires', value: localTime(policy.expiresAt) },
+      {
+        label: 'Private amount choice and policy-scoped state viewing',
+        value: privateAmountAuthority(
+          policy.agentVisiblePrivateAmounts,
+        ),
+      },
+      ...(policy.mode === 'bounded'
+        ? boundedScopeDetails(policy)
+        : [
+            {
+              label: 'Allowed surface',
+              value:
+                'Audited ChainWhisper orders, recurring actions, Privacy Portal transactions, and private messaging only',
+            },
+            {
+              label: 'Still forbidden',
+              value:
+                'Arbitrary calldata/transfers, unknown contracts, administration, wallet replacement, onboarding, token setup, policy changes, and secret deletion',
+            },
+          ]),
       { label: 'Exact terms digest', value: policy.termsDigest },
     ],
     counterparty: null,
@@ -265,12 +486,20 @@ const lifecycleConfirmation = (
     gasCap: '0',
     expectedResult:
       action === 'resume'
-        ? 'Matching autonomous actions may continue under the unchanged policy.'
-        : 'The policy is permanently revoked. Pending signed transactions remain reserved for recovery.',
+        ? `Matching autonomous actions may continue under the unchanged policy. ${privateAmountAuthority(policy.agentVisiblePrivateAmounts)}`
+        : `The policy is permanently revoked. Pending signed transactions remain reserved for recovery. ${
+            policy.agentVisiblePrivateAmounts
+              ? 'Revocation also removes the policy authority that let the agent both choose private amounts and view policy-scoped private balances, hidden order inventory/progress, and participant receipts.'
+              : privateAmountAuthority(false)
+          }`,
     summary:
       action === 'resume'
-        ? 'Resume the unchanged local autonomy policy.'
-        : 'Permanently revoke this local autonomy policy.',
+        ? `Resume the unchanged local autonomy policy. ${privateAmountAuthority(policy.agentVisiblePrivateAmounts)}`
+        : `Permanently revoke this local autonomy policy. ${
+            policy.agentVisiblePrivateAmounts
+              ? 'This removes the agent authority to both choose private amounts and view policy-scoped private balances, hidden order inventory/progress, and participant receipts.'
+              : privateAmountAuthority(false)
+          }`,
     authorizationScope: 'complete-logical-action',
     actionButtonLabel:
       action === 'resume' ? 'Resume autonomy' : 'Revoke policy',

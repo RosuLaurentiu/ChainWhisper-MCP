@@ -222,5 +222,45 @@ describe('public beta confirmation clarity', () => {
     expect(message).toContain('Exact transaction terms:');
     expect(message).toContain('- You send: 1.25 p.WISP');
     expect(message).toContain('- You receive: 2.5 p.COTI');
+    expect(confirmation.fee).toBe(
+      '1 COTI (1000000000000000000 wei)',
+    );
+  });
+
+  it('formats the signed Privacy Portal fee in COTI and wei', () => {
+    const envelope = {
+      operationId: 'portal-fee-confirmation',
+      operationHash: `0x${'55'.repeat(32)}` as HexString,
+      wallet: WALLET,
+      summary: 'Convert through the Privacy Portal.',
+      fee: {
+        amount: '0',
+        asset: 'native',
+        recipient: CONTRACT,
+      },
+      intent: {
+        action: 'privacy_bridge',
+        sellAsset: { symbol: 'WISP' },
+        buyAsset: { symbol: 'p.WISP' },
+        sellAmount: '1',
+        buyAmount: '1',
+        recipient: null,
+        metadata: { portalFeeAtomic: '9' },
+      },
+      steps: [],
+    } as unknown as SignedActionEnvelopeV1;
+    const step = {
+      id: 'privacy-portal-deposit',
+      kind: 'protocol',
+      to: CONTRACT,
+      data: '0x12345678' as HexString,
+      value: '9',
+      gasCap: '8000000',
+      summary: 'Convert through the Privacy Portal.',
+    } satisfies MaterializedActionStep;
+
+    expect(buildActionConfirmation(envelope, step, 0).fee).toBe(
+      '0.000000000000000009 COTI (9 wei); Privacy Portal fee',
+    );
   });
 });

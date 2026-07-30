@@ -26,6 +26,8 @@ const WALLET = '0x1111111111111111111111111111111111111111';
 const COUNTERPARTY = '0x2222222222222222222222222222222222222222';
 const MANIFEST = `0x${'ab'.repeat(32)}` as const;
 const NOW = new Date('2026-07-29T12:00:00.000Z');
+const PRIVATE_AMOUNT_AUTHORITY_ENABLED =
+  'The agent may both choose private amounts and view policy-scoped private balances, hidden order inventory/progress, and participant receipts.';
 const hash = (character: string) =>
   `0x${character.repeat(64)}` as `0x${string}`;
 
@@ -188,6 +190,7 @@ const fillExposure = (
   messageCount: 0,
   nativeValue: '1',
   maximumNetworkFee: '2',
+  boundedRiskComplete: true,
   agentProvidedPrivateAmounts: true,
   stepDigests: [hash('c'), hash('d')],
   ...changes,
@@ -358,12 +361,129 @@ describe('autonomy policy core', () => {
       ),
     ).toEqual({ 'p.coti': '18', 'p.wisp': '90' });
     expect(elicitor.requests).toHaveLength(1);
-    expect(elicitor.requests[0]?.autonomyEditor).toMatchObject({
+    const activationRequest = elicitor.requests[0]!;
+    expect(activationRequest.autonomyEditor).toMatchObject({
       expiresAt: requested.expiresAt,
       agentVisiblePrivateAmounts: true,
       maximumActions: 4,
       maximumMessages: 2,
     });
+    expect(activationRequest.details).toContainEqual({
+      label: 'Private amount choice and policy-scoped state viewing',
+      value: PRIVATE_AMOUNT_AUTHORITY_ENABLED,
+    });
+    expect(activationRequest.details).toEqual(
+      expect.arrayContaining([
+        {
+          label: 'Allowed pairs',
+          value: 'p.wisp -> p.coti',
+        },
+        {
+          label: 'Allowed counterparties',
+          value: COUNTERPARTY,
+        },
+        {
+          label: 'Allowed Privacy Portal routes',
+          value: 'wisp: private to public',
+        },
+        {
+          label: 'Private messaging',
+          value: `Enabled only for: ${COUNTERPARTY}`,
+        },
+      ]),
+    );
+    expect(activationRequest.summary).toContain(
+      PRIVATE_AMOUNT_AUTHORITY_ENABLED,
+    );
+    expect(activationRequest.expectedResult).toContain(
+      PRIVATE_AMOUNT_AUTHORITY_ENABLED,
+    );
+  });
+
+  it('spells out the combined private authority in resume and revocation confirmations', async () => {
+    const { manager } = setup();
+    const activated = await manager.activate(boundedProposal());
+    if (!activated.allowed) throw new Error(activated.denial.code);
+
+    const elicitor = new ValuesElicitor({});
+    const approvals = new ControlPageAutonomyApprovals(
+      new ConfirmationGate(elicitor, 5_000),
+    );
+    await expect(
+      approvals.approveResume({ policies: [activated.value] }),
+    ).resolves.toBe(true);
+    await expect(
+      approvals.approveRevocation({ policy: activated.value }),
+    ).resolves.toBe(true);
+
+    expect(elicitor.requests).toHaveLength(2);
+    for (const request of elicitor.requests) {
+      expect(request.details).toContainEqual({
+        label: 'Private amount choice and policy-scoped state viewing',
+        value: PRIVATE_AMOUNT_AUTHORITY_ENABLED,
+      });
+      expect(request.details).toEqual(
+        expect.arrayContaining([
+          {
+            label: 'Allowed pairs',
+            value: 'p.wisp -> p.coti',
+          },
+          {
+            label: 'Allowed counterparties',
+            value: COUNTERPARTY,
+          },
+          {
+            label: 'Allowed Privacy Portal routes',
+            value: 'wisp: private to public',
+          },
+          {
+            label: 'Private messaging',
+            value: `Enabled only for: ${COUNTERPARTY}`,
+          },
+        ]),
+      );
+      expect(request.summary).toContain(
+        'both choose private amounts and view policy-scoped private balances, hidden order inventory/progress, and participant receipts',
+      );
+      expect(request.expectedResult).toContain(
+        'both choose private amounts and view policy-scoped private balances, hidden order inventory/progress, and participant receipts',
+      );
+    }
+  });
+
+  it('spells out the combined private authority in the full-autonomy acknowledgement', async () => {
+    const elicitor = new ValuesElicitor({
+      'autonomy.agentVisiblePrivateAmounts': 'true',
+    });
+    const approvals = new ControlPageAutonomyApprovals(
+      new ConfirmationGate(elicitor, 5_000),
+    );
+    const proposal: AutonomyPolicyProposalV1 = {
+      version: AUTONOMY_POLICY_VERSION,
+      mode: 'full',
+      wallet: WALLET,
+      chainId: 2_632_500,
+      manifestHash: MANIFEST,
+      startsAt: NOW.toISOString(),
+      expiresAt: new Date(
+        NOW.getTime() + 12 * 60 * 60 * 1_000,
+      ).toISOString(),
+      agentVisiblePrivateAmounts: true,
+      allowlistedEconomicSurface: true,
+    };
+
+    await expect(
+      approvals.approveActivation({ proposal }),
+    ).resolves.toMatchObject({
+      approved: true,
+      proposal: { agentVisiblePrivateAmounts: true },
+    });
+    expect(elicitor.requests).toHaveLength(1);
+    expect(elicitor.requests[0]?.acknowledgements).toContainEqual(
+      expect.stringContaining(
+        'both choose private amounts and view policy-scoped private balances, hidden order inventory/progress, and participant receipts',
+      ),
+    );
   });
 
   it.each([
@@ -472,6 +592,93 @@ describe('autonomy policy core', () => {
     });
   });
 
+  it('authorizes policy-scoped private state through the policy manager', async () => {
+    const { manager } = setup();
+    const activated = await manager.activate(boundedProposal());
+    expect(activated.allowed).toBe(true);
+    if (!activated.allowed) return;
+
+    const scope = {
+      wallet: WALLET,
+      chainId: 2_632_500,
+      manifestHash: MANIFEST,
+      assets: [
+        { aliases: ['p.WISP', '0x3333333333333333333333333333333333333333'] },
+        { aliases: ['p.COTI', '0x4444444444444444444444444444444444444444'] },
+      ],
+      pair: {
+        firstAliases: ['p.WISP'],
+        secondAliases: ['p.COTI'],
+        bidirectional: false,
+      },
+      orderType: 'one-off.private-liquidity.public' as const,
+      counterparties: [COUNTERPARTY],
+    };
+    await expect(
+      manager.authorizePrivateStateDisclosure(
+        activated.value.id,
+        scope,
+      ),
+    ).resolves.toMatchObject({
+      allowed: true,
+      value: { id: activated.value.id },
+    });
+    await expect(
+      manager.authorizePrivateStateDisclosure(
+        activated.value.id,
+        {
+          ...scope,
+          assets: [{ aliases: ['p.UNKNOWN'] }],
+        },
+      ),
+    ).resolves.toMatchObject({
+      allowed: false,
+      denial: {
+        code: 'ASSET_NOT_ALLOWED',
+        policyId: activated.value.id,
+      },
+    });
+  });
+
+  it('fails bounded autonomy closed when economic exposure cannot be derived', async () => {
+    const { manager, store } = setup();
+    const activated = await manager.activate(boundedProposal());
+    if (!activated.allowed) throw new Error(activated.denial.code);
+
+    await expect(
+      manager.reserve(
+        activated.value.id,
+        fillExposure('8', '0', {
+          boundedRiskComplete: false,
+          priceQuotes: [],
+          grossSpend: [],
+          minimumReceive: [],
+        }),
+      ),
+    ).resolves.toMatchObject({
+      allowed: false,
+      denial: {
+        code: 'ECONOMIC_EXPOSURE_INCOMPLETE',
+        field: 'boundedRiskComplete',
+      },
+    });
+    expect(store.snapshot.reservations).toEqual({});
+
+    await expect(
+      manager.reserve(
+        activated.value.id,
+        fillExposure('9', '0', {
+          grossSpend: [],
+          minimumReceive: [],
+        }),
+      ),
+    ).resolves.toMatchObject({
+      allowed: false,
+      denial: { code: 'INVALID_EXPOSURE', field: 'grossSpend' },
+    });
+    expect(store.snapshot.reservations).toEqual({});
+  });
+
   it('serializes concurrent reservations so cumulative spend cannot race', async () => {
     const { manager } = setup();
     const activated = await manager.activate(boundedProposal());
@@ -548,13 +755,53 @@ describe('autonomy policy core', () => {
     });
   });
 
+  it('settles a recovered reservation by its exact operation hash', async () => {
+    const { manager } = setup();
+    const activated = await manager.activate(boundedProposal());
+    expect(activated.allowed).toBe(true);
+    if (!activated.allowed) return;
+    const exposure = fillExposure('8');
+    const reserved = await manager.reserve(activated.value.id, exposure);
+    expect(reserved.allowed).toBe(true);
+    if (!reserved.allowed) return;
+    await manager.markSigned(reserved.value.id, hash('9'));
+    await manager.markPending(reserved.value.id);
+
+    await expect(
+      manager.settleByOperationHash(exposure.operationHash),
+    ).resolves.toMatchObject({
+      allowed: true,
+      value: {
+        id: reserved.value.id,
+        state: 'settled',
+      },
+    });
+  });
+
   it('pauses immediately and requires local approval to resume and revoke', async () => {
     const { approvals, manager } = setup();
     const activated = await manager.activate(boundedProposal());
     if (!activated.allowed) throw new Error(activated.denial.code);
+    const reservation = await manager.reserve(
+      activated.value.id,
+      fillExposure('1'),
+    );
+    if (!reservation.allowed) throw new Error(reservation.denial.code);
+    expect(
+      await manager.authorizeReservedWrite(reservation.value.id),
+    ).toMatchObject({
+      allowed: true,
+      value: { id: reservation.value.id, state: 'reserved' },
+    });
     await manager.pauseGlobal();
     expect(
-      await manager.reserve(activated.value.id, fillExposure('1')),
+      await manager.authorizeReservedWrite(reservation.value.id),
+    ).toMatchObject({
+      allowed: false,
+      denial: { code: 'GLOBAL_PAUSED' },
+    });
+    expect(
+      await manager.reserve(activated.value.id, fillExposure('2')),
     ).toMatchObject({
       allowed: false,
       denial: { code: 'GLOBAL_PAUSED' },
@@ -569,6 +816,9 @@ describe('autonomy policy core', () => {
       allowed: true,
       value: { globalPaused: false },
     });
+    expect(
+      await manager.authorizeReservedWrite(reservation.value.id),
+    ).toMatchObject({ allowed: true });
     approvals.revocation = true;
     expect(await manager.revoke(activated.value.id)).toMatchObject({
       allowed: true,

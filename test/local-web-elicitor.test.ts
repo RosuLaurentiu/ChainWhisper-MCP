@@ -12,6 +12,10 @@ import {
   type ConfirmationRequest,
   type WalletControlState,
 } from '../src/signer/index.js';
+import {
+  agentControlStateKey,
+  renderAgentControlPage,
+} from '../src/signer/localControlPage.js';
 
 const CONFIRMATION: ConfirmationRequest = {
   operationId: 'diagnostic',
@@ -22,14 +26,37 @@ const CONFIRMATION: ConfirmationRequest = {
   wallet: '0x1111111111111111111111111111111111111111',
   contract: '0x0000000000000000000000000000000000000000',
   action: 'create_recurring',
-  orderType: null,
+  orderType: {
+    id: 'recurring.private-liquidity.public',
+    cadence: 'recurring',
+    route: 'recurring-escrow',
+    access: 'public',
+    termsVisibility: 'hidden-liquidity',
+    assetPrivacy: 'fully-private',
+    relation: 'primary',
+  },
   orderTypeLabel: 'Recurring · private liquidity · public price',
   assets: ['p.WISP', 'p.COTI'],
   amounts: ['12.5 p.WISP', '25 p.COTI'],
   details: [
     { label: 'You send', value: '12.5 p.WISP' },
     { label: 'You receive', value: '25 p.COTI' },
+    { label: 'Buy price', value: '0.9 p.COTI per p.WISP' },
+    { label: 'Sell price', value: '1.1 p.COTI per p.WISP' },
+    { label: 'Market reference', value: '1 p.COTI per p.WISP · Carbon' },
+    { label: 'Reference timestamp', value: '2026-07-29T10:00:00Z' },
+    { label: 'Buy deviation', value: '-10%' },
+    { label: 'Sell deviation', value: '+10%' },
+    {
+      label: 'On-chain visibility',
+      value:
+        'Sell inventory and buy budget are encrypted. Buy and sell prices, addresses, and order activity are public.',
+    },
     { label: 'Maximum network fee', value: '0.08 COTI' },
+    {
+      label: 'Allowance spender',
+      value: '0x2222222222222222222222222222222222222222',
+    },
   ],
   counterparty: null,
   spender: '0x2222222222222222222222222222222222222222',
@@ -39,6 +66,9 @@ const CONFIRMATION: ConfirmationRequest = {
   expectedResult: 'A recurring order is created.',
   summary: 'Create a recurring private-liquidity order.',
 };
+
+const PRIVATE_AMOUNT_AUTHORITY_ENABLED =
+  'The agent may both choose private amounts and view policy-scoped private balances, hidden order inventory/progress, and participant receipts.';
 
 type HttpResult = {
   status: number;
@@ -172,13 +202,65 @@ describe('local Agent Control elicitor', () => {
           expect(csp).toContain("frame-ancestors 'none'");
           expect(csp).toContain("style-src 'nonce-");
           expect(csp).not.toContain("'unsafe-inline'");
-          expect(session.page.body).toContain('Create recurring order');
+          expect(session.page.body).toContain(
+            'Create recurring private-liquidity order',
+          );
+          expect(session.page.body).toContain(
+            'Private inventory · public prices',
+          );
+          expect(session.page.body).toContain(
+            'Sell inventory and buy budget are encrypted. Buy and sell prices, addresses, and order activity are public.',
+          );
           expect(session.page.body).toContain(
             'Recurring · private liquidity · public price',
           );
+          expect(session.page.body).toContain(
+            'Sell-side inventory · encrypted on-chain',
+          );
           expect(session.page.body).toContain('12.5 p.WISP');
           expect(session.page.body).toContain(
-            'Confirm complete recurring order',
+            'Buy-side budget · encrypted on-chain',
+          );
+          expect(session.page.body).toContain('25 p.COTI');
+          expect(session.page.body).toContain(
+            'reusable two-sided liquidity',
+          );
+          expect(session.page.body).toContain(
+            'It does not schedule automatic trades',
+          );
+          expect(session.page.body).toContain(
+            '0.9 p.COTI per p.WISP',
+          );
+          expect(session.page.body).toContain(
+            '1.1 p.COTI per p.WISP',
+          );
+          expect(session.page.body).toContain(
+            '1 p.COTI per p.WISP · Carbon',
+          );
+          expect(session.page.body).toContain(
+            '2026-07-29T10:00:00Z',
+          );
+          expect(session.page.body).toContain('-10%');
+          expect(session.page.body).toContain('+10%');
+          expect(session.page.body).toContain('Maximum network cost');
+          expect(
+            session.page.body.match(/Protocol fee/gu),
+          ).toHaveLength(1);
+          expect(session.page.body).toContain(
+            'Confirm complete order creation',
+          );
+          const beforeTechnical =
+            session.page.body.split(
+              '<summary>Technical details</summary>',
+            )[0] ?? '';
+          expect(beforeTechnical).not.toContain('Native value');
+          expect(beforeTechnical).not.toContain('Gas limit');
+          expect(beforeTechnical).not.toContain('Allowance spender');
+          expect(session.page.body).toContain(
+            '<summary>Technical details</summary>',
+          );
+          expect(session.page.body).not.toContain(
+            '<details open>',
           );
           expect(session.page.body).not.toContain('>Submit<');
           expect(session.page.body).not.toContain('type="checkbox"');
@@ -213,10 +295,15 @@ describe('local Agent Control elicitor', () => {
     });
     eliciters.push(elicitor);
 
-    await expect(
-      elicitor.requestConfirmation(CONFIRMATION, 5_000),
-    ).resolves.toEqual({ outcome: 'accepted' });
+    const confirmation = elicitor.requestConfirmation(
+      CONFIRMATION,
+      5_000,
+    );
+    await new Promise<void>((resolve) => setImmediate(resolve));
     await browserDone;
+    await expect(confirmation).resolves.toEqual({
+      outcome: 'accepted',
+    });
   });
 
   it('collects private values only through the authenticated local form', async () => {
@@ -227,7 +314,7 @@ describe('local Agent Control elicitor', () => {
           const session = await establishSession(url);
           expect(session.page.body).toContain('Enter private order values');
           expect(session.page.body).toContain(
-            'never sent through the agent conversation',
+            'To let the agent choose these trade values',
           );
           expect(session.page.body).toContain('inputmode="decimal"');
           const snapshot = await rawRequest(`${session.origin}/snapshot`, {
@@ -353,7 +440,7 @@ describe('local Agent Control elicitor', () => {
     await browserDone;
   });
 
-  it('rotates the only active browser session and returns no URL', async () => {
+  it('rotates an unconsumed bootstrap token and returns no URL', async () => {
     const bootstrapUrls: string[] = [];
     const elicitor = new LocalWebFormElicitor({
       openUrl: (url) => {
@@ -388,6 +475,177 @@ describe('local Agent Control elicitor', () => {
     expect(currentBootstrap.status).toBe(303);
   });
 
+  it('reports success only after the browser reaches Agent Control when arrival acknowledgement is required', async () => {
+    let browserSession:
+      | Promise<Awaited<ReturnType<typeof establishSession>>>
+      | undefined;
+    const elicitor = new LocalWebFormElicitor({
+      requireBrowserArrival: true,
+      browserArrivalTimeoutMs: 250,
+      openUrl: (url) => {
+        browserSession = establishSession(url);
+      },
+    });
+    eliciters.push(elicitor);
+
+    await expect(elicitor.openControlPanel()).resolves.toEqual({
+      opened: true,
+      ready: true,
+      activePrompt: false,
+    });
+    expect(browserSession).toBeDefined();
+    await browserSession;
+  });
+
+  it('coalesces concurrent opens and waits for the authenticated control page', async () => {
+    const openedUrls: string[] = [];
+    let resolveOpenedUrl!: (url: string) => void;
+    const openedUrl = new Promise<string>((resolve) => {
+      resolveOpenedUrl = resolve;
+    });
+    const elicitor = new LocalWebFormElicitor({
+      requireBrowserArrival: true,
+      browserArrivalTimeoutMs: 250,
+      openUrl: (url) => {
+        openedUrls.push(url);
+        resolveOpenedUrl(url);
+      },
+    });
+    eliciters.push(elicitor);
+
+    const first = elicitor.openControlPanel();
+    const second = elicitor.openControlPanel();
+    let settled = 0;
+    void first.then(() => {
+      settled += 1;
+    });
+    void second.then(() => {
+      settled += 1;
+    });
+
+    const bootstrapUrl = await openedUrl;
+    expect(openedUrls).toEqual([bootstrapUrl]);
+    const bootstrap = await rawRequest(bootstrapUrl, {
+      headers: {
+        'Sec-Fetch-Site': 'none',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Dest': 'document',
+      },
+    });
+    expect(bootstrap.status).toBe(303);
+    const cookie = header(bootstrap, 'set-cookie').split(';')[0] ?? '';
+    const origin = new URL(bootstrapUrl).origin;
+
+    expect(
+      (
+        await rawRequest(`${origin}/snapshot`, {
+          headers: { Cookie: cookie },
+        })
+      ).status,
+    ).toBe(200);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(settled).toBe(0);
+
+    expect(
+      (
+        await rawRequest(`${origin}/control`, {
+          headers: {
+            Cookie: cookie,
+            'Sec-Fetch-Site': 'same-origin',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Dest': 'document',
+          },
+        })
+      ).status,
+    ).toBe(200);
+    await expect(Promise.all([first, second])).resolves.toEqual([
+      {
+        opened: true,
+        ready: true,
+        activePrompt: false,
+      },
+      {
+        opened: true,
+        ready: true,
+        activePrompt: false,
+      },
+    ]);
+    expect(openedUrls).toHaveLength(1);
+  });
+
+  it('returns a retryable result when the browser command launches but no page arrives', async () => {
+    const openedUrls: string[] = [];
+    const elicitor = new LocalWebFormElicitor({
+      requireBrowserArrival: true,
+      browserArrivalTimeoutMs: 25,
+      openUrl: (url) => {
+        openedUrls.push(url);
+      },
+    });
+    eliciters.push(elicitor);
+
+    await expect(elicitor.openControlPanel()).resolves.toEqual({
+      opened: false,
+      ready: true,
+      activePrompt: false,
+      reason: 'browser-arrival-timeout',
+    });
+    expect(openedUrls).toHaveLength(1);
+    expect(openedUrls[0]).toMatch(/\/open\/[A-Za-z0-9_-]+$/u);
+  });
+
+  it('preserves a pending card when no browser page arrives', async () => {
+    const elicitor = new LocalWebFormElicitor({
+      requireBrowserArrival: true,
+      browserArrivalTimeoutMs: 20,
+      openUrl: () => undefined,
+    });
+    eliciters.push(elicitor);
+
+    const confirmation = elicitor.requestConfirmation(
+      CONFIRMATION,
+      5_000,
+    );
+    await new Promise<void>((resolve) => setTimeout(resolve, 30));
+    await expect(elicitor.openControlPanel()).resolves.toEqual({
+      opened: false,
+      ready: true,
+      activePrompt: true,
+      reason: 'browser-arrival-timeout',
+    });
+    await elicitor.close();
+    await expect(confirmation).resolves.toEqual({
+      outcome: 'cancelled',
+    });
+  });
+
+  it('opens the authenticated control route for an established session', async () => {
+    const openedUrls: string[] = [];
+    const elicitor = new LocalWebFormElicitor({
+      openUrl: (url) => {
+        openedUrls.push(url);
+      },
+    });
+    eliciters.push(elicitor);
+
+    await elicitor.openControlPanel();
+    const session = await establishSession(openedUrls[0] ?? '');
+    const snapshot = await rawRequest(`${session.origin}/snapshot`, {
+      headers: { Cookie: session.cookie },
+    });
+    expect(snapshot.status).toBe(200);
+
+    await expect(elicitor.openControlPanel()).resolves.toEqual({
+      opened: true,
+      ready: true,
+      activePrompt: false,
+    });
+    expect(openedUrls).toEqual([
+      expect.stringMatching(/\/open\/[A-Za-z0-9_-]+$/u),
+      `${session.origin}/control`,
+    ]);
+  });
+
   it('renders local Agent Wallet setup while redacting generated keys from snapshots', async () => {
     let bootstrapUrl = '';
     const generatedKey = `0x${'ab'.repeat(32)}`;
@@ -418,6 +676,9 @@ describe('local Agent Control elicitor', () => {
     const session = await establishSession(bootstrapUrl);
     expect(session.page.body).toContain('Use existing wallet');
     expect(session.page.body).toContain('Create new wallet');
+    expect(session.page.body).toMatch(
+      /name="environmentFilePath"[^>]*readonly/u,
+    );
     expect(session.page.body).toContain('Copy private key');
     expect(session.page.body).toContain(generatedKey);
     expect(session.page.body).not.toContain(
@@ -430,6 +691,173 @@ describe('local Agent Control elicitor', () => {
     expect(snapshot.status).toBe(200);
     expect(snapshot.body).not.toContain(generatedKey);
     expect(snapshot.body).toContain('"privateKey":"[redacted]"');
+  });
+
+  it('renders contextual token setup with inline recovery and exact discard controls', async () => {
+    let bootstrapUrl = '';
+    const operationHash = `0x${'44'.repeat(32)}`;
+    const diagnosticSecret = `0x${'de'.repeat(32)}`;
+    const submitted: Array<{
+      action: string;
+      fields: Readonly<Record<string, string>>;
+    }> = [];
+    const elicitor = new LocalWebFormElicitor({
+      openUrl: (url) => {
+        bootstrapUrl = url;
+      },
+      getControlSummary: () => ({
+        wallet: '0x1111111111111111111111111111111111111111',
+        network: 'COTI Mainnet',
+        balance: '1 COTI',
+        privacyStatus: 'ready',
+        signerStatus: 'ready',
+        autonomy: { mode: 'manual' },
+        pendingOperations: 1,
+        recentOperations: [
+          {
+            label: 'Create recurring private-liquidity order',
+            status: 'needs_confirmation',
+            transactionUrl:
+              'https://mainnet.cotiscan.io/tx/0x1234',
+            operationId: 'order-1',
+            operationHash,
+            recoverable: true,
+            discardable: true,
+            setupAssets: ['p.WISP'],
+          },
+        ],
+        diagnostics: [
+          {
+            label: 'Unsafe test diagnostic',
+            value: `private key ${diagnosticSecret}`,
+          },
+        ],
+        controlActions: {
+          enablePrivateToken: true,
+        },
+      }),
+      onControlAction: (action, fields) => {
+        submitted.push({ action, fields });
+        return { ok: true, message: 'Local action accepted.' };
+      },
+    });
+    eliciters.push(elicitor);
+
+    await elicitor.openControlPanel();
+    const session = await establishSession(bootstrapUrl);
+    expect(session.page.body).toContain('Prepare p.WISP');
+    expect(session.page.body).toContain('name="token"');
+    expect(session.page.body).toContain('p.WISP');
+    expect(session.page.body).not.toContain('Choose a token');
+    expect(session.page.body).toContain(
+      '<strong>Create recurring private-liquidity order</strong>',
+    );
+    expect(session.page.body).toContain('<small>Needs Confirmation</small>');
+    expect(session.page.body).not.toContain('<strong>order-1</strong>');
+    expect(session.page.body).toContain(
+      'href="https://mainnet.cotiscan.io/tx/0x1234"',
+    );
+    expect(session.page.body).toContain('View transaction');
+    expect(session.page.body).toContain('Reconcile');
+    expect(session.page.body).toContain('name="operationId"');
+    expect(session.page.body).toContain('Discard local data');
+    expect(session.page.body).toContain('name="operationHash"');
+    expect(session.page.body).toContain(operationHash);
+
+    const snapshot = await rawRequest(`${session.origin}/snapshot`, {
+      headers: { Cookie: session.cookie },
+    });
+    expect(snapshot.status).toBe(200);
+    expect(snapshot.body).not.toContain(diagnosticSecret);
+    expect(snapshot.body).toContain('"value":"[redacted]"');
+    expect(snapshot.body).toContain(operationHash);
+
+    const missingToken = await submit(
+      session,
+      new URLSearchParams({
+        csrf: hiddenValue(session.page.body, 'csrf'),
+        intent: 'control',
+        action: 'enable-private-token',
+      }),
+    );
+    expect(missingToken.status).toBe(400);
+    expect(submitted).toHaveLength(0);
+
+    const extraSecret = `0x${'ab'.repeat(32)}`;
+    const tokenSetup = await submit(
+      session,
+      new URLSearchParams({
+        csrf: hiddenValue(missingToken.body, 'csrf'),
+        intent: 'control',
+        action: 'enable-private-token',
+        token: ' p.WISP ',
+        privateKey: extraSecret,
+      }),
+    );
+    expect(tokenSetup.status).toBe(200);
+    expect(tokenSetup.body).not.toContain(extraSecret);
+    expect(submitted.at(-1)).toEqual({
+      action: 'enable-private-token',
+      fields: { token: 'p.WISP' },
+    });
+
+    const invalidRecovery = await submit(
+      session,
+      new URLSearchParams({
+        csrf: hiddenValue(tokenSetup.body, 'csrf'),
+        intent: 'control',
+        action: 'recover-operation',
+        operationId: '../order-1',
+      }),
+    );
+    expect(invalidRecovery.status).toBe(400);
+    expect(submitted).toHaveLength(1);
+
+    const recovery = await submit(
+      session,
+      new URLSearchParams({
+        csrf: hiddenValue(invalidRecovery.body, 'csrf'),
+        intent: 'control',
+        action: 'recover-operation',
+        operationId: 'order-1',
+      }),
+    );
+    expect(recovery.status).toBe(200);
+    expect(submitted.at(-1)).toEqual({
+      action: 'recover-operation',
+      fields: { operationId: 'order-1' },
+    });
+
+    const invalidDiscard = await submit(
+      session,
+      new URLSearchParams({
+        csrf: hiddenValue(recovery.body, 'csrf'),
+        intent: 'control',
+        action: 'discard-operation',
+        operationId: 'order-1',
+        operationHash: '0x1234',
+      }),
+    );
+    expect(invalidDiscard.status).toBe(400);
+    expect(submitted).toHaveLength(2);
+
+    const discardBody = new URLSearchParams({
+      csrf: hiddenValue(invalidDiscard.body, 'csrf'),
+      intent: 'control',
+      action: 'discard-operation',
+      operationId: 'order-1',
+      operationHash,
+    });
+    const discard = await submit(session, discardBody);
+    expect(discard.status).toBe(200);
+    expect(submitted.at(-1)).toEqual({
+      action: 'discard-operation',
+      fields: { operationId: 'order-1', operationHash },
+    });
+
+    const replay = await submit(session, discardBody);
+    expect(replay.status).toBe(403);
+    expect(submitted).toHaveLength(3);
   });
 
   it('imports an Agent Wallet through authenticated Agent Control and requires restart', async () => {
@@ -561,6 +989,122 @@ describe('local Agent Control elicitor', () => {
     await browserDone;
   });
 
+  it('accepts human token, COTI, price, and local-time policy limits while returning exact atomic values', async () => {
+    let browserDone: Promise<void> = Promise.resolve();
+    const elicitor = new LocalWebFormElicitor({
+      openUrl: (url) => {
+        browserDone = (async () => {
+          const session = await establishSession(url);
+          expect(session.page.body).toContain('Ends (local time)');
+          expect(session.page.body).toContain('10');
+          expect(session.page.body).toContain(
+            'Maximum network cost per action (COTI)',
+          );
+          expect(session.page.body).toContain('p.COTI per p.WISP');
+          expect(session.page.body).not.toContain('p.WISP base units');
+          const accepted = await submit(
+            session,
+            new URLSearchParams({
+              csrf: hiddenValue(session.page.body, 'csrf'),
+              promptId: hiddenValue(session.page.body, 'promptId'),
+              intent: 'prompt',
+              action: 'confirm',
+              'autonomy.expiresAt': '2026-08-01T12:00',
+              'autonomy.agentVisiblePrivateAmounts': 'true',
+              'autonomy.perAction.0': '5',
+              'autonomy.cumulative.0': '9',
+              'autonomy.maximumNativeValuePerAction': '0',
+              'autonomy.maximumNativeValueCumulative': '0',
+              'autonomy.maximumNetworkFeePerAction': '0.01',
+              'autonomy.maximumNetworkFeeCumulative': '0.02',
+              'autonomy.maximumActions': '4',
+              'autonomy.maximumMessages': '2',
+              'autonomy.price.0.minimum': '0.95',
+              'autonomy.price.0.maximum': '1.05',
+            }),
+          );
+          expect(accepted.status).toBe(200);
+        })();
+        return browserDone;
+      },
+    });
+    eliciters.push(elicitor);
+
+    const result = await elicitor.requestConfirmation(
+      {
+        ...CONFIRMATION,
+        action: 'activate_bounded_autonomy',
+        autonomyEditor: {
+          startsAt: '2026-07-30T12:00:00.000Z',
+          expiresAt: '2026-08-01T12:00:00.000Z',
+          duration: '2 days',
+          agentVisiblePrivateAmounts: true,
+          perActionSpend: [
+            {
+              asset: 'p.wisp',
+              amount: '10000000000000000000',
+              symbol: 'p.WISP',
+              decimals: 18,
+              displayAmount: '10',
+            },
+          ],
+          cumulativeSpend: [
+            {
+              asset: 'p.wisp',
+              amount: '20000000000000000000',
+              symbol: 'p.WISP',
+              decimals: 18,
+              displayAmount: '20',
+            },
+          ],
+          maximumNativeValuePerAction: '0',
+          maximumNativeValueCumulative: '0',
+          maximumNetworkFeePerAction: '10000000000000000',
+          maximumNetworkFeeCumulative: '20000000000000000',
+          maximumActions: 5,
+          maximumMessages: 3,
+          priceBands: [
+            {
+              sellAsset: 'p.wisp',
+              buyAsset: 'p.coti',
+              minimumNumerator: '9',
+              minimumDenominator: '10',
+              maximumNumerator: '11',
+              maximumDenominator: '10',
+              sellSymbol: 'p.WISP',
+              buySymbol: 'p.COTI',
+              sellDecimals: 18,
+              buyDecimals: 18,
+              minimumDisplay: '0.9',
+              maximumDisplay: '1.1',
+            },
+          ],
+        },
+      },
+      5_000,
+    );
+
+    expect(result).toMatchObject({
+      outcome: 'accepted',
+      values: {
+        'autonomy.agentVisiblePrivateAmounts': 'true',
+        'autonomy.perAction.0': '5000000000000000000',
+        'autonomy.cumulative.0': '9000000000000000000',
+        'autonomy.maximumNativeValuePerAction': '0',
+        'autonomy.maximumNativeValueCumulative': '0',
+        'autonomy.maximumNetworkFeePerAction': '10000000000000000',
+        'autonomy.maximumNetworkFeeCumulative': '20000000000000000',
+        'autonomy.maximumActions': '4',
+        'autonomy.maximumMessages': '2',
+        'autonomy.price.0.minNumerator': '19',
+        'autonomy.price.0.minDenominator': '20',
+        'autonomy.price.0.maxNumerator': '21',
+        'autonomy.price.0.maxDenominator': '20',
+      },
+    });
+    await browserDone;
+  });
+
   it('enforces exact Host, Fetch Metadata, body, and rate limits', async () => {
     const bootstrapUrls: string[] = [];
     const elicitor = new LocalWebFormElicitor({
@@ -608,17 +1152,164 @@ describe('local Agent Control elicitor', () => {
     expect(header(limited, 'retry-after')).toBe('60');
   });
 
-  it('fails closed when the OS browser cannot be opened', async () => {
+  it('keeps pending confirmation available after browser failure and retries successfully', async () => {
+    let attempts = 0;
+    let retrySession:
+      | Awaited<ReturnType<typeof establishSession>>
+      | undefined;
+    let firstAttemptFinished!: () => void;
+    const firstAttempt = new Promise<void>((resolve) => {
+      firstAttemptFinished = resolve;
+    });
     const elicitor = new LocalWebFormElicitor({
-      openUrl: () => {
-        throw new Error('No desktop browser');
+      openUrl: async (url) => {
+        attempts += 1;
+        if (attempts === 1) {
+          firstAttemptFinished();
+          throw new Error('No desktop browser');
+        }
+        retrySession = await establishSession(url);
       },
     });
     eliciters.push(elicitor);
 
+    const confirmation = elicitor.requestConfirmation(
+      CONFIRMATION,
+      5_000,
+    );
+    await firstAttempt;
+    expect(elicitor.isSupported()).toBe(true);
+
+    await expect(elicitor.openControlPanel()).resolves.toEqual({
+      opened: true,
+      ready: true,
+      activePrompt: true,
+    });
+    expect(retrySession).toBeDefined();
+    if (!retrySession) throw new Error('Retry session was not opened.');
+    const session = retrySession;
+    const csrf = hiddenValue(session.page.body, 'csrf');
     await expect(
-      elicitor.requestConfirmation(CONFIRMATION, 5_000),
-    ).resolves.toEqual({ outcome: 'cancelled' });
-    expect(elicitor.isSupported()).toBe(false);
+      submit(
+        session,
+        new URLSearchParams({
+          csrf,
+          promptId: hiddenValue(session.page.body, 'promptId'),
+          intent: 'prompt',
+          action: 'confirm',
+        }).toString(),
+      ),
+    ).resolves.toMatchObject({ status: 200 });
+    await expect(confirmation).resolves.toEqual({
+      outcome: 'accepted',
+    });
+    expect(attempts).toBe(2);
+  });
+});
+
+describe('Agent Control state refresh key', () => {
+  it('renders the complete private authority in the policy editor and active summary', () => {
+    const activationPage = renderAgentControlPage(
+      {
+        csrfToken: 'csrf',
+        pending: {
+          id: 'activate-policy',
+          kind: 'confirmation',
+          request: {
+            ...CONFIRMATION,
+            action: 'activate_bounded_autonomy',
+            summary: PRIVATE_AMOUNT_AUTHORITY_ENABLED,
+            expectedResult: PRIVATE_AMOUNT_AUTHORITY_ENABLED,
+            details: [
+              {
+                label:
+                  'Private amount choice and policy-scoped state viewing',
+                value: PRIVATE_AMOUNT_AUTHORITY_ENABLED,
+              },
+            ],
+            autonomyEditor: {
+              expiresAt: '2026-08-05T12:00:00.000Z',
+              agentVisiblePrivateAmounts: true,
+              perActionSpend: [],
+              cumulativeSpend: [],
+              priceBands: [],
+            },
+          },
+        },
+        summary: { autonomy: { mode: 'manual' } },
+      },
+      'nonce',
+    );
+    expect(activationPage).toContain(
+      'Private amount choice and policy-scoped state viewing',
+    );
+    expect(activationPage).toContain(PRIVATE_AMOUNT_AUTHORITY_ENABLED);
+    expect(activationPage).toContain(
+      'Allow this agent to both choose private amounts and view policy-scoped private balances, hidden order inventory/progress, and participant receipts.',
+    );
+
+    const activeSummary = renderAgentControlPage(
+      {
+        csrfToken: 'csrf',
+        pending: null,
+        summary: {
+          autonomy: {
+            mode: 'bounded',
+            state: 'active',
+            agentVisiblePrivateAmounts: true,
+          },
+        },
+      },
+      'nonce',
+    );
+    expect(activeSummary).toContain(
+      'This policy lets the agent both choose private amounts and view policy-scoped private balances, hidden order inventory/progress, and participant receipts.',
+    );
+    expect(
+      agentControlStateKey({
+        pending: null,
+        summary: {
+          autonomy: {
+            mode: 'bounded',
+            state: 'active',
+            agentVisiblePrivateAmounts: true,
+          },
+        },
+      }),
+    ).not.toBe(
+      agentControlStateKey({
+        pending: null,
+        summary: {
+          autonomy: {
+            mode: 'bounded',
+            state: 'active',
+            agentVisiblePrivateAmounts: false,
+          },
+        },
+      }),
+    );
+  });
+
+  it('changes when a new operation has the same status', () => {
+    const base = {
+      pending: null,
+      summary: {
+        recentOperations: [
+          { label: 'Order 1', status: 'confirming' },
+        ],
+      },
+    };
+    const next = {
+      ...base,
+      summary: {
+        recentOperations: [
+          { label: 'Order 2', status: 'confirming' },
+        ],
+      },
+    };
+
+    expect(agentControlStateKey(base)).not.toBe(
+      agentControlStateKey(next),
+    );
   });
 });

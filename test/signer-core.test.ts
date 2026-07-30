@@ -3,10 +3,17 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { describe, expect, it } from 'vitest';
-import { encodeFunctionData, parseAbi } from 'viem';
+import {
+  encodeAbiParameters,
+  encodeEventTopics,
+  encodeFunctionData,
+  parseAbi,
+  parseAbiParameters,
+} from 'viem';
 
 import {
   finalizeActionEnvelope,
+  deriveOrderClassificationV1,
   signActionEnvelope,
   type HexString,
   type SignedActionEnvelopeV1,
@@ -23,9 +30,12 @@ import {
   StrictMaterializedIntentValidator,
   loadSignerConfig,
   type Address,
+  type AutonomyReservationV1,
   type ConfirmationRequest,
   type FormElicitor,
+  type MaterializedActionStep,
   type MaterializedIntentValidator,
+  type PolicyExposureV1,
   type RuntimeRegistryState,
   type RuntimeStateReader,
   type TransactionReceipt,
@@ -41,6 +51,9 @@ const REGISTRY_HASH = `0x${'44'.repeat(32)}` as HexString;
 const PAIRING = 'pairing-secret-that-is-longer-than-thirty-two-characters';
 const NOW = new Date('2026-07-27T12:05:00.000Z');
 const CANCEL_ABI = parseAbi(['function cancelTrade(uint256 tradeId)']);
+const TRADE_OPENED_ABI = parseAbi([
+  'event TradeOpened(uint256 indexed tradeId, address indexed maker, address indexed taker, bool isPublic, bytes32 accessHash, uint256 parentTradeId, uint64 createdAt, uint64 expiresAt, uint256 feePaid)',
+]);
 const CANCEL_DATA = encodeFunctionData({
   abi: CANCEL_ABI,
   functionName: 'cancelTrade',
@@ -151,6 +164,88 @@ const resignEnvelope = (
   );
 };
 
+const createStandardOrderEnvelope = (
+  operationId: string,
+): {
+  envelope: SignedActionEnvelopeV1;
+  orderType: ReturnType<typeof deriveOrderClassificationV1>;
+} => {
+  const orderType = deriveOrderClassificationV1({
+    route: 'standard-escrow',
+    access: 'public',
+    privateLiquidity: false,
+    assets: [{ kind: 'erc20' }, { kind: 'erc20' }],
+    relation: 'primary',
+  });
+  const base = createEnvelope(operationId);
+  return {
+    orderType,
+    envelope: resignEnvelope(base, {
+      registrySnapshot: {
+        ...base.registrySnapshot,
+        contracts: {
+          standardEscrow: {
+            address: CONTRACT,
+            bytecodeHash: REGISTRY_HASH,
+            selectors: {
+              createTradeWithPolicy: CANCEL_DATA.slice(
+                0,
+                10,
+              ) as HexString,
+            },
+          },
+        },
+      },
+      intent: {
+        action: 'create_trade',
+        orderType,
+        accessMode: 'public',
+        amountVisibility: 'visible',
+        sellAsset: {
+          kind: 'erc20',
+          reference: 'WISP',
+          address: CONTRACT,
+          symbol: 'WISP',
+          decimals: 6,
+        },
+        buyAsset: {
+          kind: 'native',
+          reference: 'COTI',
+          symbol: 'COTI',
+          decimals: 18,
+        },
+        sellAmount: '1',
+        buyAmount: '2',
+      },
+      fee: {
+        recipient: FEE_RECIPIENT,
+        amount: '7',
+        asset: 'native',
+      },
+      summary: 'Create a public order.',
+    }),
+  };
+};
+
+const tradeOpenedLog = (tradeId: bigint) => ({
+  address: CONTRACT,
+  topics: encodeEventTopics({
+    abi: TRADE_OPENED_ABI,
+    eventName: 'TradeOpened',
+    args: {
+      tradeId,
+      maker: WALLET,
+      taker: '0x0000000000000000000000000000000000000000',
+    },
+  }),
+  data: encodeAbiParameters(
+    parseAbiParameters(
+      'bool, bytes32, uint256, uint64, uint64, uint256',
+    ),
+    [true, `0x${'00'.repeat(32)}`, 0n, 1n, 2n, 7n],
+  ),
+});
+
 class TestRuntimeState implements RuntimeStateReader {
   reads = 0;
   state: RuntimeRegistryState = {
@@ -175,7 +270,7 @@ class TestElicitor implements FormElicitor {
 
   constructor(
     readonly supported = true,
-    readonly outcome: 'accepted' | 'declined' = 'accepted',
+    readonly outcome: 'accepted' | 'declined' | 'timeout' = 'accepted',
   ) {}
 
   isSupported(): boolean {
@@ -185,10 +280,48 @@ class TestElicitor implements FormElicitor {
   async requestConfirmation(
     request: ConfirmationRequest,
   ): Promise<
-    { outcome: 'accepted' } | { outcome: 'declined' }
+    | { outcome: 'accepted' }
+    | { outcome: 'declined' }
+    | { outcome: 'timeout' }
   > {
     this.requests.push(request);
     return { outcome: this.outcome };
+  }
+}
+
+class DeferredTestElicitor extends TestElicitor {
+  release: (() => void) | null = null;
+
+  override async requestConfirmation(
+    request: ConfirmationRequest,
+  ): Promise<{ outcome: 'accepted' }> {
+    this.requests.push(request);
+    await new Promise<void>((resolve) => {
+      this.release = resolve;
+    });
+    return { outcome: 'accepted' };
+  }
+}
+
+class BusyDeclinesElicitor extends TestElicitor {
+  concurrentDeclines = 0;
+  readonly releases: Array<() => void> = [];
+  #active = false;
+
+  override async requestConfirmation(
+    request: ConfirmationRequest,
+  ): Promise<{ outcome: 'accepted' } | { outcome: 'declined' }> {
+    this.requests.push(request);
+    if (this.#active) {
+      this.concurrentDeclines += 1;
+      return { outcome: 'declined' };
+    }
+    this.#active = true;
+    await new Promise<void>((resolve) => {
+      this.releases.push(resolve);
+    });
+    this.#active = false;
+    return { outcome: 'accepted' };
   }
 }
 
@@ -197,6 +330,7 @@ class TestWallet implements WalletTransport {
   broadcastCount = 0;
   pendingNonce = 4;
   receiptStatus: TransactionReceipt['status'] = 'success';
+  receiptLogs: TransactionReceipt['logs'];
   throwAfterAccept = false;
   throwPrepareOnce = false;
   hideTransactions = false;
@@ -269,6 +403,7 @@ class TestWallet implements WalletTransport {
           transactionHash: hash,
           status: this.receiptStatus,
           ...(this.receiptStatus === 'pending' ? {} : { blockNumber: 20 }),
+          ...(this.receiptLogs ? { logs: this.receiptLogs } : {}),
         }
       : null;
   }
@@ -278,6 +413,7 @@ class TestWallet implements WalletTransport {
       transactionHash: hash,
       status: this.receiptStatus,
       ...(this.receiptStatus === 'pending' ? {} : { blockNumber: 20 }),
+      ...(this.receiptLogs ? { logs: this.receiptLogs } : {}),
     };
   }
 }
@@ -295,6 +431,153 @@ class TestSimulator implements TransactionSimulator {
       : { ok: true };
   }
 }
+
+class SequencedFeeSimulator extends TestSimulator {
+  constructor(readonly maximumFees: string[]) {
+    super();
+  }
+
+  override async simulate(): Promise<{
+    ok: true;
+    feeQuote: {
+      model: 'eip1559';
+      maximumNetworkFeeWei: string;
+      maximumNetworkFeeCoti: string;
+      maximumFeePerGasWei: string;
+    };
+  }> {
+    const maximumNetworkFeeWei =
+      this.maximumFees[this.calls] ??
+      this.maximumFees.at(-1) ??
+      '0';
+    this.calls += 1;
+    return {
+      ok: true,
+      feeQuote: {
+        model: 'eip1559',
+        maximumNetworkFeeWei,
+        maximumNetworkFeeCoti: '0',
+        maximumFeePerGasWei: '1',
+      },
+    };
+  }
+}
+
+class DeferredSecondSimulation extends TestSimulator {
+  readonly secondCallStarted: Promise<void>;
+  #markSecondCallStarted: () => void = () => undefined;
+  #releaseSecondCall: () => void = () => undefined;
+
+  constructor() {
+    super();
+    this.secondCallStarted = new Promise<void>((resolve) => {
+      this.#markSecondCallStarted = resolve;
+    });
+  }
+
+  release(): void {
+    this.#releaseSecondCall();
+  }
+
+  override async simulate(): Promise<
+    { ok: true } | { ok: false; errorCode: string }
+  > {
+    this.calls += 1;
+    if (this.calls === 2) {
+      this.#markSecondCallStarted();
+      await new Promise<void>((resolve) => {
+        this.#releaseSecondCall = resolve;
+      });
+    }
+    return { ok: true };
+  }
+}
+
+class DeferredPrepareWallet extends TestWallet {
+  readonly prepareStarted: Promise<void>;
+  #markPrepareStarted: () => void = () => undefined;
+  #releasePrepare: () => void = () => undefined;
+
+  constructor() {
+    super();
+    this.prepareStarted = new Promise<void>((resolve) => {
+      this.#markPrepareStarted = resolve;
+    });
+  }
+
+  release(): void {
+    this.#releasePrepare();
+  }
+
+  override async prepareTransaction(
+    request: TransactionRequest,
+  ): Promise<{ hash: HexString; signedTransaction: HexString }> {
+    this.#markPrepareStarted();
+    await new Promise<void>((resolve) => {
+      this.#releasePrepare = resolve;
+    });
+    return super.prepareTransaction(request);
+  }
+}
+
+const createTestAutonomy = () => {
+  let paused = false;
+  let reservationState: AutonomyReservationV1['state'] = 'reserved';
+  const reservation = (): AutonomyReservationV1 =>
+    ({
+      id: 'reservation-1',
+      policyId: 'policy-1',
+      operationHash: REGISTRY_HASH,
+      state: reservationState,
+      signedTransactionHashes: [],
+    }) as unknown as AutonomyReservationV1;
+  const manager = {
+    reserve: async () => ({ allowed: true as const, value: reservation() }),
+    authorizeReservedWrite: async () =>
+      paused
+        ? {
+            allowed: false as const,
+            denial: {
+              code: 'GLOBAL_PAUSED' as const,
+              message: 'Autonomy is globally paused.',
+              policyId: 'policy-1',
+            },
+          }
+        : { allowed: true as const, value: reservation() },
+    markSigned: async () => {
+      reservationState = 'signed';
+      return { allowed: true as const, value: reservation() };
+    },
+    markPending: async () => {
+      reservationState = 'pending';
+      return { allowed: true as const, value: reservation() };
+    },
+    markUncertain: async () => {
+      reservationState = 'uncertain';
+      return { allowed: true as const, value: reservation() };
+    },
+    markSettled: async () => {
+      reservationState = 'settled';
+      return { allowed: true as const, value: reservation() };
+    },
+    releaseBeforeSigning: async () => {
+      reservationState = 'released';
+      return { allowed: true as const, value: reservation() };
+    },
+    pauseGlobal: async () => {
+      paused = true;
+      return {
+        allowed: true as const,
+        value: {
+          globalPaused: true,
+          policies: [],
+          activeReservationCount: 1,
+        },
+      };
+    },
+  } as unknown as AutonomyPolicyManager;
+  return { manager, isPaused: () => paused };
+};
 
 const createEngine = async (options: {
   wallet?: TestWallet;
@@ -366,6 +649,249 @@ describe('local ChainWhisper signer core', () => {
     });
     expect(setup.elicitor.requests).toHaveLength(0);
     expect(setup.wallet.prepared.size).toBe(0);
+  });
+
+  it('persists an asynchronous policy denial as a terminal safe status', async () => {
+    const autonomy = {
+      reserve: async () => ({
+        allowed: false as const,
+        denial: {
+          code: 'ACTION_NOT_ALLOWED' as const,
+          message: 'Action is outside the bounded policy.',
+          policyId: 'policy-1',
+          field: 'action',
+        },
+      }),
+    } as unknown as AutonomyPolicyManager;
+    const setup = await createEngine({ autonomy });
+    const envelope = createEnvelope('queued-policy-denial');
+
+    await setup.engine.queueAction(envelope, 'policy-1');
+    let status = await setup.engine.getOperationStatus(
+      envelope.operationId,
+    );
+    for (
+      let attempt = 0;
+      status?.status !== 'failed' && attempt < 50;
+      attempt += 1
+    ) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 5));
+      status = await setup.engine.getOperationStatus(
+        envelope.operationId,
+      );
+    }
+
+    expect(status).toMatchObject({
+      status: 'failed',
+      errorCode: 'AUTONOMY_ACTION_NOT_ALLOWED',
+      userActionRequired: false,
+    });
+    expect(setup.elicitor.requests).toHaveLength(0);
+    expect(
+      await setup.vault.get(
+        `operation:${envelope.operationId}:request`,
+      ),
+    ).toBeNull();
+  });
+
+  it('does not list, restore, or replay a failed queued operation', async () => {
+    const setup = await createEngine({});
+    const envelope = createEnvelope('failed-queued-operation');
+    await setup.journal.begin(
+      envelope.operationId,
+      envelope.operationHash,
+    );
+    await setup.vault.put(
+      `operation:${envelope.operationId}:request`,
+      JSON.stringify({ version: 1, envelope }),
+      { kind: 'recovery-note' },
+    );
+    await setup.journal.recordError(
+      envelope.operationId,
+      'STALE_SIMULATION',
+      true,
+    );
+
+    await expect(
+      setup.engine.getOperationStatus(envelope.operationId),
+    ).resolves.toMatchObject({
+      status: 'failed',
+      errorCode: 'STALE_SIMULATION',
+      userActionRequired: false,
+      nextPollingIntervalMs: null,
+    });
+    await expect(
+      setup.engine.listPendingOperationIds(),
+    ).resolves.not.toContain(envelope.operationId);
+
+    await setup.engine.restorePendingOperations();
+    await new Promise<void>((resolve) => setTimeout(resolve, 20));
+    expect(setup.elicitor.requests).toHaveLength(0);
+    expect(setup.simulator.calls).toBe(0);
+    expect(setup.wallet.prepareCount).toBe(0);
+
+    await expect(
+      setup.engine.queueAction(envelope),
+    ).resolves.toMatchObject({
+      status: 'failed',
+      errorCode: 'STALE_SIMULATION',
+      nextPollingIntervalMs: null,
+    });
+    expect(setup.elicitor.requests).toHaveLength(0);
+    expect(setup.simulator.calls).toBe(0);
+    expect(setup.wallet.prepareCount).toBe(0);
+  });
+
+  it('leaves private-message journal records to the messaging lifecycle owner', async () => {
+    const setup = await createEngine({});
+    const operationHash = `0x${'7a'.repeat(32)}` as HexString;
+    const operationId = `message-${operationHash.slice(2, 18)}`;
+    await setup.journal.begin(operationId, operationHash);
+    await setup.journal.reserveNonce(operationId, 4, 0);
+    await setup.journal.recordBroadcast(
+      operationId,
+      4,
+      `0x${'7b'.repeat(32)}` as HexString,
+      0,
+    );
+
+    await setup.engine.restorePendingOperations();
+
+    await expect(
+      setup.engine.listPendingOperationIds(),
+    ).resolves.not.toContain(operationId);
+    await expect(setup.journal.get(operationId)).resolves.toMatchObject({
+      stage: 'broadcast',
+      errorCodes: [],
+    });
+    expect(setup.simulator.calls).toBe(0);
+    expect(setup.wallet.prepareCount).toBe(0);
+  });
+
+  it('does not reopen a confirmation for an already declined operation', async () => {
+    const elicitor = new TestElicitor(true, 'declined');
+    const setup = await createEngine({ elicitor });
+    const envelope = createEnvelope('declined-operation-replay');
+
+    await setup.engine.queueAction(envelope);
+    let status = await setup.engine.getOperationStatus(
+      envelope.operationId,
+    );
+    for (
+      let attempt = 0;
+      status?.status !== 'declined' && attempt < 50;
+      attempt += 1
+    ) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 5));
+      status = await setup.engine.getOperationStatus(
+        envelope.operationId,
+      );
+    }
+
+    expect(status).toMatchObject({
+      status: 'declined',
+      errorCode: 'CONFIRMATION_DECLINED',
+      userActionRequired: false,
+    });
+    expect(await setup.journal.get(envelope.operationId)).toMatchObject({
+      stage: 'declined',
+    });
+    expect(await setup.engine.listPendingOperationIds()).not.toContain(
+      envelope.operationId,
+    );
+    expect(elicitor.requests).toHaveLength(1);
+
+    await expect(setup.engine.queueAction(envelope)).resolves.toMatchObject({
+      status: 'declined',
+      errorCode: 'CONFIRMATION_DECLINED',
+    });
+    expect(elicitor.requests).toHaveLength(1);
+  });
+
+  it('journals confirmation timeout as terminal and excludes it from pending work', async () => {
+    const elicitor = new TestElicitor(true, 'timeout');
+    const setup = await createEngine({ elicitor });
+    const envelope = createEnvelope('timed-out-operation');
+
+    await setup.engine.queueAction(envelope);
+    let status = await setup.engine.getOperationStatus(
+      envelope.operationId,
+    );
+    for (
+      let attempt = 0;
+      status?.status !== 'declined' && attempt < 50;
+      attempt += 1
+    ) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 5));
+      status = await setup.engine.getOperationStatus(
+        envelope.operationId,
+      );
+    }
+
+    expect(status).toMatchObject({
+      status: 'declined',
+      errorCode: 'CONFIRMATION_TIMEOUT',
+      userActionRequired: false,
+    });
+    expect(await setup.journal.get(envelope.operationId)).toMatchObject({
+      stage: 'declined',
+    });
+    expect(await setup.engine.listPendingOperationIds()).not.toContain(
+      envelope.operationId,
+    );
+    await expect(setup.engine.queueAction(envelope)).resolves.toMatchObject({
+      status: 'declined',
+      errorCode: 'CONFIRMATION_TIMEOUT',
+    });
+    expect(elicitor.requests).toHaveLength(1);
+  });
+
+  it('serializes queued manual operations instead of treating a busy prompt as a decline', async () => {
+    const elicitor = new BusyDeclinesElicitor();
+    const setup = await createEngine({ elicitor });
+    const first = createEnvelope('serialized-manual-first');
+    const second = createEnvelope('serialized-manual-second');
+
+    await setup.engine.queueAction(first);
+    await setup.engine.queueAction(second);
+    for (
+      let attempt = 0;
+      elicitor.requests.length < 1 && attempt < 50;
+      attempt += 1
+    ) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 5));
+    }
+    expect(elicitor.requests).toHaveLength(1);
+    expect(
+      await setup.engine.getOperationStatus(second.operationId),
+    ).toMatchObject({ status: 'queued' });
+
+    elicitor.releases.shift()?.();
+    for (
+      let attempt = 0;
+      elicitor.requests.length < 2 && attempt < 50;
+      attempt += 1
+    ) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 5));
+    }
+    expect(elicitor.requests).toHaveLength(2);
+    expect(elicitor.concurrentDeclines).toBe(0);
+
+    elicitor.releases.shift()?.();
+    let secondStatus = await setup.engine.getOperationStatus(
+      second.operationId,
+    );
+    for (
+      let attempt = 0;
+      secondStatus?.status !== 'completed' && attempt < 50;
+      attempt += 1
+    ) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 5));
+      secondStatus = await setup.engine.getOperationStatus(
+        second.operationId,
+      );
+    }
+    expect(secondStatus).toMatchObject({ status: 'completed' });
   });
 
   it('rechecks runtime around confirmation and confirms every write', async () => {
@@ -470,6 +996,678 @@ describe('local ChainWhisper signer core', () => {
       errorCode: 'ELICITATION_UNSUPPORTED',
     });
     expect(setup.wallet.prepareCount).toBe(0);
+  });
+
+  it('queues a verified envelope without waiting for Agent Control', async () => {
+    const elicitor = new DeferredTestElicitor();
+    const setup = await createEngine({ elicitor });
+    const envelope = createEnvelope('async-agent-control');
+
+    await expect(setup.engine.queueAction(envelope)).resolves.toMatchObject({
+      version: 'cw.operation-status/2',
+      operationId: envelope.operationId,
+      operationHash: envelope.operationHash,
+      status: 'queued',
+      userActionRequired: false,
+    });
+    expect(setup.wallet.prepareCount).toBe(0);
+    for (let attempt = 0; !elicitor.release && attempt < 50; attempt += 1) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 5));
+    }
+    elicitor.release?.();
+  });
+
+  it('applies pause before an unsigned autonomous write reaches the wallet', async () => {
+    const simulator = new DeferredSecondSimulation();
+    const autonomy = createTestAutonomy();
+    const setup = await createEngine({
+      simulator,
+      autonomy: autonomy.manager,
+    });
+    const envelope = createEnvelope('pause-before-signing');
+
+    await setup.engine.queueAction(envelope, 'policy-1');
+    await simulator.secondCallStarted;
+    await expect(setup.engine.pauseAutonomy()).resolves.toMatchObject({
+      allowed: true,
+      value: { globalPaused: true },
+    });
+    simulator.release();
+
+    await expect
+      .poll(
+        async () =>
+          (await setup.engine.getOperationStatus(envelope.operationId))
+            ?.errorCode,
+      )
+      .toBe('WRITE_UNAVAILABLE');
+    expect(autonomy.isPaused()).toBe(true);
+    expect(setup.wallet.prepareCount).toBe(0);
+    expect(setup.wallet.broadcastCount).toBe(0);
+  });
+
+  it('waits for a write already inside the signing queue before pause returns', async () => {
+    const wallet = new DeferredPrepareWallet();
+    const autonomy = createTestAutonomy();
+    const setup = await createEngine({
+      wallet,
+      autonomy: autonomy.manager,
+    });
+    const envelope = createEnvelope('pause-waits-for-active-signing');
+
+    await setup.engine.queueAction(envelope, 'policy-1');
+    await wallet.prepareStarted;
+    let pauseFinished = false;
+    const pausing = setup.engine.pauseAutonomy().then((result) => {
+      pauseFinished = true;
+      return result;
+    });
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+    expect(pauseFinished).toBe(false);
+
+    wallet.release();
+    await expect(pausing).resolves.toMatchObject({
+      allowed: true,
+      value: { globalPaused: true },
+    });
+    expect(wallet.prepareCount).toBe(1);
+    expect(wallet.broadcastCount).toBe(1);
+  });
+
+  it('removes the exact envelope after completion and retains only a redacted result', async () => {
+    const setup = await createEngine({});
+    const envelope = resignEnvelope(
+      createEnvelope('async-redacted-result'),
+      { summary: 'Cancel using private amount 123456789.' },
+    );
+
+    await setup.engine.queueAction(envelope);
+    let status = await setup.engine.getOperationStatus(
+      envelope.operationId,
+    );
+    for (let attempt = 0; status?.status !== 'completed' && attempt < 50; attempt += 1) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 5));
+      status = await setup.engine.getOperationStatus(
+        envelope.operationId,
+      );
+    }
+
+    expect(status).toMatchObject({
+      status: 'completed',
+      summary: 'ChainWhisper order update completed.',
+      result: {
+        action: 'order_update',
+        status: 'completed',
+      },
+    });
+    expect(
+      await setup.vault.get(
+        `operation:${envelope.operationId}:request`,
+      ),
+    ).toBeNull();
+    expect(JSON.stringify(status)).not.toContain('123456789');
+  });
+
+  it('retains a decoded created-order identity through async cleanup', async () => {
+    const setup = await createEngine({
+      intentValidator: { validate: async () => undefined },
+    });
+    const { envelope, orderType } = createStandardOrderEnvelope(
+      'async-created-order-result',
+    );
+    setup.wallet.receiptLogs = [tradeOpenedLog(42n)];
+
+    await setup.engine.queueAction(envelope);
+    let status = await setup.engine.getOperationStatus(
+      envelope.operationId,
+    );
+    for (
+      let attempt = 0;
+      status?.status !== 'completed' && attempt < 50;
+      attempt += 1
+    ) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 5));
+      status = await setup.engine.getOperationStatus(
+        envelope.operationId,
+      );
+    }
+
+    expect(status).toMatchObject({
+      status: 'completed',
+      result: {
+        action: 'create_trade',
+        canonicalType: orderType,
+        order: {
+          handle: `cw_${CONTRACT.slice(2).toLowerCase()}_42`,
+          status: 'open',
+          shareableAppLink:
+            'https://chainwhisper.chat/otc/order/link/VgAq',
+        },
+      },
+    });
+    await expect(
+      setup.vault.get(`operation:${envelope.operationId}:request`),
+    ).resolves.toBeNull();
+  });
+
+  it('keeps a completed create envelope until its exact order identity is reconciled', async () => {
+    const setup = await createEngine({
+      intentValidator: { validate: async () => undefined },
+    });
+    const { envelope } = createStandardOrderEnvelope(
+      'delayed-created-order-result',
+    );
+
+    await setup.engine.queueAction(envelope);
+    let status = await setup.engine.getOperationStatus(
+      envelope.operationId,
+    );
+    for (
+      let attempt = 0;
+      status?.status !== 'uncertain' && attempt < 50;
+      attempt += 1
+    ) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 5));
+      status = await setup.engine.getOperationStatus(
+        envelope.operationId,
+      );
+    }
+
+    expect(status).toMatchObject({
+      status: 'uncertain',
+      errorCode: 'ORDER_RESULT_RECONCILIATION_REQUIRED',
+      userActionRequired: false,
+      nextPollingIntervalMs: 1_000,
+    });
+    await expect(
+      setup.vault.get(`operation:${envelope.operationId}:request`),
+    ).resolves.not.toBeNull();
+    await expect(setup.engine.listPendingOperationIds()).resolves.toContain(
+      envelope.operationId,
+    );
+
+    setup.wallet.receiptLogs = [tradeOpenedLog(84n)];
+    await expect(
+      setup.engine.getOperationStatus(envelope.operationId),
+    ).resolves.toMatchObject({
+      status: 'completed',
+      result: {
+        order: {
+          handle: `cw_${CONTRACT.slice(2).toLowerCase()}_84`,
+          status: 'open',
+        },
+      },
+    });
+    await expect(
+      setup.vault.get(`operation:${envelope.operationId}:request`),
+    ).resolves.toBeNull();
+    await expect(
+      setup.engine.listPendingOperationIds(),
+    ).resolves.not.toContain(envelope.operationId);
+  });
+
+  it('backfills a created-order identity from a successful recovered receipt', async () => {
+    const setup = await createEngine({
+      intentValidator: { validate: async () => undefined },
+    });
+    const { envelope } = createStandardOrderEnvelope(
+      'recovered-created-order-result',
+    );
+    const transactionHash = `0x${'99'.repeat(32)}` as HexString;
+    setup.wallet.transactions.set(transactionHash, {
+      hash: transactionHash,
+      nonce: 4,
+    });
+    setup.wallet.receiptLogs = [tradeOpenedLog(73n)];
+    await setup.vault.put(
+      `operation:${envelope.operationId}:request`,
+      JSON.stringify({ version: 1, envelope }),
+      { kind: 'recovery-note' },
+    );
+    await setup.journal.begin(
+      envelope.operationId,
+      envelope.operationHash,
+    );
+    await setup.journal.recordPreparedTransaction(
+      envelope.operationId,
+      4,
+      transactionHash,
+      0,
+    );
+    await setup.journal.recordReceipt(envelope.operationId, {
+      transactionHash,
+      status: 'success',
+      blockNumber: 20,
+    });
+    await setup.journal.updateStage(
+      envelope.operationId,
+      'completed',
+      1,
+    );
+
+    await expect(
+      setup.engine.getOperationStatus(envelope.operationId),
+    ).resolves.toMatchObject({
+      status: 'completed',
+      result: {
+        action: 'create_trade',
+        order: {
+          handle: `cw_${CONTRACT.slice(2).toLowerCase()}_73`,
+          status: 'open',
+          shareableAppLink:
+            'https://chainwhisper.chat/otc/order/link/VgBJ',
+        },
+      },
+    });
+    await expect(
+      setup.journal.get(envelope.operationId),
+    ).resolves.toMatchObject({
+      semanticResult: {
+        order: {
+          handle: `cw_${CONTRACT.slice(2).toLowerCase()}_73`,
+        },
+      },
+    });
+  });
+
+  it('requires a fresh envelope after local private setup completes', async () => {
+    let reserveCalls = 0;
+    const autonomy = {
+      reserve: async () => {
+        reserveCalls += 1;
+        return {
+          allowed: false as const,
+          denial: {
+            code: 'POLICY_NOT_FOUND' as const,
+            message: 'The test policy is unavailable.',
+          },
+        };
+      },
+    } as unknown as AutonomyPolicyManager;
+    const setup = await createEngine({ autonomy });
+    const baseEnvelope = createEnvelope('private-setup-reprepare');
+    const envelope = resignEnvelope(baseEnvelope, {
+      intent: {
+        ...baseEnvelope.intent,
+        sellAsset: {
+          kind: 'private-erc20',
+          reference: 'p.WISP',
+          symbol: 'p.WISP',
+          decimals: 6,
+        },
+      },
+    });
+    await setup.journal.begin(
+      envelope.operationId,
+      envelope.operationHash,
+    );
+    await setup.vault.put(
+      `operation:${envelope.operationId}:request`,
+      JSON.stringify({
+        version: 1,
+        envelope,
+        policyId: 'policy-1',
+      }),
+      { kind: 'recovery-note' },
+    );
+    await setup.journal.recordError(
+      envelope.operationId,
+      'PRIVATE_TOKEN_SETUP_REQUIRED',
+      true,
+    );
+
+    await expect(
+      setup.engine.getOperationStatus(envelope.operationId),
+    ).resolves.toMatchObject({
+      status: 'needs_setup',
+      userActionRequired: true,
+      setupRequirement: {
+        kind: 'private-token-setup',
+        assets: ['p.WISP'],
+      },
+    });
+    await setup.engine.markSetupCompleted();
+    await expect(
+      setup.engine.getOperationStatus(envelope.operationId),
+    ).resolves.toMatchObject({
+      status: 'needs_reprepare',
+      errorCode: 'OPERATION_REPREPARE_REQUIRED',
+    });
+
+    await setup.engine.restorePendingOperations();
+    await new Promise<void>((resolve) => setTimeout(resolve, 20));
+    expect(reserveCalls).toBe(0);
+    expect(setup.wallet.prepareCount).toBe(0);
+
+    await expect(
+      setup.engine.queueAction(envelope, 'policy-1'),
+    ).resolves.toMatchObject({
+      status: 'needs_reprepare',
+      errorCode: 'OPERATION_REPREPARE_REQUIRED',
+    });
+    expect(reserveCalls).toBe(0);
+    expect(setup.wallet.prepareCount).toBe(0);
+  });
+
+  it('restores a persisted nonterminal envelope after signer restart', async () => {
+    const setup = await createEngine({
+      elicitor: new TestElicitor(false),
+    });
+    const envelope = createEnvelope('restart-restoration');
+    await expect(setup.engine.queueAction(envelope)).resolves.toMatchObject({
+      status: 'needs_confirmation',
+      errorCode: 'CONTROL_PANEL_OPEN_REQUIRED',
+    });
+    const restored = new SignerEngine({
+      verifier: new ActionEnvelopeVerifier(
+        createConfig(setup.stateDirectory),
+        setup.runtime,
+        () => NOW,
+      ),
+      wallet: setup.wallet,
+      materializer: new PassthroughPrivateInputMaterializer(),
+      confirmation: new ConfirmationGate(new TestElicitor(), 5_000),
+      simulator: setup.simulator,
+      intentValidator: new StrictMaterializedIntentValidator(),
+      journal: setup.journal,
+      vault: setup.vault,
+    });
+
+    await restored.restorePendingOperations();
+    let status = await restored.getOperationStatus(envelope.operationId);
+    for (let attempt = 0; status?.status !== 'completed' && attempt < 50; attempt += 1) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 5));
+      status = await restored.getOperationStatus(envelope.operationId);
+    }
+    expect(status).toMatchObject({
+      status: 'completed',
+      result: { action: 'order_update' },
+    });
+  });
+
+  it('reuses the complete autonomy exposure when resuming a later step after restart', async () => {
+    const wallet = new TestWallet();
+    wallet.receiptStatus = 'pending';
+    let boundExposure: string | null = null;
+    const reservation = {
+      version: 'cw.autonomy-reservation/1',
+      id: 'reservation-1',
+      policyId: 'policy-1',
+      policyTermsDigest: REGISTRY_HASH,
+      operationHash: REGISTRY_HASH,
+      exposureDigest: REGISTRY_HASH,
+      authorizationBinding: REGISTRY_HASH,
+      exposure: null,
+      state: 'reserved',
+      createdAt: NOW.toISOString(),
+      updatedAt: NOW.toISOString(),
+      signedTransactionHashes: [],
+    } as unknown as AutonomyReservationV1;
+    const autonomy = {
+      reserve: async (
+        _policyId: string,
+        exposure: PolicyExposureV1,
+      ) => {
+        const serialized = JSON.stringify(exposure);
+        if (boundExposure === null) boundExposure = serialized;
+        if (boundExposure !== serialized) {
+          return {
+            allowed: false as const,
+            denial: {
+              code: 'OPERATION_BINDING_MISMATCH' as const,
+              message: 'The operation exposure changed during restart.',
+              policyId: 'policy-1',
+            },
+          };
+        }
+        return {
+          allowed: true as const,
+          value: { ...reservation, exposure },
+        };
+      },
+      authorizeReservedWrite: async () => ({
+        allowed: true as const,
+        value: reservation,
+      }),
+      markSigned: async (
+        _id: string,
+        transactionHash: HexString,
+      ) => ({
+        allowed: true as const,
+        value: {
+          ...reservation,
+          state: 'signed' as const,
+          signedTransactionHashes: [transactionHash],
+        },
+      }),
+      markPending: async () => ({
+        allowed: true as const,
+        value: { ...reservation, state: 'pending' as const },
+      }),
+      markUncertain: async () => ({
+        allowed: true as const,
+        value: { ...reservation, state: 'uncertain' as const },
+      }),
+      markSettled: async () => ({
+        allowed: true as const,
+        value: { ...reservation, state: 'settled' as const },
+      }),
+      releaseBeforeSigning: async () => ({
+        allowed: true as const,
+        value: { ...reservation, state: 'released' as const },
+      }),
+    } as unknown as AutonomyPolicyManager;
+    const setup = await createEngine({ wallet, autonomy });
+    const base = createEnvelope('autonomy-restart-complete-exposure');
+    const envelope = resignEnvelope(base, {
+      steps: [
+        base.steps[0]!,
+        {
+          ...base.steps[0]!,
+          id: 'cancel-after-restart',
+          summary: 'Complete the second bound transaction.',
+        },
+      ],
+      gasCap: '200000',
+    });
+
+    await setup.engine.queueAction(envelope, 'policy-1');
+    await expect
+      .poll(() => wallet.broadcastCount, { timeout: 5_000 })
+      .toBe(1);
+    await expect
+      .poll(
+        async () =>
+          (await setup.journal.get(envelope.operationId))?.stage,
+        { timeout: 5_000 },
+      )
+      .toBe('broadcast');
+    expect(await setup.journal.get(envelope.operationId)).toMatchObject({
+      stage: 'broadcast',
+      nextStepIndex: 0,
+    });
+
+    wallet.receiptStatus = 'success';
+    wallet.pendingNonce = 5;
+    const restored = new SignerEngine({
+      verifier: new ActionEnvelopeVerifier(
+        createConfig(setup.stateDirectory),
+        setup.runtime,
+        () => NOW,
+      ),
+      wallet,
+      materializer: new PassthroughPrivateInputMaterializer(),
+      confirmation: new ConfirmationGate(new TestElicitor(), 5_000),
+      simulator: setup.simulator,
+      intentValidator: new StrictMaterializedIntentValidator(),
+      journal: setup.journal,
+      vault: setup.vault,
+      autonomy,
+    });
+
+    await restored.restorePendingOperations();
+    await expect
+      .poll(
+        async () =>
+          (await restored.getOperationStatus(envelope.operationId))?.status,
+        { timeout: 5_000 },
+      )
+      .toBe('completed');
+    const status = await restored.getOperationStatus(envelope.operationId);
+    expect(status).toMatchObject({ status: 'completed' });
+    expect(wallet.prepareCount).toBe(2);
+    expect(wallet.broadcastCount).toBe(2);
+  });
+
+  it('enforces each persisted autonomy fee ceiling when a later step resumes', async () => {
+    const wallet = new TestWallet();
+    wallet.receiptStatus = 'pending';
+    const simulator = new SequencedFeeSimulator([
+      '10',
+      '20',
+      '10',
+      '21',
+    ]);
+    const { manager: autonomy } = createTestAutonomy();
+    const setup = await createEngine({ wallet, simulator, autonomy });
+    const base = createEnvelope('autonomy-restart-fee-ceiling');
+    const envelope = resignEnvelope(base, {
+      steps: [
+        base.steps[0]!,
+        {
+          ...base.steps[0]!,
+          id: 'second-fee-bound-step',
+          summary: 'Complete the second fee-bound transaction.',
+        },
+      ],
+      gasCap: '200000',
+    });
+
+    await setup.engine.queueAction(envelope, 'policy-1');
+    await expect
+      .poll(() => wallet.broadcastCount, { timeout: 5_000 })
+      .toBe(1);
+    await expect
+      .poll(
+        async () =>
+          (await setup.journal.get(envelope.operationId))?.stage,
+        { timeout: 5_000 },
+      )
+      .toBe('broadcast');
+
+    const stored = JSON.parse(
+      (await setup.vault.get(
+        `operation:${envelope.operationId}:request`,
+      ))!,
+    ) as { policyStepFeeCeilings?: string[] };
+    expect(stored.policyStepFeeCeilings).toEqual(['10', '20']);
+
+    wallet.receiptStatus = 'success';
+    const restored = new SignerEngine({
+      verifier: new ActionEnvelopeVerifier(
+        createConfig(setup.stateDirectory),
+        setup.runtime,
+        () => NOW,
+      ),
+      wallet,
+      materializer: new PassthroughPrivateInputMaterializer(),
+      confirmation: new ConfirmationGate(new TestElicitor(), 5_000),
+      simulator,
+      intentValidator: new StrictMaterializedIntentValidator(),
+      journal: setup.journal,
+      vault: setup.vault,
+      autonomy,
+    });
+
+    await restored.restorePendingOperations();
+    await expect
+      .poll(
+        async () =>
+          (await setup.journal.get(envelope.operationId))?.errorCodes.at(
+            -1,
+          ),
+        { timeout: 5_000 },
+      )
+      .toBe('FEE_CHANGED');
+    expect(wallet.prepareCount).toBe(1);
+    expect(wallet.broadcastCount).toBe(1);
+  });
+
+  it('re-materializes completed steps before resuming an autonomous action', async () => {
+    const wallet = new TestWallet();
+    wallet.receiptStatus = 'pending';
+    const { manager: autonomy } = createTestAutonomy();
+    const setup = await createEngine({ wallet, autonomy });
+    const base = createEnvelope('autonomy-restart-step-binding');
+    const envelope = resignEnvelope(base, {
+      steps: [
+        base.steps[0]!,
+        {
+          ...base.steps[0]!,
+          id: 'second-digest-bound-step',
+          summary: 'Complete the second digest-bound transaction.',
+        },
+      ],
+      gasCap: '200000',
+    });
+
+    await setup.engine.queueAction(envelope, 'policy-1');
+    await expect
+      .poll(() => wallet.broadcastCount, { timeout: 5_000 })
+      .toBe(1);
+    await expect
+      .poll(
+        async () =>
+          (await setup.journal.get(envelope.operationId))?.stage,
+        { timeout: 5_000 },
+      )
+      .toBe('broadcast');
+
+    wallet.receiptStatus = 'success';
+    const restored = new SignerEngine({
+      verifier: new ActionEnvelopeVerifier(
+        createConfig(setup.stateDirectory),
+        setup.runtime,
+        () => NOW,
+      ),
+      wallet,
+      materializer: {
+        materializeStep: async (
+          actionEnvelope: SignedActionEnvelopeV1,
+          stepIndex: number,
+        ): Promise<MaterializedActionStep> => {
+          const step = actionEnvelope.steps[stepIndex]!;
+          return {
+            ...step,
+            data:
+              stepIndex === 0
+                ? (`${step.data.slice(0, -1)}${
+                    step.data.endsWith('0') ? '1' : '0'
+                  }` as HexString)
+                : step.data,
+          };
+        },
+      },
+      confirmation: new ConfirmationGate(new TestElicitor(), 5_000),
+      simulator: setup.simulator,
+      intentValidator: new StrictMaterializedIntentValidator(),
+      journal: setup.journal,
+      vault: setup.vault,
+      autonomy,
+    });
+
+    await restored.restorePendingOperations();
+    await expect
+      .poll(
+        async () =>
+          (await setup.journal.get(envelope.operationId))?.errorCodes.at(
+            -1,
+          ),
+        { timeout: 5_000 },
+      )
+      .toBe('OPERATION_REPREPARE_REQUIRED');
+    expect(wallet.prepareCount).toBe(1);
+    expect(wallet.broadcastCount).toBe(1);
   });
 
   it('keeps a pending receipt in processing and does not resubmit it', async () => {
@@ -835,8 +2033,10 @@ describe('local ChainWhisper signer core', () => {
     const setup = await createEngine({ elicitor });
     const operationId = 'declined-local-discard';
     const secretReference = `${REGISTRY_HASH}:recovery-secret`;
+    const requestReference = `operation:${operationId}:request`;
     await setup.journal.begin(operationId, REGISTRY_HASH);
     await setup.vault.put(secretReference, 'local-recovery-value');
+    await setup.vault.put(requestReference, 'durable-operation-request');
 
     await expect(
       setup.engine.discardOperation(operationId, REGISTRY_HASH),
@@ -855,15 +2055,22 @@ describe('local ChainWhisper signer core', () => {
     expect(await setup.vault.get(secretReference)).toBe(
       'local-recovery-value',
     );
+    expect(await setup.vault.get(requestReference)).toBe(
+      'durable-operation-request',
+    );
   });
 
   it('discards only the locally confirmed exact operation and its secret prefix', async () => {
     const setup = await createEngine({});
     const operationId = 'confirmed-local-discard';
     const secretReference = `${REGISTRY_HASH}:recovery-secret`;
+    const requestReference = `operation:${operationId}:request`;
+    const resultReference = `operation:${operationId}:result`;
     const unrelatedReference = `0x${'55'.repeat(32)}:recovery-secret`;
     await setup.journal.begin(operationId, REGISTRY_HASH);
     await setup.vault.put(secretReference, 'discard-this-value');
+    await setup.vault.put(requestReference, 'discard-this-request');
+    await setup.vault.put(resultReference, 'discard-this-result');
     await setup.vault.put(unrelatedReference, 'preserve-this-value');
 
     await expect(
@@ -877,8 +2084,57 @@ describe('local ChainWhisper signer core', () => {
       'discarded',
     );
     expect(await setup.vault.get(secretReference)).toBeNull();
+    expect(await setup.vault.get(requestReference)).toBeNull();
+    expect(await setup.vault.get(resultReference)).toBeNull();
     expect(await setup.vault.get(unrelatedReference)).toBe(
       'preserve-this-value',
     );
+  });
+
+  it('does not start an operation while its local discard confirmation is open', async () => {
+    const elicitor = new DeferredTestElicitor();
+    const setup = await createEngine({ elicitor });
+    const envelope = createEnvelope('discard-blocks-background-start');
+    await setup.journal.begin(
+      envelope.operationId,
+      envelope.operationHash,
+    );
+
+    const discarding = setup.engine.discardOperation(
+      envelope.operationId,
+      envelope.operationHash,
+    );
+    await expect
+      .poll(() => elicitor.requests.length)
+      .toBe(1);
+    await expect(
+      setup.engine.queueAction(envelope),
+    ).rejects.toMatchObject({ code: 'OPERATION_IN_PROGRESS' });
+    expect(setup.wallet.prepareCount).toBe(0);
+    expect(setup.wallet.broadcastCount).toBe(0);
+
+    elicitor.release?.();
+    await expect(discarding).resolves.toMatchObject({
+      status: 'discarded',
+    });
+  });
+
+  it('rejects discard while the same operation has an active background worker', async () => {
+    const elicitor = new DeferredTestElicitor();
+    const setup = await createEngine({ elicitor });
+    const envelope = createEnvelope('active-worker-blocks-discard');
+
+    await setup.engine.queueAction(envelope);
+    await expect
+      .poll(() => elicitor.requests.length)
+      .toBe(1);
+    await expect(
+      setup.engine.discardOperation(
+        envelope.operationId,
+        envelope.operationHash,
+      ),
+    ).rejects.toMatchObject({ code: 'OPERATION_IN_PROGRESS' });
+
+    elicitor.release?.();
   });
 });

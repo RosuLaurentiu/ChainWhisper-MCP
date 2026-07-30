@@ -55,6 +55,19 @@ type FeeBoundTransactionRequest = Omit<TransactionRequest, 'nonce'> & {
 
 const asHexHash = (value: string): HexString => value as HexString;
 
+const receiptLogs = (
+  logs: readonly {
+    address: string;
+    topics: readonly string[];
+    data: string;
+  }[],
+): NonNullable<TransactionReceipt['logs']> =>
+  logs.map((log) => ({
+    address: log.address as Address,
+    topics: log.topics.map((topic) => topic as HexString),
+    data: log.data as HexString,
+  }));
+
 const feePolicyError = (message: string): SignerError =>
   new SignerError('FEE_CHANGED', message);
 
@@ -420,6 +433,7 @@ export class CotiWalletTransport implements WalletTransport {
       transactionHash: asHexHash(receipt.hash),
       status: receipt.status === 1 ? 'success' : 'reverted',
       blockNumber: receipt.blockNumber,
+      logs: receiptLogs(receipt.logs),
     };
   }
 
@@ -436,6 +450,7 @@ export class CotiWalletTransport implements WalletTransport {
       transactionHash: asHexHash(receipt.hash),
       status: receipt.status === 1 ? 'success' : 'reverted',
       blockNumber: receipt.blockNumber,
+      logs: receiptLogs(receipt.logs),
     };
   }
 }

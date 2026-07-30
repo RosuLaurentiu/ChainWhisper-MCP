@@ -41,12 +41,20 @@ import type {
   OfficialMessagingTool,
   OtcNegotiationEnvelopeV1,
   OtcNegotiationKind,
+  OperationJournalRecord,
+  OperationStatusV2,
+  RecoverOperationResult,
   UntrustedNegotiationMessage,
   WalletTransport,
 } from './types.js';
 import { EncryptedSecretVault } from './vault.js';
 
 export { ORDER_ACCESS_SECRET_ID } from './privateInputs.js';
+
+const MESSAGE_OPERATION_PATTERN = /^message-[0-9a-f]{16}$/u;
+
+export const isMessageOperationId = (operationId: string): boolean =>
+  MESSAGE_OPERATION_PATTERN.test(operationId);
 
 const SEND_TOOLS = new Set<McpToolName>([
   'send_private_agent_message',
@@ -887,6 +895,10 @@ export class ChainWhisperMessagingBridge {
   readonly #autonomy: AutonomyPolicyManager | null;
   readonly #manifestHash: HexString | null;
   readonly #vaultSecretCandidateCache = new Map<string, boolean>();
+  readonly #activeSends = new Map<
+    string,
+    { operationHash: HexString; promise: Promise<unknown> }
+  >();
 
   constructor(options: {
     tools?: readonly McpToolDefinition[];
@@ -1226,6 +1238,290 @@ export class ChainWhisperMessagingBridge {
     );
   }
 
+  async getOperationStatus(
+    operationId: string,
+  ): Promise<OperationStatusV2 | null> {
+    let record = await this.#journal.get(operationId);
+    if (!record) return null;
+    this.#assertMessageRecord(record);
+    record = await this.#reconcileOperation(record);
+    return this.#publicOperationStatus(record);
+  }
+
+  async listPendingOperationIds(): Promise<string[]> {
+    const pending: string[] = [];
+    for (const record of await this.#journal.list()) {
+      if (!isMessageOperationId(record.operationId)) continue;
+      this.#assertMessageRecord(record);
+      if (
+        !['completed', 'declined', 'discarded'].includes(
+          record.stage,
+        ) &&
+        (record.stage !== 'failed' ||
+          record.errorCodes.at(-1) ===
+            'OPERATION_REPREPARE_REQUIRED')
+      ) {
+        pending.push(record.operationId);
+      }
+    }
+    return pending;
+  }
+
+  async restorePendingOperations(): Promise<void> {
+    for (const record of await this.#journal.list()) {
+      if (!isMessageOperationId(record.operationId)) continue;
+      this.#assertMessageRecord(record);
+      if (
+        record.stage === 'validated' ||
+        record.stage === 'awaiting-confirmation'
+      ) {
+        await this.#recordErrorOnce(
+          record,
+          'OPERATION_REPREPARE_REQUIRED',
+          true,
+        );
+        continue;
+      }
+      if (
+        record.stage === 'awaiting-broadcast' ||
+        record.stage === 'prepared-broadcast' ||
+        record.stage === 'broadcast'
+      ) {
+        await this.#reconcileOperation(record);
+      }
+    }
+  }
+
+  async recoverOperation(
+    operationId: string,
+    operationHash?: string,
+  ): Promise<RecoverOperationResult> {
+    let record = await this.#journal.get(operationId);
+    if (!record) {
+      throw new SignerError(
+        'OPERATION_NOT_FOUND',
+        'No local private-message operation matches this identifier.',
+      );
+    }
+    this.#assertMessageRecord(record);
+    if (
+      operationHash &&
+      record.operationHash.toLowerCase() !== operationHash.toLowerCase()
+    ) {
+      throw new SignerError(
+        'ENVELOPE_TAMPERED',
+        'Operation hash does not match the local message journal.',
+      );
+    }
+    record = await this.#reconcileOperation(record);
+    const status =
+      record.stage === 'completed'
+        ? 'completed'
+        : record.stage === 'discarded'
+          ? 'discarded'
+          : record.stage === 'failed'
+            ? 'retryable'
+            : 'processing';
+    return {
+      operationId: record.operationId,
+      operationHash: record.operationHash,
+      status,
+      transactionHashes: [...record.transactionHashes],
+      errorCodes: [...record.errorCodes],
+    };
+  }
+
+  #assertMessageRecord(record: OperationJournalRecord): void {
+    if (
+      !isMessageOperationId(record.operationId) ||
+      record.operationId !==
+        `message-${record.operationHash.slice(2, 18).toLowerCase()}`
+    ) {
+      throw new SignerError(
+        'ENVELOPE_TAMPERED',
+        'Private-message operation identity does not match its journal binding.',
+      );
+    }
+  }
+
+  async #recordErrorOnce(
+    record: OperationJournalRecord,
+    code: string,
+    retryable: boolean,
+  ): Promise<OperationJournalRecord> {
+    if (record.errorCodes.includes(code)) return record;
+    return (
+      (await this.#journal.recordError(
+        record.operationId,
+        code,
+        retryable,
+      )) ?? record
+    );
+  }
+
+  async #settleRecoveredAutonomy(
+    operationHash: HexString,
+  ): Promise<void> {
+    await this.#autonomy
+      ?.settleByOperationHash(operationHash)
+      .catch(() => undefined);
+  }
+
+  async #reconcileOperation(
+    record: OperationJournalRecord,
+  ): Promise<OperationJournalRecord> {
+    if (
+      ![
+        'awaiting-broadcast',
+        'prepared-broadcast',
+        'broadcast',
+      ].includes(record.stage)
+    ) {
+      return record;
+    }
+    if (record.transactionHashes.length === 0) {
+      return this.#recordErrorOnce(
+        record,
+        'MESSAGE_BROADCAST_UNCERTAIN',
+        true,
+      );
+    }
+
+    let pending = false;
+    let unknown = false;
+    for (const transactionHash of [...record.transactionHashes].reverse()) {
+      const recordedReceipt = record.receipts.find(
+        (receipt) =>
+          receipt.transactionHash.toLowerCase() ===
+          transactionHash.toLowerCase(),
+      );
+      let liveReceipt = null;
+      try {
+        liveReceipt =
+          await this.#wallet.getTransactionReceipt(transactionHash);
+      } catch {
+        unknown = true;
+      }
+      const exactLiveReceipt =
+        liveReceipt?.transactionHash.toLowerCase() ===
+        transactionHash.toLowerCase()
+          ? liveReceipt
+          : null;
+      if (liveReceipt && !exactLiveReceipt) unknown = true;
+      const receipt =
+        recordedReceipt && recordedReceipt.status !== 'pending'
+          ? recordedReceipt
+          : exactLiveReceipt ?? recordedReceipt ?? null;
+      if (!receipt) {
+        unknown = true;
+        continue;
+      }
+      record =
+        (await this.#journal.recordReceipt(
+          record.operationId,
+          receipt,
+        )) ?? record;
+      if (receipt.status === 'pending') {
+        pending = true;
+        continue;
+      }
+      if (receipt.status === 'success') {
+        record =
+          (await this.#journal.updateStage(
+            record.operationId,
+            'completed',
+            1,
+          )) ?? record;
+        await this.#settleRecoveredAutonomy(record.operationHash);
+        return record;
+      }
+      record = await this.#recordErrorOnce(
+        record,
+        'MESSAGE_TRANSACTION_REVERTED',
+        false,
+      );
+      record =
+        (await this.#journal.updateStage(
+          record.operationId,
+          'failed',
+          0,
+        )) ?? record;
+      await this.#settleRecoveredAutonomy(record.operationHash);
+      return record;
+    }
+
+    if (unknown && !pending) {
+      record = await this.#recordErrorOnce(
+        record,
+        'MESSAGE_BROADCAST_UNCERTAIN',
+        true,
+      );
+    }
+    return record;
+  }
+
+  #publicOperationStatus(
+    record: OperationJournalRecord,
+  ): OperationStatusV2 {
+    const lastError = record.errorCodes.at(-1);
+    const hasPendingReceipt = record.receipts.some(
+      (receipt) =>
+        receipt.status === 'pending' &&
+        record.transactionHashes.some(
+          (hash) =>
+            hash.toLowerCase() ===
+            receipt.transactionHash.toLowerCase(),
+        ),
+    );
+    const status =
+      record.stage === 'completed'
+        ? ('completed' as const)
+        : record.stage === 'declined'
+          ? ('declined' as const)
+          : record.stage === 'awaiting-confirmation'
+            ? ('needs_confirmation' as const)
+            : record.stage === 'validated'
+              ? ('queued' as const)
+              : lastError === 'OPERATION_REPREPARE_REQUIRED'
+                ? ('needs_reprepare' as const)
+                : record.stage === 'failed' ||
+                    record.stage === 'discarded'
+                  ? ('failed' as const)
+                  : hasPendingReceipt
+                    ? ('confirming' as const)
+                    : ('uncertain' as const);
+    const terminal = ['completed', 'declined', 'failed'].includes(
+      status,
+    );
+    const userActionRequired = [
+      'needs_reprepare',
+      'needs_confirmation',
+    ].includes(status);
+    const errorCode =
+      status === 'completed' || status === 'confirming'
+        ? undefined
+        : record.stage === 'discarded'
+          ? 'OPERATION_DISCARDED'
+          : lastError ??
+            (status === 'uncertain'
+              ? 'MESSAGE_BROADCAST_UNCERTAIN'
+              : undefined);
+    return {
+      version: 'cw.operation-status/2',
+      operationId: record.operationId,
+      operationHash: record.operationHash,
+      status,
+      summary: 'Send encrypted ChainWhisper order message.',
+      transactionHashes: [...record.transactionHashes],
+      transactionLinks: record.transactionHashes.map(
+        (hash) => `https://mainnet.cotiscan.io/tx/${hash}`,
+      ),
+      userActionRequired,
+      nextPollingIntervalMs: terminal ? null : 1_000,
+      ...(errorCode ? { errorCode } : {}),
+    };
+  }
+
   async #send(
     toolName: McpToolName,
     input: Record<string, unknown>,
@@ -1319,9 +1615,28 @@ export class ChainWhisperMessagingBridge {
       }),
     );
     const operationId = `message-${operationHash.slice(2, 18)}`;
+    const safeOperationResult = (
+      value: Record<string, unknown>,
+    ): unknown =>
+      safeResult({
+        operationId,
+        operationHash,
+        ...value,
+      });
+    const activeSend = this.#activeSends.get(operationId);
+    if (activeSend) {
+      if (activeSend.operationHash !== operationHash) {
+        throw new SignerError(
+          'UNSAFE_MESSAGE',
+          'This private-message operation id is already bound to a different operation hash.',
+        );
+      }
+      return activeSend.promise;
+    }
+    const execution = (async (): Promise<unknown> => {
     let record = await this.#journal.begin(operationId, operationHash);
     if (record.stage === 'completed') {
-      return safeResult({
+      return safeOperationResult({
         status: 'completed',
         transactionHashes: [...record.transactionHashes],
       });
@@ -1332,7 +1647,20 @@ export class ChainWhisperMessagingBridge {
         'This private-message operation was discarded and will not be sent.',
       );
     }
-    if (record.stage === 'failed') {
+    if (
+      record.stage === 'failed' &&
+      record.errorCodes.at(-1) ===
+        'OPERATION_REPREPARE_REQUIRED' &&
+      record.nonces.length === 0 &&
+      record.transactionHashes.length === 0
+    ) {
+      record =
+        (await this.#journal.updateStage(
+          operationId,
+          'validated',
+          0,
+        )) ?? record;
+    } else if (record.stage === 'failed') {
       throw new SignerError(
         'TRANSACTION_FAILED',
         'This private-message operation failed and will not be sent again automatically.',
@@ -1347,19 +1675,32 @@ export class ChainWhisperMessagingBridge {
         const receipt = await this.#wallet
           .getTransactionReceipt(transactionHash)
           .catch(() => null);
-        if (receipt?.status === 'success') {
-          await this.#journal.recordReceipt(operationId, receipt);
+        const exactReceipt =
+          receipt?.transactionHash.toLowerCase() ===
+          transactionHash.toLowerCase()
+            ? receipt
+            : null;
+        if (exactReceipt?.status === 'success') {
+          await this.#journal.recordReceipt(operationId, exactReceipt);
           await this.#journal.updateStage(operationId, 'completed', 1);
-          return safeResult({ status: 'completed', transactionHash });
+          await this.#settleRecoveredAutonomy(record.operationHash);
+          return safeOperationResult({
+            status: 'completed',
+            transactionHash,
+          });
         }
-        if (receipt?.status === 'reverted') {
-          await this.#journal.recordReceipt(operationId, receipt);
+        if (exactReceipt?.status === 'reverted') {
+          await this.#journal.recordReceipt(
+            operationId,
+            exactReceipt,
+          );
           await this.#journal.recordError(
             operationId,
             'MESSAGE_TRANSACTION_REVERTED',
             false,
           );
           await this.#journal.updateStage(operationId, 'failed', 0);
+          await this.#settleRecoveredAutonomy(record.operationHash);
           throw new SignerError(
             'TRANSACTION_FAILED',
             'Encrypted private message transaction reverted and will not be sent again automatically.',
@@ -1381,7 +1722,7 @@ export class ChainWhisperMessagingBridge {
           true,
         );
       }
-      return safeResult({
+      return safeOperationResult({
         status: 'processing',
         transactionHashes: [...record.transactionHashes],
         errorCode: 'MESSAGE_BROADCAST_UNCERTAIN',
@@ -1417,6 +1758,7 @@ export class ChainWhisperMessagingBridge {
         messageCount: 1,
         nativeValue: '0',
         maximumNetworkFee: maximumNetworkFee.wei,
+        boundedRiskComplete: true,
         agentProvidedPrivateAmounts: false,
         stepDigests: [
           sha256Hex(
@@ -1494,17 +1836,75 @@ export class ChainWhisperMessagingBridge {
       );
       await this.#confirmation.confirm(confirmation);
     }
-    let invoked: { nonce: number; result: unknown };
+    let autonomousWriteStarted = false;
+    let invoked: {
+      nonce: number;
+      result: {
+        safeInvokedResult: unknown;
+        transactionHash: HexString;
+      };
+    };
     try {
       invoked = await this.#nonceQueue.runExternalWrite(
         async (nonce) => {
+          if (autonomyReservation && this.#autonomy) {
+            const authorized =
+              await this.#autonomy.authorizeReservedWrite(
+                autonomyReservation.id,
+              );
+            if (!authorized.allowed) {
+              throw new SignerError(
+                'WRITE_UNAVAILABLE',
+                `Autonomy write authorization is no longer active: ${authorized.denial.code}.`,
+              );
+            }
+            autonomyReservation = authorized.value;
+          }
           await this.#journal.reserveNonce(operationId, nonce, 0);
-          return this.#invoke(toolName, input);
+          autonomousWriteStarted = Boolean(autonomyReservation);
+          const safeInvokedResult = safeResult(
+            await this.#invoke(toolName, input),
+          );
+          const transactionHash =
+            transactionHashFromResult(safeInvokedResult);
+          if (!transactionHash) {
+            throw new SignerError(
+              'WRITE_UNAVAILABLE',
+              'The private-messaging SDK did not return a transaction hash.',
+            );
+          }
+          await this.#journal.recordBroadcast(
+            operationId,
+            nonce,
+            transactionHash,
+            0,
+          );
+          if (autonomyReservation && this.#autonomy) {
+            const signed = await this.#autonomy.markSigned(
+              autonomyReservation.id,
+              transactionHash,
+            );
+            if (!signed.allowed) {
+              throw new SignerError(
+                'WRITE_UNAVAILABLE',
+                `Autonomy reservation could not record the messaging write: ${signed.denial.code}.`,
+              );
+            }
+            autonomyReservation = signed.value;
+            await this.#autonomy.markPending(autonomyReservation.id);
+          }
+          return { safeInvokedResult, transactionHash };
         },
       );
     } catch (error) {
       if (autonomyReservation && this.#autonomy) {
-        await this.#autonomy.markUncertain(autonomyReservation.id);
+        if (autonomousWriteStarted) {
+          await this.#autonomy.markUncertain(autonomyReservation.id);
+        } else {
+          await this.#autonomy.releaseBeforeSigning(
+            autonomyReservation.id,
+          );
+        }
       }
       const reserved = await this.#journal.get(operationId);
       if (
@@ -1520,7 +1920,7 @@ export class ChainWhisperMessagingBridge {
           'MESSAGE_BROADCAST_UNCERTAIN',
           true,
         );
-        return safeResult({
+        return safeOperationResult({
           status: 'processing',
           transactionHashes: [...reserved.transactionHashes],
           errorCode: 'MESSAGE_BROADCAST_UNCERTAIN',
@@ -1528,57 +1928,8 @@ export class ChainWhisperMessagingBridge {
       }
       throw error;
     }
-    let safeInvokedResult: unknown;
-    try {
-      safeInvokedResult = safeResult(invoked.result);
-    } catch {
-      if (autonomyReservation && this.#autonomy) {
-        await this.#autonomy.markUncertain(autonomyReservation.id);
-      }
-      await this.#journal.recordError(
-        operationId,
-        'MESSAGE_BROADCAST_UNCERTAIN',
-        true,
-      );
-      return safeResult({
-        status: 'processing',
-        transactionHashes: [],
-        errorCode: 'MESSAGE_BROADCAST_UNCERTAIN',
-      });
-    }
-    const transactionHash = transactionHashFromResult(safeInvokedResult);
-    if (!transactionHash) {
-      if (autonomyReservation && this.#autonomy) {
-        await this.#autonomy.markUncertain(autonomyReservation.id);
-      }
-      await this.#journal.recordError(
-        operationId,
-        'MESSAGE_TRANSACTION_HASH_MISSING',
-        true,
-      );
-      return safeResult({
-        status: 'processing',
-        transactionHashes: [],
-        errorCode: 'MESSAGE_BROADCAST_UNCERTAIN',
-      });
-    }
-    record =
-      (await this.#journal.recordBroadcast(
-        operationId,
-        invoked.nonce,
-        transactionHash,
-        0,
-      )) ?? record;
-    if (autonomyReservation && this.#autonomy) {
-      const signed = await this.#autonomy.markSigned(
-        autonomyReservation.id,
-        transactionHash,
-      );
-      if (signed.allowed) {
-        autonomyReservation = signed.value;
-        await this.#autonomy.markPending(autonomyReservation.id);
-      }
-    }
+    const { safeInvokedResult, transactionHash } = invoked.result;
+    record = (await this.#journal.get(operationId)) ?? record;
     let receipt;
     try {
       receipt = await this.#wallet.waitForTransaction(transactionHash);
@@ -1591,7 +1942,25 @@ export class ChainWhisperMessagingBridge {
         'MESSAGE_BROADCAST_UNCERTAIN',
         true,
       );
-      return safeResult({
+      return safeOperationResult({
+        status: 'processing',
+        transactionHashes: [...record.transactionHashes],
+        errorCode: 'MESSAGE_BROADCAST_UNCERTAIN',
+      });
+    }
+    if (
+      receipt.transactionHash.toLowerCase() !==
+      transactionHash.toLowerCase()
+    ) {
+      if (autonomyReservation && this.#autonomy) {
+        await this.#autonomy.markUncertain(autonomyReservation.id);
+      }
+      await this.#journal.recordError(
+        operationId,
+        'MESSAGE_BROADCAST_UNCERTAIN',
+        true,
+      );
+      return safeOperationResult({
         status: 'processing',
         transactionHashes: [...record.transactionHashes],
         errorCode: 'MESSAGE_BROADCAST_UNCERTAIN',
@@ -1599,7 +1968,7 @@ export class ChainWhisperMessagingBridge {
     }
     await this.#journal.recordReceipt(operationId, receipt);
     if (receipt.status === 'pending') {
-      return safeResult({
+      return safeOperationResult({
         status: 'processing',
         transactionHash,
       });
@@ -1623,11 +1992,23 @@ export class ChainWhisperMessagingBridge {
     if (autonomyReservation && this.#autonomy) {
       await this.#autonomy.markSettled(autonomyReservation.id);
     }
-    return safeResult({
+    return safeOperationResult({
       status: 'completed',
       transactionHash,
       messageId: asRecord(safeInvokedResult)?.messageId ?? null,
     });
+    })();
+    this.#activeSends.set(operationId, {
+      operationHash,
+      promise: execution,
+    });
+    try {
+      return await execution;
+    } finally {
+      if (this.#activeSends.get(operationId)?.promise === execution) {
+        this.#activeSends.delete(operationId);
+      }
+    }
   }
 
   async #markIncomingUntrusted(

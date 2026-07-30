@@ -19,6 +19,14 @@ authorize a funded Mainnet transaction.
   wallet credentials in MCP schemas.
 - Official COTI private messaging is embedded. Do not register its standalone
   MCP.
+- A compatible COTI MCP remains an independent companion for generic,
+  read-only COTI functions. It never receives the ChainWhisper Agent Wallet
+  private key, wallet privacy/AES material, or access secrets.
+- ChainWhisper exposes app-economic actions. Trade amounts, prices, and budgets
+  may be visible to or chosen by the user's agent. Each confirmation states
+  which values are encrypted and which are public under the deployed contract.
+  Credentials, pairing and session tokens, and raw access secrets remain
+  signer-only.
 - The local-host beta boundary is explicit: use a dedicated, minimally funded
   Agent Wallet.
 
@@ -64,10 +72,24 @@ publishing.
 - [ ] `CHANGELOG.md` contains the exact version and date.
 - [ ] The release commit is reviewed and contained in protected `main`.
 - [ ] The exact protected tag is `v0.1.0-beta.0`.
-- [ ] No package with that immutable version already exists on npm.
+- [ ] No conflicting package with that immutable version exists on npm.
 
 The release workflow rejects a tag/package/source mismatch, a non-beta
-version, a tag outside `main`, and an already published version.
+version, a tag outside `main`, and a conflicting already-published artifact. If
+the exact tarball is already published byte-for-byte, the workflow verifies it
+and safely skips republishing.
+
+## Deployed recurring source identity
+
+- [ ] Synchronize the active recurring Solidity source and exported ABI with
+      the deployed `WithSecret` fill selectors used by the app, runtime
+      manifest, and attested Mainnet bytecode.
+- [ ] Reproduce the attested recurring bytecode from the synchronized release
+      source or attach equivalent reviewed deployment provenance.
+
+The signer already fails closed against the live bytecode hash and selector
+set. This repository drift does not authorize a wrong call, but it must be
+resolved before describing the beta contract artifacts as reproducible.
 
 ## Local release checks
 
@@ -88,6 +110,7 @@ Run the read-only COTI Mainnet checks:
 
 ```sh
 npm run smoke:live
+npm run smoke:live:readonly
 npm run audit:runtime
 ```
 
@@ -101,6 +124,10 @@ Confirm:
 - [ ] The production dependency audit reports no advisory.
 - [ ] Every ChainWhisper, onboarding, private-token, Privacy Portal, and
       messaging bytecode attestation passed.
+- [ ] Planner, configured-signer, and wallet-setup `tools/list` names and input
+      schemas exactly match the README allowlists and the locked domain,
+      signer-tool, and package-smoke expectations; no extra SDK, setup,
+      recovery, credential, or arbitrary-transaction tool is public.
 
 ## CI matrix
 
@@ -120,6 +147,8 @@ artifact checks. No skipped platform job may be treated as release evidence.
 - [ ] Existing-wallet import writes only the selected signer `.env`.
 - [ ] Generated wallet uses a cryptographic random source and displays the raw
       key once for backup.
+- [ ] First wallet setup activates inside the existing signer process without
+      changing its MCP catalog, PID, or Agent Control port.
 - [ ] Address, COTI balance, copy actions, and funding instructions are clear.
 - [ ] Process environment overrides `.env`; `.env` overrides legacy JSON.
 - [ ] Default and custom `.env` paths reload correctly.
@@ -137,6 +166,9 @@ artifact checks. No skipped platform job may be treated as release evidence.
       namespaced.
 - [ ] One active browser session is enforced and opening another invalidates
       the first.
+- [ ] A browser launch counts as opened only after Agent Control receives a
+      real local navigation; launch-without-arrival remains retryable and
+      preserves the pending card.
 - [ ] Bootstrap, cookie, CSRF, Host/Origin, replay, CSP, frame, no-store, body
       limit, and rate-limit tests pass.
 - [ ] There are no remote assets, analytics, telemetry, or app configuration.
@@ -156,10 +188,12 @@ artifact checks. No skipped platform job may be treated as release evidence.
       **Decline**.
 - [ ] Every step is re-attested, revalidated, and re-simulated after approval.
 - [ ] Changed calldata or an exceeded fee ceiling requires new authorization.
-- [ ] Private values are collected on the signer-owned page and never returned
-      to the agent.
-- [ ] `chainwhisper_discard_operation` requires the exact operation hash and
-      local confirmation.
+- [ ] Private trade values can be entered locally or supplied by the agent and
+      are shown in the complete action review. Wallet/AES credentials,
+      pairing/session tokens, and raw access secrets never enter MCP schemas,
+      prompts, results, URLs, logs, or diagnostics.
+- [ ] Discard and manual recovery are available only in Agent Control, require
+      local authorization, and are absent from the public MCP surface.
 
 ## Autonomy acceptance
 
@@ -172,10 +206,18 @@ artifact checks. No skipped platform job may be treated as release evidence.
       days.
 - [ ] Policy activation is wallet/chain/manifest bound.
 - [ ] A local edit can narrow and never broaden a proposal.
+- [ ] Policy editing uses human token/COTI amounts, quote-per-base prices, and
+      local date/time; exact atomic values remain in technical details.
 - [ ] `policyId` is optional for action and message writes.
 - [ ] A mismatch returns a structured denial without a fallback prompt.
-- [ ] Agent-provided private amounts require
-      `agentVisiblePrivateAmounts=true`.
+- [ ] Bounded activation, resume, and revocation reviews visibly list the
+      allowed pairs, full counterparty addresses, Privacy Portal directions,
+      and private-messaging recipients.
+- [ ] Every Agent Control editor, activation/resume/revocation confirmation,
+      and active-policy summary states that enabling
+      `agentVisiblePrivateAmounts=true` lets the agent both choose private
+      amounts and view policy-scoped private balances, hidden order
+      inventory/progress, and participant receipts.
 - [ ] Budgets reserve atomically before signing.
 - [ ] Concurrent reservations cannot overspend.
 - [ ] A pre-sign failure releases; signed, pending, or uncertain writes remain
@@ -191,16 +233,24 @@ artifact checks. No skipped platform job may be treated as release evidence.
 
 Use deterministic tests for:
 
-- [ ] all ten canonical public/private/recurring create routes;
+- [ ] all eight app-exposed public/private/recurring create routes;
+- [ ] all ten canonical classifications, including proof that the two internal
+      direct-recipient recurring types are not advertised or creatable;
 - [ ] fill, counter, edit, lifecycle, cancel, and recurring inventory routes;
 - [ ] public and private amount modes;
 - [ ] both Privacy Portal directions for every allowlisted pair;
 - [ ] private-token readiness and exact encrypted approval;
+- [x] policy-or-local-confirmation-gated private balances, owned hidden
+      inventory, recurring progress, and wallet-scoped participant receipts;
 - [ ] structured private messaging and untrusted received messages;
 - [ ] restart recovery, uncertain broadcast recovery, pause, and revoke.
 
 There is no unlisted recurring product. Do not add one in the MCP catalog.
 Privacy Portal amounts are public calldata under the deployed bridge ABI.
+For recurring private-liquidity orders, each private-token inventory or budget
+side is encrypted on-chain; a public-token side remains visible. Buy and sell
+prices remain public order terms. Autonomy policy budgets and price bands stay
+only in wallet-scoped local signer state.
 
 ## Disposable Mainnet canary
 

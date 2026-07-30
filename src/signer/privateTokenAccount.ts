@@ -493,8 +493,8 @@ export class PrivateTokenAccountService {
     const aesKey = this.#cotiWallet.getUserOnboardInfo()?.aesKey;
     if (!isCotiAesKey(aesKey)) {
       throw new SignerError(
-        'PRIVATE_INPUT_UNAVAILABLE',
-        'Run chainwhisper_onboard_privacy before a private-token transaction.',
+        'PRIVACY_SETUP_REQUIRED',
+        'Open Agent Control and enable private trading before this private-token transaction.',
       );
     }
     const [ownerEncryptionAddress, spenderEncryptionAddress] =
@@ -506,8 +506,8 @@ export class PrivateTokenAccountService {
       ownerEncryptionAddress.toLowerCase() !== wallet.toLowerCase()
     ) {
       throw new SignerError(
-        'PRIVATE_INPUT_UNAVAILABLE',
-        `Run chainwhisper_enable_private_token for ${token.symbol} before approving it.`,
+        'PRIVATE_TOKEN_SETUP_REQUIRED',
+        `Open Agent Control and prepare ${token.symbol} before approving it. Prepare a fresh action envelope after setup completes.`,
       );
     }
     if (spenderEncryptionAddress === ZERO_ADDRESS) {

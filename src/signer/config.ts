@@ -621,6 +621,7 @@ export const buildPublicSignerStatus = (
     controlPageReadiness?: PublicSignerStatus['controlPageReadiness'];
     autonomy?: PublicSignerStatus['autonomy'];
     diagnosticCodes?: string[];
+    requiredAssets?: string[];
   } = {},
 ): PublicSignerStatus => {
   const defaultAutonomy: PublicSignerStatus['autonomy'] = {
@@ -629,8 +630,20 @@ export const buildPublicSignerStatus = (
     activePolicyCount: 0,
     globalPaused: false,
   };
+  const requiredAssets = [
+    ...new Set(
+      (options.requiredAssets ?? [])
+        .map((asset) => asset.trim())
+        .filter(Boolean),
+    ),
+  ].slice(0, 16);
   if (!config) {
     return {
+      version: 'cw.signer-status/2',
+      network: {
+        name: 'COTI Mainnet',
+        chainId: 2_632_500,
+      },
       chainId: 2_632_500,
       wallet,
       configured: false,
@@ -645,6 +658,19 @@ export const buildPublicSignerStatus = (
       controlPageReadiness:
         options.controlPageReadiness ?? 'unavailable',
       autonomy: options.autonomy ?? defaultAutonomy,
+      requiredAssets: requiredAssets.map((asset) => ({
+        asset,
+        status: 'unavailable',
+      })),
+      pendingOperations: {
+        count: 0,
+        operationIds: [],
+      },
+      nextAction: {
+        tool: null,
+        arguments: {},
+        reason: 'configuration-invalid',
+      },
       diagnosticCodes: options.diagnosticCodes ?? [
         'wallet-setup-required',
       ],
@@ -657,6 +683,11 @@ export const buildPublicSignerStatus = (
     privacyReady ??
     config.aesConfigured;
   return {
+    version: 'cw.signer-status/2',
+    network: {
+      name: 'COTI Mainnet',
+      chainId: config.chainId,
+    },
     chainId: config.chainId,
     wallet,
     configured: config.walletConfigured,
@@ -687,6 +718,41 @@ export const buildPublicSignerStatus = (
     controlPageReadiness:
       options.controlPageReadiness ?? 'unavailable',
     autonomy: options.autonomy ?? defaultAutonomy,
+    requiredAssets: requiredAssets.map((asset) => ({
+      asset,
+      status: config.walletConfigured
+        ? hasPrivacyKey
+          ? 'unavailable'
+          : 'privacy-onboarding-required'
+        : 'wallet-setup-required',
+    })),
+    pendingOperations: {
+      count: 0,
+      operationIds: [],
+    },
+    nextAction: !config.walletConfigured
+      ? {
+          tool: 'chainwhisper_open_control_panel',
+          arguments: {},
+          reason: 'wallet-setup-required',
+        }
+      : !hasPrivacyKey
+        ? {
+            tool: 'chainwhisper_open_control_panel',
+            arguments: {},
+            reason: 'privacy-onboarding-required',
+          }
+        : confirmation !== 'available'
+          ? {
+              tool: 'chainwhisper_open_control_panel',
+              arguments: {},
+              reason: 'control-panel-required',
+            }
+          : {
+              tool: null,
+              arguments: {},
+              reason: 'ready',
+            },
     diagnosticCodes:
       options.diagnosticCodes ??
       [
