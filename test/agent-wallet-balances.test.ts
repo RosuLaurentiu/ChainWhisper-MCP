@@ -61,7 +61,12 @@ const manifest = {
   ],
 } as unknown as ChainWhisperRuntimeManifestV1;
 
-const rpcFixture = () => {
+const rpcFixture = (
+  options: {
+    privateCotiMapping?: string;
+    walletCode?: string;
+  } = {},
+) => {
   let failPublicBalance = false;
   let calls = 0;
   const request = vi.fn(
@@ -69,6 +74,10 @@ const rpcFixture = () => {
       calls += 1;
       if (method === 'eth_getBalance') {
         return '0x1bc16d674ec80000' as T;
+      }
+      if (method === 'eth_getCode') {
+        expect(params).toEqual([WALLET, 'latest']);
+        return (options.walletCode ?? '0x') as T;
       }
       const transaction = params[0] as {
         to: string;
@@ -90,7 +99,7 @@ const rpcFixture = () => {
             transaction.to.toLowerCase() ===
             PRIVATE_WISP.toLowerCase()
               ? WALLET
-              : ZERO_ADDRESS,
+              : (options.privateCotiMapping ?? ZERO_ADDRESS),
         }) as T;
       }
       return encodeFunctionResult({
@@ -114,7 +123,7 @@ const rpcFixture = () => {
 };
 
 describe('AgentWalletBalanceReader', () => {
-  it('reads native, public, and prepared private balances with active filtering', async () => {
+  it('reads explicit and implicit EOA private balances after privacy onboarding', async () => {
     const fixture = rpcFixture();
     const reader = new AgentWalletBalanceReader({
       wallet: WALLET,
@@ -152,7 +161,9 @@ describe('AgentWalletBalanceReader', () => {
       },
       {
         symbol: 'p.COTI',
-        readiness: 'setup-required',
+        displayAmount: '<0.000001',
+        exactAmount: '0.00000000001',
+        readiness: 'ready',
         defaultVisible: true,
       },
     ]);
@@ -162,6 +173,88 @@ describe('AgentWalletBalanceReader', () => {
         expect.objectContaining({ from: WALLET }),
       ]),
     );
+    expect(fixture.request).toHaveBeenCalledWith('eth_getCode', [
+      WALLET,
+      'latest',
+    ]);
+  });
+
+  it('does not decrypt a zero-mapped private token for a code-bearing wallet', async () => {
+    const fixture = rpcFixture({ walletCode: '0x6001600055' });
+    const decrypt = vi.fn(() => 10_000_000n);
+    const reader = new AgentWalletBalanceReader({
+      wallet: WALLET,
+      rpc: fixture.rpc,
+      manifest,
+      privacyKey: () => AES_KEY,
+      decrypt,
+    });
+
+    const snapshot = await reader.snapshot();
+
+    expect(
+      snapshot.rows.find(({ symbol }) => symbol === 'p.COTI'),
+    ).toMatchObject({
+      readiness: 'setup-required',
+      defaultVisible: false,
+    });
+    expect(decrypt).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps prepared zero private balances under Show all assets unless required', async () => {
+    const fixture = rpcFixture();
+    const reader = new AgentWalletBalanceReader({
+      wallet: WALLET,
+      rpc: fixture.rpc,
+      manifest,
+      privacyKey: () => AES_KEY,
+      decrypt: () => 0n,
+    });
+
+    const ordinary = await reader.snapshot();
+    expect(
+      ordinary.rows.find(({ symbol }) => symbol === 'p.COTI'),
+    ).toMatchObject({
+      readiness: 'ready',
+      exactAmount: '0',
+      defaultVisible: false,
+    });
+
+    const required = await reader.snapshot(['p.COTI']);
+    expect(
+      required.rows.find(({ symbol }) => symbol === 'p.COTI'),
+    ).toMatchObject({
+      readiness: 'ready',
+      exactAmount: '0',
+      defaultVisible: true,
+    });
+  });
+
+  it('does not classify a foreign mapping as ready or query wallet code', async () => {
+    const foreign =
+      '0x5555555555555555555555555555555555555555';
+    const fixture = rpcFixture({ privateCotiMapping: foreign });
+    const reader = new AgentWalletBalanceReader({
+      wallet: WALLET,
+      rpc: fixture.rpc,
+      manifest,
+      privacyKey: () => AES_KEY,
+      decrypt: () => 10_000_000n,
+    });
+
+    const snapshot = await reader.snapshot();
+
+    expect(
+      snapshot.rows.find(({ symbol }) => symbol === 'p.COTI'),
+    ).toMatchObject({
+      readiness: 'setup-required',
+      defaultVisible: false,
+    });
+    expect(
+      fixture.request.mock.calls.some(
+        ([method]) => method === 'eth_getCode',
+      ),
+    ).toBe(false);
   });
 
   it('uses its cache, deduplicates refreshes, and retains stale successful values', async () => {
@@ -192,7 +285,40 @@ describe('AgentWalletBalanceReader', () => {
       stale: true,
     });
     expect(first.stale).toBe(true);
-    expect(fixture.calls() - firstCallCount).toBe(5);
+    expect(fixture.calls() - firstCallCount).toBe(6);
+  });
+
+  it('invalidates freshness without discarding the last snapshot used for partial-failure fallback', async () => {
+    const fixture = rpcFixture();
+    const reader = new AgentWalletBalanceReader({
+      wallet: WALLET,
+      rpc: fixture.rpc,
+      manifest,
+      privacyKey: () => AES_KEY,
+      decrypt: () => 10_000_000n,
+    });
+    const initial = await reader.snapshot();
+    fixture.failPublicBalance();
+
+    reader.invalidate();
+    const refreshed = await reader.snapshot();
+
+    expect(refreshed.revision).toBe(initial.revision + 1);
+    expect(
+      refreshed.rows.find(({ symbol }) => symbol === 'WISP'),
+    ).toMatchObject({
+      displayAmount: '12.5',
+      exactAmount: '12.5',
+      readiness: 'ready',
+      stale: true,
+    });
+    expect(
+      refreshed.rows.find(({ symbol }) => symbol === 'COTI'),
+    ).toMatchObject({
+      exactAmount: '2',
+      stale: false,
+    });
+    expect(refreshed.stale).toBe(true);
   });
 
   it('does not query or reveal private balances before privacy onboarding', async () => {

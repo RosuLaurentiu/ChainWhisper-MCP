@@ -22,6 +22,10 @@ import {
 } from './autonomy.js';
 import { buildPolicyExposure } from './policyExposure.js';
 import { decodeCreatedOrderResult } from './orderResult.js';
+import {
+  activitySnapshotReference,
+  buildLocalActivitySnapshot,
+} from './agentActivity.js';
 import type {
   ExecuteActionResult,
   JournalReceipt,
@@ -61,17 +65,171 @@ type StoredOperationV1 = {
   policyStepFeeCeilings?: string[];
 };
 
+export type MaterializedActionBundleV1 = {
+  version: 1;
+  operationId: string;
+  operationHash: string;
+  wallet: string;
+  chainId: number;
+  manifestHash: string;
+  firstStepIndex: number;
+  expiresAt: string;
+  steps: Array<{
+    stepIndex: number;
+    step: MaterializedActionStep;
+    stepDigest: string;
+    feeQuote?: TransactionFeeQuote;
+  }>;
+};
+
+export type ManualAuthorizationV1 = {
+  version: 1;
+  operationId: string;
+  operationHash: string;
+  wallet: string;
+  chainId: number;
+  manifestHash: string;
+  firstStepIndex: number;
+  stepDigests: string[];
+  stepFeeCeilings: string[];
+  authorizedAt: string;
+  expiresAt: string;
+};
+
+type StoredOperationV2 = {
+  version: 2;
+  envelope: SignedActionEnvelopeV1;
+  policyId?: string;
+  policyExposure?: PolicyExposureV1;
+  /** Per-envelope-step network-fee ceilings captured at authorization time. */
+  policyStepFeeCeilings?: string[];
+  materializedBundle?: MaterializedActionBundleV1;
+  manualAuthorization?: ManualAuthorizationV1;
+};
+
+type StoredOperation = StoredOperationV1 | StoredOperationV2;
+
 type StoredResultV1 = {
   version: 1;
   summary: string;
   result: OperationSemanticResultV2;
 };
 
-const parseStoredOperation = (value: string | null): StoredOperationV1 | null => {
+const isUnsignedInteger = (value: unknown): value is string =>
+  typeof value === 'string' && /^(?:0|[1-9][0-9]*)$/u.test(value);
+
+const isHexData = (value: unknown): value is string =>
+  typeof value === 'string' && /^0x(?:[0-9a-fA-F]{2})*$/u.test(value);
+
+const isHexDigest = (value: unknown): value is string =>
+  typeof value === 'string' && /^0x[0-9a-fA-F]{64}$/u.test(value);
+
+const isAddress = (value: unknown): value is string =>
+  typeof value === 'string' && /^0x[0-9a-fA-F]{40}$/u.test(value);
+
+const isMaterializedStep = (
+  value: unknown,
+): value is MaterializedActionStep => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return false;
+  }
+  const step = value as Partial<MaterializedActionStep>;
+  return (
+    typeof step.id === 'string' &&
+    ['approval', 'protocol', 'message'].includes(step.kind ?? '') &&
+    isAddress(step.to) &&
+    isHexData(step.data) &&
+    isUnsignedInteger(step.value) &&
+    isUnsignedInteger(step.gasCap) &&
+    typeof step.summary === 'string'
+  );
+};
+
+const isFeeQuote = (
+  value: unknown,
+): value is TransactionFeeQuote => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return false;
+  }
+  const quote = value as Partial<TransactionFeeQuote>;
+  return (
+    (quote.model === 'eip1559' || quote.model === 'legacy') &&
+    isUnsignedInteger(quote.maximumNetworkFeeWei) &&
+    typeof quote.maximumNetworkFeeCoti === 'string' &&
+    isUnsignedInteger(quote.maximumFeePerGasWei) &&
+    (quote.maximumPriorityFeePerGasWei === undefined ||
+      isUnsignedInteger(quote.maximumPriorityFeePerGasWei))
+  );
+};
+
+const isMaterializedBundle = (
+  value: unknown,
+): value is MaterializedActionBundleV1 => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return false;
+  }
+  const bundle = value as Partial<MaterializedActionBundleV1>;
+  return (
+    bundle.version === 1 &&
+    typeof bundle.operationId === 'string' &&
+    isHexDigest(bundle.operationHash) &&
+    isAddress(bundle.wallet) &&
+    Number.isSafeInteger(bundle.chainId) &&
+    isHexDigest(bundle.manifestHash) &&
+    Number.isSafeInteger(bundle.firstStepIndex) &&
+    (bundle.firstStepIndex ?? -1) >= 0 &&
+    typeof bundle.expiresAt === 'string' &&
+    Array.isArray(bundle.steps) &&
+    bundle.steps.every((entry) => {
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+        return false;
+      }
+      const candidate = entry as MaterializedActionBundleV1['steps'][number];
+      return (
+        Number.isSafeInteger(candidate.stepIndex) &&
+        candidate.stepIndex >= 0 &&
+        isMaterializedStep(candidate.step) &&
+        isHexDigest(candidate.stepDigest) &&
+        (candidate.feeQuote === undefined ||
+          isFeeQuote(candidate.feeQuote))
+      );
+    })
+  );
+};
+
+const isManualAuthorization = (
+  value: unknown,
+): value is ManualAuthorizationV1 => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return false;
+  }
+  const authorization = value as Partial<ManualAuthorizationV1>;
+  return (
+    authorization.version === 1 &&
+    typeof authorization.operationId === 'string' &&
+    isHexDigest(authorization.operationHash) &&
+    isAddress(authorization.wallet) &&
+    Number.isSafeInteger(authorization.chainId) &&
+    isHexDigest(authorization.manifestHash) &&
+    Number.isSafeInteger(authorization.firstStepIndex) &&
+    (authorization.firstStepIndex ?? -1) >= 0 &&
+    Array.isArray(authorization.stepDigests) &&
+    authorization.stepDigests.every(isHexDigest) &&
+    Array.isArray(authorization.stepFeeCeilings) &&
+    authorization.stepFeeCeilings.every(isUnsignedInteger) &&
+    typeof authorization.authorizedAt === 'string' &&
+    typeof authorization.expiresAt === 'string'
+  );
+};
+
+const parseStoredOperation = (value: string | null): StoredOperation | null => {
   if (!value) return null;
   try {
-    const parsed = JSON.parse(value) as Partial<StoredOperationV1>;
-    return parsed.version === 1 &&
+    const parsed = JSON.parse(value) as Omit<
+      Partial<StoredOperationV2>,
+      'version'
+    > & { version?: 1 | 2 };
+    return (parsed.version === 1 || parsed.version === 2) &&
       parsed.envelope?.version === 'cw.action/1' &&
       typeof parsed.envelope.operationId === 'string' &&
       typeof parsed.envelope.operationHash === 'string' &&
@@ -86,8 +244,14 @@ const parseStoredOperation = (value: string | null): StoredOperationV1 | null =>
             (entry) =>
               typeof entry === 'string' &&
               /^(?:0|[1-9][0-9]*)$/u.test(entry),
-          )))
-      ? (parsed as StoredOperationV1)
+          ))) &&
+      (parsed.version !== 2 ||
+        parsed.materializedBundle === undefined ||
+        isMaterializedBundle(parsed.materializedBundle)) &&
+      (parsed.version !== 2 ||
+        parsed.manualAuthorization === undefined ||
+        isManualAuthorization(parsed.manualAuthorization))
+      ? (parsed as StoredOperation)
       : null;
   } catch {
     return null;
@@ -108,6 +272,60 @@ const parseStoredResult = (value: string | null): StoredResultV1 | null => {
     return null;
   }
 };
+
+const materializedBundleMatchesEnvelope = (
+  bundle: MaterializedActionBundleV1,
+  envelope: SignedActionEnvelopeV1,
+  wallet: string,
+  nextStepIndex: number,
+): boolean => {
+  if (
+    bundle.operationId !== envelope.operationId ||
+    !sameHex(bundle.operationHash, envelope.operationHash) ||
+    !sameHex(bundle.wallet, wallet) ||
+    bundle.chainId !== envelope.chainId ||
+    !sameHex(
+      bundle.manifestHash,
+      envelope.registrySnapshot.manifestHash,
+    ) ||
+    bundle.expiresAt !== envelope.expiresAt ||
+    bundle.firstStepIndex > nextStepIndex ||
+    bundle.steps.length !==
+      envelope.steps.length - bundle.firstStepIndex
+  ) {
+    return false;
+  }
+  return bundle.steps.every(
+    (entry, offset) =>
+      entry.stepIndex === bundle.firstStepIndex + offset &&
+      entry.stepIndex < envelope.steps.length &&
+      materializedActionStepDigest(entry.step) ===
+        entry.stepDigest,
+  );
+};
+
+const manualAuthorizationMatchesBundle = (
+  authorization: ManualAuthorizationV1,
+  bundle: MaterializedActionBundleV1,
+): boolean =>
+  authorization.operationId === bundle.operationId &&
+  sameHex(authorization.operationHash, bundle.operationHash) &&
+  sameHex(authorization.wallet, bundle.wallet) &&
+  authorization.chainId === bundle.chainId &&
+  sameHex(authorization.manifestHash, bundle.manifestHash) &&
+  authorization.firstStepIndex === bundle.firstStepIndex &&
+  authorization.expiresAt === bundle.expiresAt &&
+  authorization.stepDigests.length === bundle.steps.length &&
+  authorization.stepFeeCeilings.length === bundle.steps.length &&
+  authorization.stepDigests.every(
+    (digest, index) =>
+      digest === bundle.steps[index]?.stepDigest,
+  ) &&
+  authorization.stepFeeCeilings.every(
+    (ceiling, index) =>
+      ceiling ===
+      (bundle.steps[index]?.feeQuote?.maximumNetworkFeeWei ?? '0'),
+  );
 
 const operationState = (
   record: OperationJournalRecord,
@@ -134,7 +352,8 @@ const operationState = (
   if (
     errorCode === 'ENVELOPE_EXPIRED' ||
     errorCode === 'STALE_STATE' ||
-    errorCode === 'OPERATION_REPREPARE_REQUIRED'
+    errorCode === 'OPERATION_REPREPARE_REQUIRED' ||
+    errorCode === 'FEE_CHANGED'
   ) {
     return 'needs_reprepare';
   }
@@ -187,7 +406,8 @@ const isTerminalReplayError = (errorCode: string | undefined): boolean =>
 const requiresFreshEnvelope = (errorCode: string | undefined): boolean =>
   errorCode === 'ENVELOPE_EXPIRED' ||
   errorCode === 'STALE_STATE' ||
-  errorCode === 'OPERATION_REPREPARE_REQUIRED';
+  errorCode === 'OPERATION_REPREPARE_REQUIRED' ||
+  errorCode === 'FEE_CHANGED';
 
 const semanticResult = (
   envelope: SignedActionEnvelopeV1 | null,
@@ -559,18 +779,43 @@ export class SignerEngine {
     policyId?: string,
     policyExposure?: PolicyExposureV1,
     policyStepFeeCeilings?: string[],
+    materializedBundle?: MaterializedActionBundleV1,
+    manualAuthorization?: ManualAuthorizationV1,
   ): Promise<void> {
+    const existing = parseStoredOperation(
+      await this.#vault.get(
+        storedOperationReference(envelope.operationId),
+      ),
+    );
+    const matchingExisting =
+      existing &&
+      existing.envelope.operationId === envelope.operationId &&
+      sameHex(existing.envelope.operationHash, envelope.operationHash)
+        ? existing
+        : null;
+    const existingV2 =
+      matchingExisting?.version === 2 ? matchingExisting : null;
+    const persistedBundle =
+      materializedBundle ?? existingV2?.materializedBundle;
+    const persistedAuthorization =
+      manualAuthorization ?? existingV2?.manualAuthorization;
     await this.#vault.put(
       storedOperationReference(envelope.operationId),
       JSON.stringify({
-        version: 1,
+        version: 2,
         envelope,
         ...(policyId ? { policyId } : {}),
         ...(policyExposure ? { policyExposure } : {}),
         ...(policyStepFeeCeilings
           ? { policyStepFeeCeilings }
           : {}),
-      } satisfies StoredOperationV1),
+        ...(!policyId && persistedBundle
+          ? { materializedBundle: persistedBundle }
+          : {}),
+        ...(!policyId && persistedAuthorization
+          ? { manualAuthorization: persistedAuthorization }
+          : {}),
+      } satisfies StoredOperationV2),
       { kind: 'recovery-note' },
     );
   }
@@ -710,6 +955,8 @@ export class SignerEngine {
     const firstStepIndex = record.nextStepIndex;
     let policyExposure = storedPolicyExposure;
     let policyStepFeeCeilings = storedPolicyStepFeeCeilings;
+    let materializedBundle: MaterializedActionBundleV1 | undefined;
+    let manualAuthorization: ManualAuthorizationV1 | undefined;
     if (policyId && (!policyExposure || !policyStepFeeCeilings)) {
       const stored = parseStoredOperation(
         await this.#vault.get(
@@ -723,6 +970,49 @@ export class SignerEngine {
       ) {
         policyExposure ??= stored.policyExposure;
         policyStepFeeCeilings ??= stored.policyStepFeeCeilings;
+      }
+    }
+    if (!policyId) {
+      const stored = parseStoredOperation(
+        await this.#vault.get(
+          storedOperationReference(envelope.operationId),
+        ),
+      );
+      if (
+        stored?.version === 2 &&
+        stored.envelope.operationId === envelope.operationId &&
+        sameHex(stored.envelope.operationHash, envelope.operationHash)
+      ) {
+        materializedBundle = stored.materializedBundle;
+        manualAuthorization = stored.manualAuthorization;
+      }
+      const invalidBundle =
+        materializedBundle &&
+        !materializedBundleMatchesEnvelope(
+          materializedBundle,
+          envelope,
+          wallet,
+          firstStepIndex,
+        );
+      const invalidAuthorization =
+        manualAuthorization &&
+        (!materializedBundle ||
+          !manualAuthorizationMatchesBundle(
+            manualAuthorization,
+            materializedBundle,
+          ));
+      if (invalidBundle || invalidAuthorization) {
+        record =
+          (await this.#journal.recordError(
+            envelope.operationId,
+            'OPERATION_REPREPARE_REQUIRED',
+            true,
+          )) ?? record;
+        return toResult(
+          record,
+          'retryable',
+          'OPERATION_REPREPARE_REQUIRED',
+        );
       }
     }
     const materializedSteps: MaterializedActionStep[] = [];
@@ -741,10 +1031,22 @@ export class SignerEngine {
     ) {
       try {
         await this.#verifier.verify(envelope, wallet);
-        const materialized = await this.#materializer.materializeStep(
-          envelope,
-          stepIndex,
+        const persistedEntry = materializedBundle?.steps.find(
+          (entry) => entry.stepIndex === stepIndex,
         );
+        const materialized =
+          !policyId && materializedBundle
+            ? persistedEntry?.step
+            : await this.#materializer.materializeStep(
+                envelope,
+                stepIndex,
+              );
+        if (!materialized) {
+          throw new SignerError(
+            'OPERATION_REPREPARE_REQUIRED',
+            'The stored manual authorization is missing an exact materialized step.',
+          );
+        }
         this.#assertMaterialization(
           envelope,
           stepIndex,
@@ -793,8 +1095,30 @@ export class SignerEngine {
             simulation.feeQuote,
           );
         }
+        if (manualAuthorization && materializedBundle) {
+          const authorizationOffset =
+            stepIndex - materializedBundle.firstStepIndex;
+          const ceiling =
+            manualAuthorization.stepFeeCeilings[
+              authorizationOffset
+            ];
+          if (ceiling === undefined) {
+            throw new SignerError(
+              'OPERATION_REPREPARE_REQUIRED',
+              'The stored manual authorization is missing a per-step fee ceiling.',
+            );
+          }
+          this.#assertPersistedFeeCeiling(
+            ceiling,
+            simulation.feeQuote,
+          );
+        }
         materializedSteps.push(materialized);
-        authorizedFeeQuotes.push(simulation.feeQuote);
+        authorizedFeeQuotes.push(
+          manualAuthorization && persistedEntry
+            ? persistedEntry.feeQuote
+            : simulation.feeQuote,
+        );
         authorizedStepDigests.push(
           materializedActionStepDigest(materialized),
         );
@@ -831,6 +1155,19 @@ export class SignerEngine {
     }
 
     try {
+      const actionConfirmation = buildActionConfirmation(
+        envelope,
+        materializedSteps,
+        firstStepIndex,
+        authorizedFeeQuotes,
+      );
+      await this.#vault.put(
+        activitySnapshotReference(envelope.operationId),
+        JSON.stringify(
+          buildLocalActivitySnapshot(actionConfirmation),
+        ),
+        { kind: 'recovery-note' },
+      );
       if (policyId) {
         if (!this.#autonomy) {
           const errorCode = 'AUTONOMY_UNAVAILABLE';
@@ -943,19 +1280,69 @@ export class SignerEngine {
         }
         autonomyReservation = reserved.value;
       } else {
-        await this.#journal.updateStage(
-          envelope.operationId,
-          'awaiting-confirmation',
-          firstStepIndex,
-        );
-        await this.#confirmation.confirm(
-          buildActionConfirmation(
-            envelope,
-            materializedSteps,
+        if (!manualAuthorization) {
+          materializedBundle = {
+            version: 1,
+            operationId: envelope.operationId,
+            operationHash: envelope.operationHash,
+            wallet,
+            chainId: envelope.chainId,
+            manifestHash:
+              envelope.registrySnapshot.manifestHash,
             firstStepIndex,
-            authorizedFeeQuotes,
-          ),
-        );
+            expiresAt: envelope.expiresAt,
+            steps: materializedSteps.map((step, offset) => ({
+              stepIndex: firstStepIndex + offset,
+              step,
+              stepDigest: authorizedStepDigests[offset]!,
+              ...(authorizedFeeQuotes[offset]
+                ? { feeQuote: authorizedFeeQuotes[offset] }
+                : {}),
+            })),
+          };
+          await this.#storeOperation(
+            envelope,
+            undefined,
+            undefined,
+            undefined,
+            materializedBundle,
+          );
+          await this.#journal.updateStage(
+            envelope.operationId,
+            'awaiting-confirmation',
+            firstStepIndex,
+          );
+          await this.#confirmation.confirm(
+            actionConfirmation,
+          );
+          manualAuthorization = {
+            version: 1,
+            operationId: envelope.operationId,
+            operationHash: envelope.operationHash,
+            wallet,
+            chainId: envelope.chainId,
+            manifestHash:
+              envelope.registrySnapshot.manifestHash,
+            firstStepIndex,
+            stepDigests: materializedBundle.steps.map(
+              ({ stepDigest }) => stepDigest,
+            ),
+            stepFeeCeilings: materializedBundle.steps.map(
+              ({ feeQuote }) =>
+                feeQuote?.maximumNetworkFeeWei ?? '0',
+            ),
+            authorizedAt: new Date().toISOString(),
+            expiresAt: envelope.expiresAt,
+          };
+          await this.#storeOperation(
+            envelope,
+            undefined,
+            undefined,
+            undefined,
+            materializedBundle,
+            manualAuthorization,
+          );
+        }
       }
     } catch (error) {
       const errorCode = asSignerErrorCode(error);
@@ -1055,6 +1442,23 @@ export class SignerEngine {
             throw new SignerError(
               'OPERATION_REPREPARE_REQUIRED',
               'The autonomy authorization is missing this step fee ceiling.',
+            );
+          }
+          this.#assertPersistedFeeCeiling(
+            ceiling,
+            confirmedSimulation.feeQuote,
+          );
+        } else if (manualAuthorization && materializedBundle) {
+          const authorizationOffset =
+            stepIndex - materializedBundle.firstStepIndex;
+          const ceiling =
+            manualAuthorization.stepFeeCeilings[
+              authorizationOffset
+            ];
+          if (ceiling === undefined) {
+            throw new SignerError(
+              'OPERATION_REPREPARE_REQUIRED',
+              'The manual authorization is missing this step fee ceiling.',
             );
           }
           this.#assertPersistedFeeCeiling(
@@ -1819,6 +2223,7 @@ export class SignerEngine {
       await Promise.all([
         this.#vault.delete(storedOperationReference(operationId)),
         this.#vault.delete(storedResultReference(operationId)),
+        this.#vault.delete(activitySnapshotReference(operationId)),
         this.#vault.deletePrefix(`${record.operationHash}:`),
       ]);
       return {

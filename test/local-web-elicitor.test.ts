@@ -1,7 +1,11 @@
-import { request as httpRequest } from 'node:http';
+import {
+  request as httpRequest,
+  type IncomingMessage,
+} from 'node:http';
 import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { Script } from 'node:vm';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
@@ -181,15 +185,166 @@ const submit = (
   });
 };
 
+type SseEvent = {
+  event: string;
+  data: string;
+};
+
+type SseWaiter = {
+  event: string;
+  settle: (result: SseEvent) => void;
+  reject: (error: Error) => void;
+  timer: ReturnType<typeof setTimeout>;
+};
+
+type SseClient = {
+  status: number;
+  headers: IncomingMessage['headers'];
+  nextEvent: (event?: string, timeoutMs?: number) => Promise<SseEvent>;
+  close: () => void;
+};
+
+const sseClients: SseClient[] = [];
+
+const openEventStream = (
+  session: {
+    origin: string;
+    cookie: string;
+  },
+): Promise<SseClient> =>
+  new Promise((resolve, reject) => {
+    let buffer = '';
+    let closed = false;
+    const queued: SseEvent[] = [];
+    const waiters: SseWaiter[] = [];
+
+    const failWaiters = (error: Error): void => {
+      for (const waiter of waiters.splice(0)) {
+        clearTimeout(waiter.timer);
+        waiter.reject(error);
+      }
+    };
+    const emit = (result: SseEvent): void => {
+      const index = waiters.findIndex(
+        (waiter) => waiter.event === result.event,
+      );
+      if (index < 0) {
+        queued.push(result);
+        return;
+      }
+      const [waiter] = waiters.splice(index, 1);
+      if (!waiter) return;
+      clearTimeout(waiter.timer);
+      waiter.settle(result);
+    };
+    const parse = (): void => {
+      buffer = buffer.replaceAll('\r\n', '\n');
+      let boundary = buffer.indexOf('\n\n');
+      while (boundary >= 0) {
+        const block = buffer.slice(0, boundary);
+        buffer = buffer.slice(boundary + 2);
+        let event = 'message';
+        const data: string[] = [];
+        for (const line of block.split('\n')) {
+          if (line.startsWith(':')) continue;
+          if (line.startsWith('event:')) {
+            event = line.slice('event:'.length).trim();
+          } else if (line.startsWith('data:')) {
+            data.push(line.slice('data:'.length).trimStart());
+          }
+        }
+        if (data.length > 0) emit({ event, data: data.join('\n') });
+        boundary = buffer.indexOf('\n\n');
+      }
+    };
+
+    const request = httpRequest(
+      `${session.origin}/events`,
+      {
+        headers: {
+          Cookie: session.cookie,
+          Origin: session.origin,
+          Accept: 'text/event-stream',
+          'Sec-Fetch-Site': 'same-origin',
+          'Sec-Fetch-Mode': 'cors',
+          'Sec-Fetch-Dest': 'empty',
+        },
+      },
+      (incoming) => {
+        incoming.setEncoding('utf8');
+        incoming.on('data', (chunk: string) => {
+          buffer += chunk;
+          parse();
+        });
+        incoming.once('error', (error) => {
+          if (!closed) failWaiters(error);
+        });
+        incoming.once('end', () => {
+          if (!closed) {
+            failWaiters(
+              new Error('Agent Control event stream ended unexpectedly.'),
+            );
+          }
+        });
+        const client: SseClient = {
+          status: incoming.statusCode ?? 0,
+          headers: incoming.headers,
+          nextEvent: (event = 'state', timeoutMs = 2_000) => {
+            const queuedIndex = queued.findIndex(
+              (candidate) => candidate.event === event,
+            );
+            if (queuedIndex >= 0) {
+              const [result] = queued.splice(queuedIndex, 1);
+              return Promise.resolve(result!);
+            }
+            return new Promise<SseEvent>((settle, rejectEvent) => {
+              const waiter: SseWaiter = {
+                event,
+                settle,
+                reject: rejectEvent,
+                timer: setTimeout(() => {
+                  const index = waiters.indexOf(waiter);
+                  if (index >= 0) waiters.splice(index, 1);
+                  rejectEvent(
+                    new Error(`Timed out waiting for SSE ${event} event.`),
+                  );
+                }, timeoutMs),
+              };
+              waiters.push(waiter);
+            });
+          },
+          close: () => {
+            if (closed) return;
+            closed = true;
+            failWaiters(new Error('Agent Control event stream closed.'));
+            incoming.destroy();
+            request.destroy();
+          },
+        };
+        sseClients.push(client);
+        resolve(client);
+      },
+    );
+    request.once('error', (error) => {
+      if (!closed) reject(error);
+    });
+    request.end();
+  });
+
 const eliciters: LocalWebFormElicitor[] = [];
 
 afterEach(async () => {
+  for (const client of sseClients.splice(0)) client.close();
   await Promise.all(eliciters.splice(0).map((elicitor) => elicitor.close()));
 });
 
 describe('local Agent Control elicitor', () => {
   it('uses a consumed bootstrap URL and renders a structured action card', async () => {
     let browserDone: Promise<void> = Promise.resolve();
+    let markBrowserStarted!: () => void;
+    const browserStarted = new Promise<void>((resolve) => {
+      markBrowserStarted = resolve;
+    });
     const elicitor = new LocalWebFormElicitor({
       openUrl: (url) => {
         browserDone = (async () => {
@@ -278,7 +433,39 @@ describe('local Agent Control elicitor', () => {
             'const submitter = event.submitter',
           );
           expect(session.page.body).toContain(
-            'submittedAction.value = submitter.value',
+            'event.preventDefault()',
+          );
+          expect(session.page.body).toContain(
+            'const formData = new FormData(form)',
+          );
+          expect(session.page.body).toContain(
+            'const response = await fetch(actionUrl',
+          );
+          expect(session.page.body).toContain(
+            'patchSurface(source)',
+          );
+          expect(session.page.body).toContain(
+            'data-dashboard-region',
+          );
+          expect(session.page.body).toContain(
+            'data-review-region',
+          );
+          expect(session.page.body).not.toContain(
+            'currentMain.replaceWith',
+          );
+          expect(
+            session.page.body.match(/new EventSource\(/gu),
+          ).toHaveLength(1);
+          const clientScript = session.page.body.match(
+            /<script nonce="[^"]+">([\s\S]*?)<\/script>/u,
+          )?.[1];
+          expect(clientScript).toBeDefined();
+          expect(() => new Script(clientScript)).not.toThrow();
+          expect(session.page.body).not.toContain(
+            'window.location.assign',
+          );
+          expect(session.page.body).not.toContain(
+            'window.location.href =',
           );
 
           const csrf = hiddenValue(session.page.body, 'csrf');
@@ -303,6 +490,7 @@ describe('local Agent Control elicitor', () => {
           });
           expect(replay.status).toBe(401);
         })();
+        markBrowserStarted();
         return browserDone;
       },
     });
@@ -312,7 +500,7 @@ describe('local Agent Control elicitor', () => {
       CONFIRMATION,
       5_000,
     );
-    await new Promise<void>((resolve) => setImmediate(resolve));
+    await browserStarted;
     await browserDone;
     await expect(confirmation).resolves.toEqual({
       outcome: 'accepted',
@@ -377,6 +565,7 @@ describe('local Agent Control elicitor', () => {
       values: { sellBaseLiquidity: '12.5' },
     });
     await browserDone;
+    expect(elicitor.focusedOperationId).toBeNull();
   });
 
   it('returns an explicit decline without requiring form values', async () => {
@@ -503,28 +692,49 @@ describe('local Agent Control elicitor', () => {
     });
 
     expect((await submit(session, firstSubmission)).status).toBe(200);
-    expect((await submit(session, secondSubmission)).status).toBe(200);
+    expect(
+      (
+        await submit(session, secondSubmission, {
+          'Sec-Fetch-Mode': 'cors',
+          'Sec-Fetch-Dest': 'empty',
+        })
+      ).status,
+    ).toBe(200);
     expect(submitted).toEqual(['onboard-privacy', 'onboard-privacy']);
     expect((await submit(session, firstSubmission)).status).toBe(403);
     expect((await submit(session, secondSubmission)).status).toBe(403);
   });
 
-  it('lets an active control page receive a prompt without opening a duplicate tab', async () => {
+  it('reuses a live SSE control page and publishes the pending prompt without opening a duplicate tab', async () => {
     const openedUrls: string[] = [];
     const elicitor = new LocalWebFormElicitor({
       openUrl: (url) => {
         openedUrls.push(url);
       },
-      activeBrowserGraceMs: 500,
+      activeBrowserGraceMs: 40,
     });
     eliciters.push(elicitor);
 
     await elicitor.openControlPanel();
     const session = await establishSession(openedUrls[0] ?? '');
+    const events = await openEventStream(session);
+    expect(events.status).toBe(200);
+    expect(events.headers['content-type']).toContain(
+      'text/event-stream',
+    );
+    const initial = JSON.parse(
+      (await events.nextEvent()).data,
+    ) as { revision: number; stateKey: string };
     const confirmation = elicitor.requestConfirmation(
       CONFIRMATION,
       5_000,
     );
+    const pending = JSON.parse(
+      (await events.nextEvent()).data,
+    ) as { revision: number; stateKey: string };
+    expect(pending.revision).toBeGreaterThan(initial.revision);
+    expect(pending.stateKey).not.toBe(initial.stateKey);
+    await new Promise<void>((resolve) => setTimeout(resolve, 100));
     expect(openedUrls).toHaveLength(1);
 
     const promptPage = await rawRequest(session.controlUrl, {
@@ -550,22 +760,96 @@ describe('local Agent Control elicitor', () => {
     await expect(confirmation).resolves.toEqual({
       outcome: 'accepted',
     });
+    expect(elicitor.focusedOperationId).toBe(
+      CONFIRMATION.operationId,
+    );
     expect(openedUrls).toHaveLength(1);
   });
 
-  it('reopens Agent Control when the previous page activity is stale', async () => {
+  it('keeps an accepted manual operation focused until an authenticated local dismissal', async () => {
+    let bootstrapUrl = '';
+    let delegatedActions = 0;
+    const elicitor = new LocalWebFormElicitor({
+      openUrl: (url) => {
+        bootstrapUrl = url;
+      },
+      activeBrowserGraceMs: 1_000,
+      getControlSummary: () => ({
+        wallet: CONFIRMATION.wallet,
+        network: 'COTI Mainnet',
+        balance: '1 COTI',
+        privacyStatus: 'ready',
+        signerStatus: 'ready',
+        autonomy: { mode: 'manual' },
+        pendingOperations: 0,
+        recentOperations: [],
+        diagnostics: [],
+        controlActions: { onboardPrivacy: true },
+      }),
+      onControlAction: () => {
+        delegatedActions += 1;
+        return { ok: true, message: 'Unexpected delegated action.' };
+      },
+    });
+    eliciters.push(elicitor);
+
+    await elicitor.openControlPanel();
+    const session = await establishSession(bootstrapUrl);
+    const confirmation = elicitor.requestConfirmation(
+      CONFIRMATION,
+      5_000,
+    );
+    const promptPage = await rawRequest(session.controlUrl, {
+      headers: {
+        Cookie: session.cookie,
+        'Sec-Fetch-Site': 'same-origin',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Dest': 'document',
+      },
+    });
+    const accepted = await submit(
+      session,
+      new URLSearchParams({
+        csrf: hiddenValue(promptPage.body, 'csrf'),
+        promptId: hiddenValue(promptPage.body, 'promptId'),
+        intent: 'prompt',
+        action: 'confirm',
+      }),
+    );
+    expect(accepted.status).toBe(200);
+    await expect(confirmation).resolves.toEqual({
+      outcome: 'accepted',
+    });
+    expect(elicitor.focusedOperationId).toBe(
+      CONFIRMATION.operationId,
+    );
+
+    const dismissed = await submit(
+      session,
+      new URLSearchParams({
+        csrf: hiddenValue(accepted.body, 'csrf'),
+        intent: 'control',
+        action: 'dismiss-focused-operation',
+      }),
+    );
+    expect(dismissed.status).toBe(200);
+    expect(dismissed.body).toContain('Operation details closed.');
+    expect(elicitor.focusedOperationId).toBeNull();
+    expect(delegatedActions).toBe(0);
+  });
+
+  it('does not treat an authenticated page load without SSE as a live control tab', async () => {
     const openedUrls: string[] = [];
     const elicitor = new LocalWebFormElicitor({
       openUrl: (url) => {
         openedUrls.push(url);
       },
-      activeBrowserGraceMs: 10,
+      activeBrowserGraceMs: 25,
     });
     eliciters.push(elicitor);
 
     await elicitor.openControlPanel();
     await establishSession(openedUrls[0] ?? '');
-    await new Promise<void>((resolve) => setTimeout(resolve, 25));
 
     const confirmation = elicitor.requestConfirmation(
       CONFIRMATION,
@@ -580,46 +864,127 @@ describe('local Agent Control elicitor', () => {
     });
   });
 
-  it('keeps watching when the active control page closes after the first check', async () => {
+  it('waits for the SSE disconnect grace period and then opens exactly one replacement tab', async () => {
     const openedUrls: string[] = [];
     const elicitor = new LocalWebFormElicitor({
       openUrl: (url) => {
         openedUrls.push(url);
       },
-      activeBrowserGraceMs: 50,
+      activeBrowserGraceMs: 80,
     });
     eliciters.push(elicitor);
 
     await elicitor.openControlPanel();
     const session = await establishSession(openedUrls[0] ?? '');
+    const events = await openEventStream(session);
+    await events.nextEvent();
     const confirmation = elicitor.requestConfirmation(
       CONFIRMATION,
       5_000,
     );
-
-    await new Promise<void>((resolve) => setTimeout(resolve, 125));
-    expect(
-      (
-        await rawRequest(session.controlUrl, {
-          headers: {
-            Cookie: session.cookie,
-            'Sec-Fetch-Site': 'same-origin',
-            'Sec-Fetch-Mode': 'navigate',
-            'Sec-Fetch-Dest': 'document',
-          },
-        })
-      ).status,
-    ).toBe(200);
-    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+    await events.nextEvent();
     expect(openedUrls).toHaveLength(1);
 
+    events.close();
+    await new Promise<void>((resolve) => setTimeout(resolve, 30));
+    expect(openedUrls).toHaveLength(1);
     await expect.poll(() => openedUrls.length).toBe(2);
     expect(openedUrls[1]).toMatch(/\/control$/u);
+    await new Promise<void>((resolve) => setTimeout(resolve, 180));
+    expect(openedUrls).toHaveLength(2);
 
     await elicitor.close();
     await expect(confirmation).resolves.toEqual({
       outcome: 'cancelled',
     });
+  });
+
+  it('rejects unauthenticated and cross-origin SSE connections', async () => {
+    let bootstrapUrl = '';
+    const elicitor = new LocalWebFormElicitor({
+      openUrl: (url) => {
+        bootstrapUrl = url;
+      },
+    });
+    eliciters.push(elicitor);
+
+    await elicitor.openControlPanel();
+    const session = await establishSession(bootstrapUrl);
+    const eventHeaders = {
+      Accept: 'text/event-stream',
+      'Sec-Fetch-Site': 'same-origin',
+      'Sec-Fetch-Mode': 'cors',
+      'Sec-Fetch-Dest': 'empty',
+    };
+    expect(
+      (
+        await rawRequest(`${session.origin}/events`, {
+          headers: {
+            Origin: session.origin,
+            ...eventHeaders,
+          },
+        })
+      ).status,
+    ).toBe(401);
+    expect(
+      (
+        await rawRequest(`${session.origin}/events`, {
+          headers: {
+            Cookie: session.cookie,
+            Origin: 'https://attacker.example',
+            ...eventHeaders,
+          },
+        })
+      ).status,
+    ).toBe(403);
+    expect(
+      (
+        await rawRequest(`${session.origin}/events`, {
+          headers: {
+            Cookie: session.cookie,
+            Origin: session.origin,
+            ...eventHeaders,
+            Accept: 'text/html',
+          },
+        })
+      ).status,
+    ).toBe(403);
+  });
+
+  it('publishes SSE state events when the signer summary changes', async () => {
+    let bootstrapUrl = '';
+    let pendingOperations = 0;
+    const elicitor = new LocalWebFormElicitor({
+      openUrl: (url) => {
+        bootstrapUrl = url;
+      },
+      getControlSummary: () => ({
+        wallet: '0x1111111111111111111111111111111111111111',
+        network: 'COTI Mainnet',
+        balance: '1 COTI',
+        privacyStatus: 'ready',
+        signerStatus: 'ready',
+        autonomy: { mode: 'manual' },
+        pendingOperations,
+        recentOperations: [],
+        diagnostics: [],
+      }),
+    });
+    eliciters.push(elicitor);
+
+    await elicitor.openControlPanel();
+    const session = await establishSession(bootstrapUrl);
+    const events = await openEventStream(session);
+    const initial = JSON.parse(
+      (await events.nextEvent()).data,
+    ) as { revision: number; stateKey: string };
+
+    pendingOperations = 1;
+    const updated = JSON.parse(
+      (await events.nextEvent('state', 2_500)).data,
+    ) as { revision: number; stateKey: string };
+    expect(updated.revision).toBeGreaterThan(initial.revision);
+    expect(updated.stateKey).not.toBe(initial.stateKey);
   });
 
   it('does not issue a new-session CSRF token from an old delayed response', async () => {
@@ -1370,6 +1735,7 @@ describe('local Agent Control elicitor', () => {
       ),
     ).resolves.toEqual({ outcome: 'accepted' });
     await browserDone;
+    expect(elicitor.focusedOperationId).toBeNull();
   });
 
   it('accepts human token, COTI, price, and local-time policy limits while returning exact atomic values', async () => {
@@ -1775,6 +2141,65 @@ describe('Agent Control state refresh key', () => {
         },
       }),
     );
+  });
+
+  it('keeps the same private-input region across unrelated activity updates', () => {
+    const pending = {
+      id: 'private-operation',
+      kind: 'private-values' as const,
+      request: {
+        operationId: 'private-operation',
+        operationHash: `0x${'44'.repeat(32)}` as `0x${string}`,
+        wallet: CONFIRMATION.wallet,
+        fields: [
+          {
+            id: 'sellBaseLiquidity',
+            title: 'Private p.WISP inventory',
+            description: 'Amount available to recurring sells.',
+            kind: 'decimal-amount' as const,
+          },
+        ],
+      },
+    };
+    const firstModel = {
+      csrfToken: 'csrf-1',
+      pending,
+      summary: {
+        wallet: CONFIRMATION.wallet,
+        pendingOperations: 0,
+        autonomy: { mode: 'manual' as const },
+      },
+    };
+    const nextModel = {
+      ...firstModel,
+      csrfToken: 'csrf-2',
+      summary: {
+        ...firstModel.summary,
+        pendingOperations: 1,
+      },
+    };
+    const firstPage = renderAgentControlPage(firstModel, 'nonce-1');
+    const nextPage = renderAgentControlPage(nextModel, 'nonce-2');
+    const reviewKey = (page: string): string | undefined =>
+      page.match(
+        /data-review-region data-region-key="([^"]+)"/u,
+      )?.[1];
+
+    expect(agentControlStateKey(firstModel)).not.toBe(
+      agentControlStateKey(nextModel),
+    );
+    expect(reviewKey(firstPage)).toBe(
+      'prompt:private-values:private-operation',
+    );
+    expect(reviewKey(nextPage)).toBe(reviewKey(firstPage));
+    expect(nextPage).toContain('value="csrf-2"');
+    expect(nextPage).toContain(
+      "region.querySelectorAll('input:not([type=\"hidden\"]), textarea, select')",
+    );
+    expect(nextPage).toContain(
+      "state.key !== (region.dataset.regionKey || '')",
+    );
+    expect(nextPage).toContain('restoreRegionState(current, state)');
   });
 
   it('changes when a new operation has the same status', () => {

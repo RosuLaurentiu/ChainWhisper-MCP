@@ -49,6 +49,9 @@ export type AgentControlAction =
   | 'pause-autonomy'
   | 'resume-autonomy'
   | 'revoke-autonomy'
+  | 'dismiss-focused-operation'
+  | 'history-previous'
+  | 'history-next'
   | 'refresh-balances'
   | 'import-wallet'
   | 'generate-wallet'
@@ -107,6 +110,11 @@ type BrowserArrivalWaiter = {
   settle: (arrived: boolean) => void;
 };
 
+type EventClient = {
+  response: ServerResponse;
+  sessionGeneration: number;
+};
+
 class BodyTooLargeError extends Error {}
 
 const COOKIE_NAME = 'cw_agent_control';
@@ -119,6 +127,9 @@ const SESSION_LIFETIME_SECONDS = 8 * 60 * 60;
 const DEFAULT_BROWSER_ARRIVAL_TIMEOUT_MS = 5_000;
 const MAX_ACTIVE_CSRF_TOKENS = 8;
 const DEFAULT_ACTIVE_BROWSER_GRACE_MS = 5_000;
+const MAX_EVENT_CONNECTIONS = 4;
+const EVENT_STATE_REFRESH_MS = 750;
+const EVENT_KEEPALIVE_MS = 15_000;
 
 const digest = (value: string): Buffer =>
   createHash('sha256').update(value).digest();
@@ -262,9 +273,30 @@ const isSafeSubmissionMetadata = (request: IncomingMessage): boolean => {
   const mode = request.headers['sec-fetch-mode'];
   const destination = request.headers['sec-fetch-dest'];
   if (site && site !== 'same-origin') return false;
-  if (mode && mode !== 'navigate') return false;
-  if (destination && destination !== 'document') return false;
-  return true;
+  return (
+    ((!mode || mode === 'navigate') &&
+      (!destination || destination === 'document')) ||
+    ((!mode || mode === 'cors' || mode === 'same-origin') &&
+      (!destination || destination === 'empty'))
+  );
+};
+
+const isSafeEventMetadata = (
+  request: IncomingMessage,
+  expectedOrigin: string,
+): boolean => {
+  const origin = request.headers.origin;
+  const site = request.headers['sec-fetch-site'];
+  const mode = request.headers['sec-fetch-mode'];
+  const destination = request.headers['sec-fetch-dest'];
+  const accept = request.headers.accept ?? '';
+  if (origin && origin !== expectedOrigin) return false;
+  if (site && site !== 'same-origin') return false;
+  if (mode && mode !== 'cors' && mode !== 'same-origin') return false;
+  if (destination && destination !== 'empty') return false;
+  return accept
+    .split(',')
+    .some((value) => value.trim().toLowerCase() === 'text/event-stream');
 };
 
 const defaultSummary = (
@@ -299,6 +331,7 @@ export class LocalWebFormElicitor
   readonly #onControlAction?: LocalWebFormElicitorOptions['onControlAction'];
   readonly #rateWindows = new Map<string, RateWindow>();
   readonly #browserArrivalWaiters = new Set<BrowserArrivalWaiter>();
+  readonly #eventClients = new Set<EventClient>();
   readonly #responseSessionGenerations = new WeakMap<
     ServerResponse,
     number
@@ -314,9 +347,16 @@ export class LocalWebFormElicitor
   #sessionDigest: Buffer | null = null;
   #sessionGeneration = 0;
   #csrfDigests: Buffer[] = [];
-  #lastAuthenticatedActivityAt = 0;
-  #promptOpenAttemptActivityAt: number | null = null;
   #promptOpenTimer: ReturnType<typeof setTimeout> | null = null;
+  #promptOpenAttempted = false;
+  #lastEventDisconnectedAt = 0;
+  #eventStateTimer: ReturnType<typeof setTimeout> | null = null;
+  #eventKeepaliveTimer: ReturnType<typeof setTimeout> | null = null;
+  #eventStateRefresh: Promise<void> | null = null;
+  #eventForcePublish = false;
+  #eventStateKey: string | null = null;
+  #eventStateRevision = 0;
+  #focusedOperationId: string | null = null;
   #pending: PendingPrompt | null = null;
   #closed = false;
 
@@ -344,6 +384,10 @@ export class LocalWebFormElicitor
 
   get controlPort(): number | null {
     return this.controlPageReady ? this.#port : null;
+  }
+
+  get focusedOperationId(): string | null {
+    return this.#focusedOperationId;
   }
 
   async startControlServer(): Promise<boolean> {
@@ -388,6 +432,13 @@ export class LocalWebFormElicitor
         reason: 'server-unavailable',
       };
     }
+    if (this.#hasLiveControlPage()) {
+      return {
+        opened: true,
+        ready: true,
+        activePrompt: Boolean(this.#pending),
+      };
+    }
     const open = async (): Promise<
       OpenControlPanelResult['reason'] | null
     > => {
@@ -422,7 +473,7 @@ export class LocalWebFormElicitor
         this.#sessionDigest = null;
         this.#sessionGeneration += 1;
         this.#csrfDigests = [];
-        this.#lastAuthenticatedActivityAt = 0;
+        this.#disconnectEventClients();
       }
       return reason;
     };
@@ -460,8 +511,9 @@ export class LocalWebFormElicitor
     this.#sessionDigest = null;
     this.#sessionGeneration += 1;
     this.#csrfDigests = [];
-    this.#lastAuthenticatedActivityAt = 0;
     this.#clearPromptOpenTimer();
+    this.#clearEventTimers();
+    this.#disconnectEventClients();
     this.#signalBrowserArrival(null, false);
     this.#settlePending('cancelled');
     const server = this.#server;
@@ -577,6 +629,7 @@ export class LocalWebFormElicitor
         if (this.#pending?.id !== id) return;
         this.#pending = null;
         this.#clearPromptOpenTimer();
+        this.#publishStateChange();
         resolve({ outcome: 'timeout' });
       }, timeoutMs);
       this.#pending = {
@@ -586,6 +639,7 @@ export class LocalWebFormElicitor
         resolve,
         timer,
       };
+      this.#publishStateChange();
       this.#openForPendingPrompt(id);
     });
   }
@@ -605,6 +659,7 @@ export class LocalWebFormElicitor
         if (this.#pending?.id !== id) return;
         this.#pending = null;
         this.#clearPromptOpenTimer();
+        this.#publishStateChange();
         resolve({ outcome: 'timeout' });
       }, timeoutMs);
       this.#pending = {
@@ -614,41 +669,52 @@ export class LocalWebFormElicitor
         resolve,
         timer,
       };
+      this.#publishStateChange();
       this.#openForPendingPrompt(id);
     });
   }
 
   #openForPendingPrompt(id: string): void {
     this.#clearPromptOpenTimer();
-    this.#promptOpenAttemptActivityAt = null;
-    this.#watchPendingPrompt(id);
+    this.#promptOpenAttempted = false;
+    if (this.#hasLiveControlPage()) return;
+    this.#schedulePendingPromptOpen(id);
   }
 
-  #watchPendingPrompt(id: string): void {
-    if (this.#pending?.id !== id) return;
-    if (this.#hasRecentAuthenticatedActivity()) {
-      this.#promptOpenAttemptActivityAt = null;
-    } else if (
-      this.#promptOpenAttemptActivityAt !==
-      this.#lastAuthenticatedActivityAt
+  #schedulePendingPromptOpen(id: string): void {
+    if (
+      this.#pending?.id !== id ||
+      this.#hasLiveControlPage() ||
+      this.#promptOpenAttempted ||
+      this.#promptOpenTimer
     ) {
-      this.#promptOpenAttemptActivityAt =
-        this.#lastAuthenticatedActivityAt;
-      void this.openControlPanel();
+      return;
     }
+    const elapsedSinceDisconnect =
+      this.#lastEventDisconnectedAt > 0
+        ? Date.now() - this.#lastEventDisconnectedAt
+        : this.#activeBrowserGraceMs;
+    const delay = Math.max(
+      0,
+      this.#activeBrowserGraceMs - elapsedSinceDisconnect,
+    );
     this.#promptOpenTimer = setTimeout(() => {
       this.#promptOpenTimer = null;
-      this.#watchPendingPrompt(id);
-    }, this.#activeBrowserGraceMs + 100);
+      if (
+        this.#pending?.id !== id ||
+        this.#hasLiveControlPage() ||
+        this.#promptOpenAttempted
+      ) {
+        return;
+      }
+      this.#promptOpenAttempted = true;
+      void this.openControlPanel();
+    }, delay);
+    this.#promptOpenTimer.unref?.();
   }
 
-  #hasRecentAuthenticatedActivity(): boolean {
-    return (
-      this.#sessionDigest !== null &&
-      this.#lastAuthenticatedActivityAt > 0 &&
-      Date.now() - this.#lastAuthenticatedActivityAt <=
-        this.#activeBrowserGraceMs
-    );
+  #hasLiveControlPage(): boolean {
+    return this.#eventClients.size > 0;
   }
 
   #clearPromptOpenTimer(): void {
@@ -745,10 +811,10 @@ export class LocalWebFormElicitor
       this.#bootstrapToken = null;
       const sessionToken = randomToken();
       const sessionDigest = digest(sessionToken);
+      this.#disconnectEventClients();
       this.#sessionDigest = sessionDigest;
       this.#sessionGeneration += 1;
       this.#csrfDigests = [];
-      this.#lastAuthenticatedActivityAt = 0;
       this.#bindBrowserArrivalSession(
         requestUrl.slice('/open/'.length),
         sessionDigest,
@@ -771,14 +837,29 @@ export class LocalWebFormElicitor
         response,
         this.#sessionGeneration,
       );
-      this.#lastAuthenticatedActivityAt = Date.now();
       await this.#sendPage(response, 200);
       this.#signalBrowserArrival(request);
       return;
     }
     if (request.method === 'GET' && requestUrl === '/snapshot') {
-      this.#lastAuthenticatedActivityAt = Date.now();
       await this.#sendSnapshot(response);
+      return;
+    }
+    if (request.method === 'GET' && requestUrl === '/events') {
+      const expectedOrigin = `http://${this.#expectedHost}`;
+      if (!isSafeEventMetadata(request, expectedOrigin)) {
+        this.#sendEmpty(response, 403);
+        return;
+      }
+      if (this.#eventClients.size >= MAX_EVENT_CONNECTIONS) {
+        response.writeHead(429, {
+          ...securityHeaders(),
+          'Retry-After': '5',
+        });
+        response.end();
+        return;
+      }
+      this.#openEventStream(request, response);
       return;
     }
     if (request.method === 'POST' && requestUrl === '/action') {
@@ -786,7 +867,6 @@ export class LocalWebFormElicitor
         response,
         this.#sessionGeneration,
       );
-      this.#lastAuthenticatedActivityAt = Date.now();
       await this.#handleAction(request, response);
       return;
     }
@@ -825,13 +905,157 @@ export class LocalWebFormElicitor
     return matchesDigest(session, this.#sessionDigest);
   }
 
+  #openEventStream(
+    request: IncomingMessage,
+    response: ServerResponse,
+  ): void {
+    const client: EventClient = {
+      response,
+      sessionGeneration: this.#sessionGeneration,
+    };
+    response.writeHead(200, {
+      ...securityHeaders(),
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      Connection: 'keep-alive',
+      'X-Accel-Buffering': 'no',
+    });
+    response.flushHeaders();
+    response.write('retry: 1000\n: connected\n\n');
+    this.#eventClients.add(client);
+    response.once('close', () => this.#removeEventClient(client));
+    this.#lastEventDisconnectedAt = 0;
+    this.#promptOpenAttempted = false;
+    this.#clearPromptOpenTimer();
+    this.#signalBrowserArrival(request);
+    this.#publishStateChange(true);
+    this.#scheduleEventKeepalive();
+  }
+
+  #removeEventClient(client: EventClient): void {
+    if (!this.#eventClients.delete(client)) return;
+    if (this.#eventClients.size > 0) return;
+    this.#lastEventDisconnectedAt = Date.now();
+    this.#clearEventTimers();
+    this.#promptOpenAttempted = false;
+    const pendingId = this.#pending?.id;
+    if (pendingId) this.#schedulePendingPromptOpen(pendingId);
+  }
+
+  #disconnectEventClients(): void {
+    if (this.#eventClients.size === 0) return;
+    const clients = [...this.#eventClients];
+    this.#eventClients.clear();
+    this.#clearEventTimers();
+    this.#lastEventDisconnectedAt = Date.now();
+    for (const { response } of clients) response.end();
+  }
+
+  #publishStateChange(force = false): void {
+    if (this.#eventClients.size === 0 || this.#closed) return;
+    this.#eventForcePublish ||= force;
+    if (this.#eventStateRefresh) return;
+    const refresh = this.#refreshEventState();
+    this.#eventStateRefresh = refresh;
+    void refresh.finally(() => {
+      if (this.#eventStateRefresh === refresh) {
+        this.#eventStateRefresh = null;
+      }
+      if (this.#eventForcePublish && this.#eventClients.size > 0) {
+        this.#publishStateChange();
+        return;
+      }
+      this.#scheduleEventStateRefresh();
+    });
+  }
+
+  async #refreshEventState(): Promise<void> {
+    const force = this.#eventForcePublish;
+    this.#eventForcePublish = false;
+    const pending = this.#publicPending();
+    const summary = await this.#summary();
+    if (this.#closed || this.#eventClients.size === 0) return;
+    const stateKey = agentControlStateKey({ pending, summary });
+    const changed = stateKey !== this.#eventStateKey;
+    if (!force && !changed) return;
+    if (changed) {
+      this.#eventStateKey = stateKey;
+      this.#eventStateRevision += 1;
+    }
+    const payload = JSON.stringify({
+      revision: this.#eventStateRevision,
+      stateKey,
+    });
+    for (const client of [...this.#eventClients]) {
+      if (client.sessionGeneration !== this.#sessionGeneration) {
+        this.#removeEventClient(client);
+        client.response.end();
+        continue;
+      }
+      client.response.write(`event: state\ndata: ${payload}\n\n`);
+    }
+  }
+
+  #scheduleEventStateRefresh(): void {
+    if (
+      this.#closed ||
+      this.#eventClients.size === 0 ||
+      this.#eventStateTimer ||
+      this.#eventStateRefresh
+    ) {
+      return;
+    }
+    this.#eventStateTimer = setTimeout(() => {
+      this.#eventStateTimer = null;
+      this.#publishStateChange();
+    }, EVENT_STATE_REFRESH_MS);
+    this.#eventStateTimer.unref?.();
+  }
+
+  #scheduleEventKeepalive(): void {
+    if (
+      this.#closed ||
+      this.#eventClients.size === 0 ||
+      this.#eventKeepaliveTimer
+    ) {
+      return;
+    }
+    this.#eventKeepaliveTimer = setTimeout(() => {
+      this.#eventKeepaliveTimer = null;
+      for (const { response } of this.#eventClients) {
+        response.write(`: keepalive ${Date.now()}\n\n`);
+      }
+      this.#scheduleEventKeepalive();
+    }, EVENT_KEEPALIVE_MS);
+    this.#eventKeepaliveTimer.unref?.();
+  }
+
+  #clearEventTimers(): void {
+    if (this.#eventStateTimer) {
+      clearTimeout(this.#eventStateTimer);
+      this.#eventStateTimer = null;
+    }
+    if (this.#eventKeepaliveTimer) {
+      clearTimeout(this.#eventKeepaliveTimer);
+      this.#eventKeepaliveTimer = null;
+    }
+  }
+
   async #summary(): Promise<AgentControlSummary> {
-    if (!this.#getControlSummary) return defaultSummary(this.#pending);
+    if (!this.#getControlSummary) {
+      return {
+        ...defaultSummary(this.#pending),
+        focusedOperationId: this.#focusedOperationId,
+      };
+    }
     try {
-      return await this.#getControlSummary();
+      return {
+        ...(await this.#getControlSummary()),
+        focusedOperationId: this.#focusedOperationId,
+      };
     } catch {
       return {
         ...defaultSummary(this.#pending),
+        focusedOperationId: this.#focusedOperationId,
         signerStatus: 'unavailable',
         diagnostics: [
           {
@@ -1029,6 +1253,9 @@ export class LocalWebFormElicitor
       action !== 'pause-autonomy' &&
       action !== 'resume-autonomy' &&
       action !== 'revoke-autonomy' &&
+      action !== 'dismiss-focused-operation' &&
+      action !== 'history-previous' &&
+      action !== 'history-next' &&
       action !== 'refresh-balances' &&
       action !== 'import-wallet' &&
       action !== 'generate-wallet' &&
@@ -1040,6 +1267,14 @@ export class LocalWebFormElicitor
     ) {
       await this.#sendPage(response, 400, {
         error: 'Unknown Agent Control action.',
+      });
+      return;
+    }
+    if (action === 'dismiss-focused-operation') {
+      this.#focusedOperationId = null;
+      this.#publishStateChange();
+      await this.#sendPage(response, 200, {
+        flash: 'Operation details closed.',
       });
       return;
     }
@@ -1096,6 +1331,7 @@ export class LocalWebFormElicitor
         fields = { operationId, operationHash };
       }
       const result = await this.#onControlAction(action, fields);
+      this.#publishStateChange();
       await this.#sendPage(response, result.ok ? 200 : 409, {
         ...(result.ok
           ? { flash: result.message }
@@ -1288,6 +1524,12 @@ export class LocalWebFormElicitor
           }
         }
       }
+      if (
+        !prompt.request.autonomyEditor &&
+        !prompt.request.action.toLowerCase().includes('autonomy')
+      ) {
+        this.#focusedOperationId = prompt.request.operationId;
+      }
       this.#settlePending('accepted', editor ? values : undefined);
       await this.#sendPage(response, 200, {
         flash:
@@ -1327,6 +1569,7 @@ export class LocalWebFormElicitor
     if (!prompt) return;
     this.#pending = null;
     this.#clearPromptOpenTimer();
+    this.#publishStateChange();
     clearTimeout(prompt.timer);
     if (prompt.kind === 'confirmation') {
       prompt.resolve(

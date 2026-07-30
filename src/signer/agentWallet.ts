@@ -25,6 +25,7 @@ export type WalletControlState = {
     privateKey: string;
   } | null;
   restartRequired: boolean;
+  activityPage?: number;
   lastDiagnostic: string | null;
   lastDiagnosticCode?: string | null;
 };
@@ -170,6 +171,7 @@ export const saveAgentWallet = async (options: {
           }
         : null;
     options.state.restartRequired = !options.activateInProcess;
+    options.state.activityPage = 0;
     options.state.lastDiagnostic = options.activateInProcess
       ? 'agent-wallet-saved-activating'
       : 'agent-wallet-saved-restart-required';

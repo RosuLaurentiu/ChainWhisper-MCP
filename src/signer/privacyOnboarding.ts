@@ -24,7 +24,8 @@ import {
   assertCotiSignerTransactionFeePolicy,
   maximumNetworkFeeDisplay,
 } from './cotiRuntime.js';
-import { SignerError } from './errors.js';
+import { SignerError, asSignerErrorCode } from './errors.js';
+import { OperationJournal } from './journal.js';
 import { NonceQueue } from './nonceQueue.js';
 import type { Address, HexString } from './types.js';
 import { EncryptedSecretVault } from './vault.js';
@@ -103,8 +104,14 @@ const parseRevertedTransactionHashes = (
   return [...unique.values()];
 };
 
-const operationHashFor = (wallet: Address): HexString =>
+export const privacyOnboardingOperationHash = (
+  wallet: Address,
+): HexString =>
   sha256Hex(`chainwhisper/privacy-onboard/v1:${wallet}`);
+
+export const privacyOnboardingOperationId = (
+  wallet: Address,
+): string => `privacy-onboard-${wallet.slice(2)}`;
 
 const processingError = (): SignerError =>
   new SignerError(
@@ -273,7 +280,7 @@ const parseRecovery = (
       (candidate.wallet !== wallet ||
         candidate.contract?.toString().toLowerCase() !==
           ACCOUNT_ONBOARD_CONTRACT.toLowerCase() ||
-        candidate.operationHash !== operationHashFor(wallet)))
+        candidate.operationHash !== privacyOnboardingOperationHash(wallet)))
   ) {
     throw recoveryError(
       'the record is for a different wallet, contract, or operation.',
@@ -283,7 +290,7 @@ const parseRecovery = (
     version: 1,
     wallet,
     contract: ACCOUNT_ONBOARD_CONTRACT.toLowerCase() as Address,
-    operationHash: operationHashFor(wallet),
+    operationHash: privacyOnboardingOperationHash(wallet),
     rsaPublicKey:
       typeof candidate.rsaPublicKey === 'string'
         ? candidate.rsaPublicKey
@@ -348,6 +355,7 @@ export class PrivacyOnboardingService {
   readonly #vault: EncryptedSecretVault;
   readonly #confirmation: ConfirmationGate;
   readonly #nonceQueue: NonceQueue;
+  readonly #journal: OperationJournal | null;
   readonly #assertRuntimeAttested: () => Promise<void>;
 
   constructor(options: {
@@ -355,14 +363,74 @@ export class PrivacyOnboardingService {
     vault: EncryptedSecretVault;
     confirmation: ConfirmationGate;
     nonceQueue: NonceQueue;
+    journal?: OperationJournal;
     assertRuntimeAttested?: () => Promise<void>;
   }) {
     this.#wallet = options.wallet;
     this.#vault = options.vault;
     this.#confirmation = options.confirmation;
     this.#nonceQueue = options.nonceQueue;
+    this.#journal = options.journal ?? null;
     this.#assertRuntimeAttested =
       options.assertRuntimeAttested ?? (async () => undefined);
+  }
+
+  async #beginJournal(wallet: Address): Promise<string> {
+    const operationId = privacyOnboardingOperationId(wallet);
+    if (this.#journal) {
+      await this.#journal.begin(
+        operationId,
+        privacyOnboardingOperationHash(wallet),
+      );
+    }
+    return operationId;
+  }
+
+  async #recordDurableRecovery(
+    operationId: string,
+    recovery: PrivacyOnboardingRecoveryV1,
+  ): Promise<void> {
+    if (!this.#journal || !recovery.txHash) return;
+    const current = await this.#journal.get(operationId);
+    if (
+      current?.transactionHashes.some(
+        (hash) =>
+          hash.toLowerCase() === recovery.txHash!.toLowerCase(),
+      ) &&
+      ['prepared-broadcast', 'broadcast', 'completed'].includes(
+        current.stage,
+      )
+    ) {
+      return;
+    }
+    if (
+      recovery.nonce !== undefined &&
+      recovery.signedTransaction
+    ) {
+      await this.#journal.recordPreparedTransaction(
+        operationId,
+        recovery.nonce,
+        recovery.txHash,
+        0,
+      );
+      return;
+    }
+    // Legacy recovery records contain only a transaction hash, which means
+    // the transaction was already handed to an RPC before journaling existed.
+    await this.#journal.recordExternalReceipt(operationId, {
+      transactionHash: recovery.txHash,
+      status: 'pending',
+    });
+  }
+
+  async #recordObservedTransaction(
+    operationId: string,
+    transactionHash: HexString,
+  ): Promise<void> {
+    await this.#journal?.recordExternalReceipt(operationId, {
+      transactionHash,
+      status: 'pending',
+    });
   }
 
   async isReady(): Promise<boolean> {
@@ -378,7 +446,7 @@ export class PrivacyOnboardingService {
     const normalized = normalizeCotiAesKey(value);
     await this.#vault.put('signer/aes-key', normalized, {
       kind: 'generic',
-      binding: { operationHash: operationHashFor(wallet) },
+      binding: { operationHash: privacyOnboardingOperationHash(wallet) },
     });
     this.#wallet.setAesKey(normalized);
     return normalized;
@@ -426,7 +494,7 @@ export class PrivacyOnboardingService {
       version: 1,
       wallet,
       contract: ACCOUNT_ONBOARD_CONTRACT.toLowerCase() as Address,
-      operationHash: operationHashFor(wallet),
+      operationHash: privacyOnboardingOperationHash(wallet),
       rsaPublicKey: Buffer.from(rsaKey.publicKey).toString('base64'),
       rsaPrivateKey: Buffer.from(rsaKey.privateKey).toString('base64'),
     };
@@ -483,6 +551,12 @@ export class PrivacyOnboardingService {
     };
     assertPreparedTransaction(prepared);
     await this.#persistRecovery(prepared);
+    await this.#journal?.recordPreparedTransaction(
+      privacyOnboardingOperationId(recovery.wallet),
+      nonce,
+      prepared.txHash!,
+      0,
+    );
     return prepared;
   }
 
@@ -601,6 +675,8 @@ export class PrivacyOnboardingService {
         'COTI privacy onboarding requires a connected RPC provider.',
       );
     }
+    const operationId = privacyOnboardingOperationId(recovery.wallet);
+    await this.#recordDurableRecovery(operationId, recovery);
     let receipt = await this.#readReceipt(recovery.txHash);
     if (!receipt) {
       let observed: boolean;
@@ -610,6 +686,12 @@ export class PrivacyOnboardingService {
         );
       } catch {
         throw processingError();
+      }
+      if (observed) {
+        await this.#recordObservedTransaction(
+          operationId,
+          recovery.txHash,
+        );
       }
       if (!observed) {
         if (!recovery.signedTransaction) {
@@ -628,6 +710,10 @@ export class PrivacyOnboardingService {
             );
           }
           observed = true;
+          await this.#recordObservedTransaction(
+            operationId,
+            recovery.txHash,
+          );
         } catch (error) {
           if (
             error instanceof SignerError &&
@@ -645,6 +731,10 @@ export class PrivacyOnboardingService {
               observed = false;
             }
             if (!observed) throw processingError();
+            await this.#recordObservedTransaction(
+              operationId,
+              recovery.txHash,
+            );
           }
         }
       }
@@ -682,11 +772,19 @@ export class PrivacyOnboardingService {
         rsaPrivateKey: recovery.rsaPrivateKey,
         revertedTransactionHashes,
       });
+      await this.#journal?.recordExternalReceipt(operationId, {
+        transactionHash: recovery.txHash,
+        status: 'reverted',
+      });
       throw new SignerError(
         'TRANSACTION_FAILED',
         'The COTI privacy onboarding transaction reverted definitively. Its RSA recovery key was retained; retry the command for a fresh confirmation and nonce.',
       );
     }
+    await this.#journal?.recordReceipt(operationId, {
+      transactionHash: recovery.txHash,
+      status: 'success',
+    });
     const aesKey = await this.#recoverAesKey(recovery, receipt);
     const rsaKey = rsaKeysFromRecovery(recovery);
     this.#wallet.setUserOnboardInfo({
@@ -694,20 +792,36 @@ export class PrivacyOnboardingService {
       rsaKey,
       txHash: recovery.txHash,
     });
+    await this.#journal?.updateStage(operationId, 'completed', 1);
     return readyResult(recovery.wallet, recovery.txHash);
   }
 
   async onboard(): Promise<PrivacyOnboardingResult> {
     const wallet = (await this.#wallet.getAddress()).toLowerCase() as Address;
-    const ready = await this.#adoptReadyKey(wallet);
-    if (ready) return ready;
+    const operationId = await this.#beginJournal(wallet);
+    try {
+      const ready = await this.#adoptReadyKey(wallet);
+      if (ready) {
+        await this.#journal?.updateStage(operationId, 'completed', 1);
+        return ready;
+      }
 
-    await this.#assertRuntimeAttested();
-    const existingRecovery = await this.#loadRecovery(wallet);
-    if (!existingRecovery?.txHash) {
-      await this.#confirmation.confirm({
-        operationId: `privacy-onboard-${wallet.slice(2)}`,
-        operationHash: operationHashFor(wallet),
+      await this.#assertRuntimeAttested();
+      const existingRecovery = await this.#loadRecovery(wallet);
+      if (existingRecovery?.txHash) {
+        await this.#recordDurableRecovery(
+          operationId,
+          existingRecovery,
+        );
+      } else {
+        await this.#journal?.updateStage(
+          operationId,
+          'awaiting-confirmation',
+          0,
+        );
+        await this.#confirmation.confirm({
+        operationId,
+        operationHash: privacyOnboardingOperationHash(wallet),
         stepId: 'coti-account-onboard',
         stepIndex: 0,
         stepCount: 1,
@@ -738,32 +852,66 @@ export class PrivacyOnboardingService {
       });
     }
 
-    const result = await this.#nonceQueue.runExternalWrite(
-      async (pendingNonce) => {
-        const becameReady = await this.#adoptReadyKey(wallet);
-        if (becameReady) return becameReady;
+      const result = await this.#nonceQueue.runExternalWrite(
+        async (pendingNonce) => {
+          const becameReady = await this.#adoptReadyKey(wallet);
+          if (becameReady) return becameReady;
 
-        let recovery = await this.#loadRecovery(wallet);
-        if (!recovery) {
-          recovery = this.#newRecovery(wallet);
-          await this.#persistRecovery(recovery);
+          let recovery = await this.#loadRecovery(wallet);
+          if (!recovery) {
+            recovery = this.#newRecovery(wallet);
+            await this.#persistRecovery(recovery);
+          }
+          const rsaKey = rsaKeysFromRecovery(recovery);
+          this.#wallet.clearUserOnboardInfo();
+          this.#wallet.disableAutoOnboard();
+          this.#wallet.setUserOnboardInfo({
+            rsaKey,
+            ...(recovery.txHash ? { txHash: recovery.txHash } : {}),
+          });
+          if (!recovery.txHash) {
+            recovery = await this.#prepareTransaction(
+              recovery,
+              pendingNonce,
+            );
+          }
+          return this.#reconcile(recovery);
+        },
+      );
+      await this.#journal?.updateStage(operationId, 'completed', 1);
+      return result.result;
+    } catch (error) {
+      const errorCode = asSignerErrorCode(error);
+      if (
+        errorCode === 'CONFIRMATION_DECLINED' ||
+        errorCode === 'CONFIRMATION_TIMEOUT'
+      ) {
+        await this.#journal?.recordError(
+          operationId,
+          errorCode,
+          false,
+        );
+      } else if (errorCode === 'OPERATION_IN_PROGRESS') {
+        const recovery = await this.#loadRecovery(wallet).catch(
+          () => null,
+        );
+        if (recovery?.txHash) {
+          await this.#recordDurableRecovery(operationId, recovery);
         }
-        const rsaKey = rsaKeysFromRecovery(recovery);
-        this.#wallet.clearUserOnboardInfo();
-        this.#wallet.disableAutoOnboard();
-        this.#wallet.setUserOnboardInfo({
-          rsaKey,
-          ...(recovery.txHash ? { txHash: recovery.txHash } : {}),
-        });
-        if (!recovery.txHash) {
-          recovery = await this.#prepareTransaction(
-            recovery,
-            pendingNonce,
-          );
-        }
-        return this.#reconcile(recovery);
-      },
-    );
-    return result.result;
+        await this.#journal?.recordError(
+          operationId,
+          errorCode,
+          true,
+        );
+      } else {
+        await this.#journal?.recordError(
+          operationId,
+          errorCode,
+          true,
+        );
+        await this.#journal?.updateStage(operationId, 'failed');
+      }
+      throw error;
+    }
   }
 }

@@ -141,6 +141,22 @@ export type ListOrdersResult = {
   truncated: boolean;
 };
 
+export type WalletOrderActivityRecord = {
+  kind: 'order' | 'fill';
+  order: SafeOrderSummary;
+  orderHandle: string;
+  transactionHash: `0x${string}` | null;
+  blockNumber: string | null;
+  logIndex: number | null;
+  occurredAt: string;
+};
+
+export type WalletOrderActivityPage = {
+  records: WalletOrderActivityRecord[];
+  nextCursor: string | null;
+  truncated: boolean;
+};
+
 export type RegistrySnapshot = {
   chainId: typeof CHAINWHISPER_CHAIN_ID;
   registryAddress: Address;

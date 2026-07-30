@@ -25,7 +25,9 @@ import {
   ConfirmationGate,
   EncryptedSecretVault,
   NonceQueue,
+  OperationJournal,
   PrivacyOnboardingService,
+  privacyOnboardingOperationId,
   type Address,
   type ConfirmationRequest,
   type FormElicitor,
@@ -66,6 +68,21 @@ class AcceptingElicitor implements FormElicitor {
   ): Promise<{ outcome: 'accepted' }> {
     this.requests.push(request);
     return { outcome: 'accepted' };
+  }
+}
+
+class DecliningElicitor implements FormElicitor {
+  readonly requests: ConfirmationRequest[] = [];
+
+  isSupported(): boolean {
+    return true;
+  }
+
+  async requestConfirmation(
+    request: ConfirmationRequest,
+  ): Promise<{ outcome: 'declined' }> {
+    this.requests.push(request);
+    return { outcome: 'declined' };
   }
 }
 
@@ -128,7 +145,11 @@ const successReceipt = (
   } as unknown as TransactionReceipt;
 };
 
-const createHarness = async () => {
+const createHarness = async (
+  elicitor: FormElicitor & {
+    requests: ConfirmationRequest[];
+  } = new AcceptingElicitor(),
+) => {
   const stateDirectory = await mkdtemp(
     join(tmpdir(), 'cw-privacy-onboarding-'),
   );
@@ -157,25 +178,51 @@ const createHarness = async () => {
       type: 0,
     }),
   );
-  const elicitor = new AcceptingElicitor();
   const pendingNonce = vi.fn(async () => 7);
+  const journal = new OperationJournal(stateDirectory);
   const service = new PrivacyOnboardingService({
     wallet,
     vault,
     confirmation: new ConfirmationGate(elicitor, 5_000),
     nonceQueue: new NonceQueue(pendingNonce),
+    journal,
   });
   return {
     vault,
     provider,
     wallet,
     elicitor,
+    journal,
     pendingNonce,
     service,
   };
 };
 
 describe('durable COTI privacy onboarding', () => {
+  it('journals a local onboarding decline as terminal without preparing a transaction', async () => {
+    const declining = new DecliningElicitor();
+    const harness = await createHarness(declining);
+
+    await expect(harness.service.onboard()).rejects.toMatchObject({
+      code: 'CONFIRMATION_DECLINED',
+    });
+
+    expect(declining.requests).toHaveLength(1);
+    expect(
+      await harness.journal.get(
+        privacyOnboardingOperationId(WALLET),
+      ),
+    ).toMatchObject({
+      stage: 'declined',
+      nonces: [],
+      transactionHashes: [],
+      receipts: [],
+      errorCodes: ['CONFIRMATION_DECLINED'],
+    });
+    expect(await harness.vault.get(RECOVERY_REFERENCE)).toBeNull();
+    harness.provider.destroy();
+  });
+
   it('recovers an accepted-but-unobserved broadcast without creating a replacement transaction', async () => {
     const harness = await createHarness();
     const getReceipt = vi
@@ -202,11 +249,27 @@ describe('durable COTI privacy onboarding', () => {
     expect(harness.elicitor.requests).toHaveLength(1);
     expect(broadcast).toHaveBeenCalledTimes(1);
     expect(wait).not.toHaveBeenCalled();
+    const operationId = privacyOnboardingOperationId(WALLET);
+    expect(await harness.journal.get(operationId)).toMatchObject({
+      stage: 'prepared-broadcast',
+      nonces: [7],
+      transactionHashes: [prepared.txHash],
+      receipts: [],
+      errorCodes: ['OPERATION_IN_PROGRESS'],
+    });
 
     getReceipt.mockResolvedValue(
       successReceipt(prepared.txHash!, prepared.rsaPublicKey),
     );
-    const result = await harness.service.onboard();
+    const restartElicitor = new AcceptingElicitor();
+    const restartedService = new PrivacyOnboardingService({
+      wallet: harness.wallet,
+      vault: harness.vault,
+      confirmation: new ConfirmationGate(restartElicitor, 5_000),
+      nonceQueue: new NonceQueue(harness.pendingNonce),
+      journal: harness.journal,
+    });
+    const result = await restartedService.onboard();
 
     expect(result).toMatchObject({
       status: 'ready',
@@ -219,7 +282,77 @@ describe('durable COTI privacy onboarding', () => {
       harness.wallet.getUserOnboardInfo()?.aesKey,
     ).toBe(AES_KEY);
     expect(harness.elicitor.requests).toHaveLength(1);
+    expect(restartElicitor.requests).toHaveLength(0);
     expect(broadcast).toHaveBeenCalledTimes(1);
+    expect(await harness.journal.get(operationId)).toMatchObject({
+      stage: 'completed',
+      transactionHashes: [prepared.txHash],
+      receipts: [
+        {
+          transactionHash: prepared.txHash,
+          status: 'success',
+        },
+      ],
+    });
+    harness.provider.destroy();
+  });
+
+  it('keeps a timed-out observed transaction in broadcasting recovery until it eventually succeeds', async () => {
+    const harness = await createHarness();
+    const getReceipt = vi
+      .spyOn(harness.provider, 'getTransactionReceipt')
+      .mockResolvedValue(null);
+    vi.spyOn(harness.provider, 'getTransaction').mockResolvedValue(
+      null,
+    );
+    vi.spyOn(
+      harness.provider,
+      'broadcastTransaction',
+    ).mockImplementation(async (signedTransaction) => ({
+      hash: keccak256(signedTransaction),
+    }) as never);
+    vi.spyOn(
+      harness.provider,
+      'waitForTransaction',
+    ).mockRejectedValue(new Error('receipt polling timed out'));
+
+    await expect(harness.service.onboard()).rejects.toMatchObject({
+      code: 'OPERATION_IN_PROGRESS',
+    });
+
+    const recovery = await recoveryRecord(harness.vault);
+    const operationId = privacyOnboardingOperationId(WALLET);
+    expect(await harness.journal.get(operationId)).toMatchObject({
+      stage: 'broadcast',
+      nonces: [7],
+      transactionHashes: [recovery.txHash],
+      receipts: [
+        {
+          transactionHash: recovery.txHash,
+          status: 'pending',
+        },
+      ],
+      errorCodes: ['OPERATION_IN_PROGRESS'],
+    });
+
+    getReceipt.mockResolvedValue(
+      successReceipt(recovery.txHash!, recovery.rsaPublicKey),
+    );
+    await expect(harness.service.onboard()).resolves.toMatchObject({
+      status: 'ready',
+      transactionHash: recovery.txHash,
+    });
+    expect(await harness.journal.get(operationId)).toMatchObject({
+      stage: 'completed',
+      transactionHashes: [recovery.txHash],
+      receipts: [
+        {
+          transactionHash: recovery.txHash,
+          status: 'success',
+        },
+      ],
+    });
+    expect(harness.elicitor.requests).toHaveLength(1);
     harness.provider.destroy();
   });
 
@@ -237,6 +370,15 @@ describe('durable COTI privacy onboarding', () => {
     expect(rsaOnly.txHash).toBeUndefined();
     expect(rsaOnly.signedTransaction).toBeUndefined();
     expect(harness.elicitor.requests).toHaveLength(1);
+    expect(
+      await harness.journal.get(
+        privacyOnboardingOperationId(WALLET),
+      ),
+    ).toMatchObject({
+      stage: 'failed',
+      transactionHashes: [],
+      errorCodes: ['TRANSACTION_FAILED'],
+    });
 
     vi.spyOn(
       harness.provider,
@@ -272,6 +414,14 @@ describe('durable COTI privacy onboarding', () => {
     expect(completed.txHash).toMatch(/^0x[0-9a-f]{64}$/u);
     expect(await harness.vault.get('signer/aes-key')).toBe(AES_KEY);
     expect(harness.elicitor.requests).toHaveLength(2);
+    expect(
+      await harness.journal.get(
+        privacyOnboardingOperationId(WALLET),
+      ),
+    ).toMatchObject({
+      stage: 'completed',
+      transactionHashes: [completed.txHash],
+    });
     harness.provider.destroy();
   });
 
@@ -378,6 +528,21 @@ describe('durable COTI privacy onboarding', () => {
     });
     expect(retryable.txHash).toBeUndefined();
     expect(retryable.signedTransaction).toBeUndefined();
+    expect(
+      await harness.journal.get(
+        privacyOnboardingOperationId(WALLET),
+      ),
+    ).toMatchObject({
+      stage: 'failed',
+      transactionHashes: [prepared.txHash],
+      receipts: [
+        {
+          transactionHash: prepared.txHash,
+          status: 'reverted',
+        },
+      ],
+      errorCodes: expect.arrayContaining(['TRANSACTION_FAILED']),
+    });
 
     await expect(harness.service.onboard()).rejects.toMatchObject({
       code: 'OPERATION_IN_PROGRESS',

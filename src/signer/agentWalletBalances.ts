@@ -20,6 +20,8 @@ const PRIVATE_TOKEN_ABI = parseAbi([
   'function accountEncryptionAddress(address account) view returns (address)',
   'function balanceOf(address account) view returns ((uint256 ciphertextHigh,uint256 ciphertextLow))',
 ]);
+const ZERO_ADDRESS =
+  '0x0000000000000000000000000000000000000000';
 const DEFAULT_CACHE_TTL_MS = 30_000;
 const DEFAULT_CONCURRENCY = 4;
 
@@ -133,6 +135,9 @@ export class AgentWalletBalanceReader {
   readonly #concurrency: number;
   #cache: BaseBalanceSnapshot | null = null;
   #refreshing: Promise<BaseBalanceSnapshot> | null = null;
+  #walletEoaCheck: Promise<boolean> | null = null;
+  #invalidationVersion = 0;
+  #cacheVersion = -1;
   #revision = 0;
 
   constructor(options: {
@@ -154,7 +159,10 @@ export class AgentWalletBalanceReader {
   }
 
   invalidate(): void {
-    this.#cache = null;
+    // Keep the last successful rows available as a stale fallback. The
+    // reader instance is wallet-bound, so constructing a new reader is the
+    // only wallet-change path that intentionally starts with an empty cache.
+    this.#invalidationVersion += 1;
   }
 
   async snapshot(
@@ -166,6 +174,7 @@ export class AgentWalletBalanceReader {
       : Number.NaN;
     const cacheFresh =
       this.#cache !== null &&
+      this.#cacheVersion === this.#invalidationVersion &&
       Number.isFinite(cachedAt) &&
       Date.now() - cachedAt < this.#cacheTtlMs;
     const base =
@@ -184,6 +193,7 @@ export class AgentWalletBalanceReader {
   async #refresh(): Promise<BaseBalanceSnapshot> {
     if (this.#refreshing) return this.#refreshing;
     const previous = this.#cache;
+    const refreshVersion = this.#invalidationVersion;
     const pending = (async () => {
       const rows = await mapWithConcurrency(
         this.#tokens,
@@ -210,6 +220,7 @@ export class AgentWalletBalanceReader {
         revision: this.#revision,
       };
       this.#cache = snapshot;
+      this.#cacheVersion = refreshVersion;
       return snapshot;
     })();
     this.#refreshing = pending;
@@ -237,7 +248,8 @@ export class AgentWalletBalanceReader {
               row.readiness === 'ready' &&
               row.exactAmount !== '0') ||
             (row.kind === 'private-erc20' &&
-              row.readiness === 'ready') ||
+              row.readiness === 'ready' &&
+              row.exactAmount !== '0') ||
             hasReference(token, required),
         };
       }),
@@ -292,10 +304,13 @@ export class AgentWalletBalanceReader {
       functionName: 'accountEncryptionAddress',
       data: encryptionRaw,
     });
-    if (
-      encryptionAddress.toLowerCase() !==
-      this.#wallet.toLowerCase()
-    ) {
+    const explicitWalletMapping =
+      encryptionAddress.toLowerCase() ===
+      this.#wallet.toLowerCase();
+    const implicitWalletMapping =
+      encryptionAddress.toLowerCase() === ZERO_ADDRESS &&
+      (await this.#walletIsEoa());
+    if (!explicitWalletMapping && !implicitWalletMapping) {
       return {
         symbol: token.symbol,
         kind: token.kind,
@@ -341,6 +356,26 @@ export class AgentWalletBalanceReader {
       readiness: 'ready',
       stale: false,
     };
+  }
+
+  async #walletIsEoa(): Promise<boolean> {
+    if (this.#walletEoaCheck) return this.#walletEoaCheck;
+    const pending = this.#rpc
+      .request<string>('eth_getCode', [this.#wallet, 'latest'])
+      .then(
+        (code) =>
+          typeof code === 'string' &&
+          code.toLowerCase() === '0x',
+      );
+    this.#walletEoaCheck = pending;
+    try {
+      return await pending;
+    } catch (error) {
+      if (this.#walletEoaCheck === pending) {
+        this.#walletEoaCheck = null;
+      }
+      throw error;
+    }
   }
 
   #ethCall(to: HexString, data: HexString): Promise<HexString> {

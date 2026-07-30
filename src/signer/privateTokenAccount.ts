@@ -181,6 +181,24 @@ export class PrivateTokenAccountService {
     return address.toLowerCase() as Address;
   }
 
+  async #walletEncryptionReady(
+    accountEncryptionAddress: Address,
+    wallet: Address,
+  ): Promise<boolean> {
+    if (
+      accountEncryptionAddress.toLowerCase() ===
+      wallet.toLowerCase()
+    ) {
+      return true;
+    }
+    if (accountEncryptionAddress !== ZERO_ADDRESS) return false;
+    const code = await this.#rpc.request<string>('eth_getCode', [
+      wallet,
+      'latest',
+    ]);
+    return typeof code === 'string' && code.toLowerCase() === '0x';
+  }
+
   async status(reference: string): Promise<PrivateTokenAccountStatus> {
     const token = this.#token(reference);
     const wallet = await this.#wallet.getAddress();
@@ -204,13 +222,16 @@ export class PrivateTokenAccountService {
         }),
       ),
     ]);
+    const ready = await this.#walletEncryptionReady(
+      accountEncryptionAddress,
+      wallet,
+    );
     return {
       token: token.address,
       symbol: token.symbol,
       wallet,
       accountEncryptionAddress,
-      ready:
-        accountEncryptionAddress.toLowerCase() === wallet.toLowerCase(),
+      ready,
       spenders: Object.fromEntries(spenderEntries),
     };
   }
@@ -503,7 +524,10 @@ export class PrivateTokenAccountService {
         this.#accountEncryptionAddress(token.address, input.spender),
       ]);
     if (
-      ownerEncryptionAddress.toLowerCase() !== wallet.toLowerCase()
+      !(await this.#walletEncryptionReady(
+        ownerEncryptionAddress,
+        wallet,
+      ))
     ) {
       throw new SignerError(
         'PRIVATE_TOKEN_SETUP_REQUIRED',

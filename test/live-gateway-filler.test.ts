@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import type { Abi } from 'viem';
+import { keccak256, toHex, type Abi } from 'viem';
 
 import {
   LiveChainWhisperDomainGateway
@@ -7,7 +7,8 @@ import {
 import type { Address, OrderStatus } from '../src/domain/types.js';
 import {
   loadRuntimeManifest,
-  type ChainWhisperRuntimeManifestV1
+  type ChainWhisperRuntimeManifestV1,
+  type JsonRpcReader
 } from '../src/shared/runtimeManifest.js';
 
 const WALLET =
@@ -124,6 +125,7 @@ const makeGateway = async (options: {
       }
     >
   >;
+  rpc?: JsonRpcReader;
 }) => {
   const manifest = await loadRuntimeManifest();
   const calls: string[] = [];
@@ -157,7 +159,8 @@ const makeGateway = async (options: {
     manifest,
     gateway: new LiveChainWhisperDomainGateway({
       manifest,
-      client
+      client,
+      ...(options.rpc ? { rpc: options.rpc } : {})
     })
   };
 };
@@ -183,6 +186,104 @@ const listFillerOrders = (
   });
 
 describe('LiveChainWhisperDomainGateway filler history', () => {
+  it('exposes attested order and fill activity with transaction hashes and block timestamps', async () => {
+    const manifest = await loadRuntimeManifest();
+    const orderId = 12;
+    const orderTransaction =
+      `0x${'44'.repeat(32)}` as `0x${string}`;
+    const fillTransaction =
+      `0x${'55'.repeat(32)}` as `0x${string}`;
+    const orderTopic = keccak256(
+      toHex(
+        'TradeOpened(uint256,address,address,bool,bytes32,uint256,uint64,uint64,uint256)'
+      )
+    );
+    const fillTopic = keccak256(
+      toHex(
+        'TradePartiallyFilled(uint256,address,uint256,uint256,uint256,uint256)'
+      )
+    );
+    const idTopic = toHex(BigInt(orderId), { size: 32 });
+    const logFilters: unknown[] = [];
+    const rpc: JsonRpcReader = {
+      async request<T>(
+        method: string,
+        params: unknown[]
+      ): Promise<T> {
+        if (method === 'eth_getLogs') {
+          logFilters.push(params[0]);
+          return [
+            {
+              address:
+                manifest.contracts.standardEscrow!.address.toLowerCase(),
+              blockNumber: '0x64',
+              transactionHash: orderTransaction,
+              logIndex: '0x1',
+              topics: [orderTopic, idTopic]
+            },
+            {
+              address:
+                manifest.contracts.standardEscrow!.address.toLowerCase(),
+              blockNumber: '0x78',
+              transactionHash: fillTransaction,
+              logIndex: '0x2',
+              topics: [fillTopic, idTopic]
+            }
+          ] as T;
+        }
+        if (method === 'eth_getBlockByNumber') {
+          const block = String(params[0]);
+          return {
+            timestamp:
+              block === '0x64' ? '0x6553f100' : '0x6553f164'
+          } as T;
+        }
+        throw new Error(`unexpected-rpc:${method}`);
+      }
+    };
+    const { gateway } = await makeGateway({
+      history: [
+        {
+          ...historyItem(manifest, orderId, 3),
+          lastActivityBlock: 120n
+        }
+      ],
+      rpc
+    });
+
+    const page = await gateway.listWalletActivity({
+      wallet: WALLET,
+      cursor: null,
+      limit: 20
+    });
+
+    expect(logFilters[0]).toMatchObject({
+      address:
+        manifest.contracts.standardEscrow!.address.toLowerCase(),
+      topics: [
+        expect.arrayContaining([orderTopic, fillTopic]),
+        idTopic
+      ]
+    });
+    expect(page.records).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          kind: 'order',
+          orderHandle: `cw_${manifest.contracts.standardEscrow!.address.slice(2).toLowerCase()}_${orderId}`,
+          transactionHash: orderTransaction,
+          blockNumber: '100',
+          occurredAt: '2023-11-14T22:13:20.000Z'
+        }),
+        expect.objectContaining({
+          kind: 'fill',
+          transactionHash: fillTransaction,
+          blockNumber: '120',
+          occurredAt: '2023-11-14T22:15:00.000Z'
+        })
+      ])
+    );
+  });
+
   it('includes only role code 3 and excludes maker, taker, and unknown history roles', async () => {
     const manifest = await loadRuntimeManifest();
     const { gateway } = await makeGateway({
