@@ -15,6 +15,7 @@ import type {
 } from './types.js';
 import type { EncryptedSecretVault } from './vault.js';
 import { writeAgentWalletEnvFile } from './walletEnv.js';
+import { SignerError } from './errors.js';
 
 export type WalletControlState = {
   environmentFilePath: string;
@@ -25,6 +26,7 @@ export type WalletControlState = {
   } | null;
   restartRequired: boolean;
   lastDiagnostic: string | null;
+  lastDiagnosticCode?: string | null;
 };
 
 export const safeAgentControlErrorMessage = (error: unknown): string => {
@@ -35,6 +37,60 @@ export const safeAgentControlErrorMessage = (error: unknown): string => {
     ? value.replace(/0x[0-9a-fA-F]{64}/gu, '[redacted]')
     : 'The local signer could not complete that action safely.';
 };
+
+export const safeAgentControlErrorCode = (error: unknown): string => {
+  if (!(error instanceof SignerError)) return 'signer-action-failed';
+  const code = error.code.toLowerCase().replaceAll('_', '-');
+  return code.startsWith('signer-') ? code : `signer-${code}`;
+};
+
+const SAFE_AGENT_CONTROL_DIAGNOSTIC_CODES = new Set([
+  'agent-wallet-ready',
+  'agent-wallet-saved-activating',
+  'agent-wallet-saved-restart-required',
+  'operation-discard-awaiting-local-confirmation',
+  'operation-discarded',
+  'operation-recovery-completed',
+  'operation-recovery-discarded',
+  'operation-recovery-processing',
+  'operation-recovery-retryable',
+  'privacy-onboarding-awaiting-local-confirmation',
+  'privacy-ready',
+  'private-token-ready',
+  'private-token-setup-awaiting-local-confirmation',
+  'private-token-setup-incomplete',
+  'signer-action-failed',
+  'signer-configuration-required',
+  'signer-confirmation-declined',
+  'signer-confirmation-timeout',
+  'signer-elicitation-unsupported',
+  'signer-envelope-expired',
+  'signer-envelope-invalid',
+  'signer-envelope-tampered',
+  'signer-exact-allowance-required',
+  'signer-fee-changed',
+  'signer-operation-discarded',
+  'signer-operation-in-progress',
+  'signer-operation-not-found',
+  'signer-operation-reprepare-required',
+  'signer-pairing-failed',
+  'signer-private-input-unavailable',
+  'signer-private-token-setup-required',
+  'signer-privacy-setup-required',
+  'signer-registry-changed',
+  'signer-already-running',
+  'signer-lock-ownership-lost',
+  'signer-stale-state',
+  'signer-transaction-failed',
+  'signer-unsafe-message',
+  'signer-unsupported-tool',
+  'signer-wallet-mismatch',
+  'signer-write-unavailable',
+]);
+
+export const isSafeAgentControlDiagnosticCode = (
+  value: string,
+): boolean => SAFE_AGENT_CONTROL_DIAGNOSTIC_CODES.has(value);
 
 const normalizePrivateKey = (value: string | undefined): string => {
   const candidate = value?.trim() ?? '';
@@ -117,6 +173,7 @@ export const saveAgentWallet = async (options: {
     options.state.lastDiagnostic = options.activateInProcess
       ? 'agent-wallet-saved-activating'
       : 'agent-wallet-saved-restart-required';
+    options.state.lastDiagnosticCode = options.state.lastDiagnostic;
     return {
       ok: true,
       message:

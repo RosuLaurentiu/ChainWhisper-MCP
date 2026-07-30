@@ -53,6 +53,7 @@ import {
   pendingOperation,
   replacementBlockReason,
   resolveWalletPrivacyKey,
+  safeAgentControlErrorCode,
   safeAgentControlErrorMessage,
   saveAgentWallet,
   signerStatusInputSchema,
@@ -510,6 +511,10 @@ const initializeConfiguredSigner = async (
     control,
     autonomy,
     writesBlocked: () => walletControl.restartRequired,
+    diagnosticCodes: () =>
+      walletControl.lastDiagnosticCode
+        ? [walletControl.lastDiagnosticCode]
+        : [],
     manifestHash: hashRuntimeManifest(manifest),
   });
   await service.restorePendingOperations();
@@ -587,13 +592,18 @@ const handleConfiguredControlAction = async (
   if (action === 'onboard-privacy') {
     walletControl.lastDiagnostic =
       'privacy-onboarding-awaiting-local-confirmation';
+    walletControl.lastDiagnosticCode =
+      'privacy-onboarding-awaiting-local-confirmation';
     void service
       .onboardPrivacy()
       .then(() => {
         walletControl.lastDiagnostic = 'privacy-ready';
+        walletControl.lastDiagnosticCode = 'privacy-ready';
       })
       .catch((error: unknown) => {
         walletControl.lastDiagnostic = safeAgentControlErrorMessage(error);
+        walletControl.lastDiagnosticCode =
+          safeAgentControlErrorCode(error);
       });
     return {
       ok: true,
@@ -624,15 +634,22 @@ const handleConfiguredControlAction = async (
     }
     walletControl.lastDiagnostic =
       'private-token-setup-awaiting-local-confirmation';
+    walletControl.lastDiagnosticCode =
+      'private-token-setup-awaiting-local-confirmation';
     void service
       .enablePrivateToken(verifiedToken.symbol)
       .then((result) => {
         walletControl.lastDiagnostic = result.ready
           ? `private-token-${result.symbol}-ready`
           : 'private-token-setup-incomplete';
+        walletControl.lastDiagnosticCode = result.ready
+          ? 'private-token-ready'
+          : 'private-token-setup-incomplete';
       })
       .catch((error: unknown) => {
         walletControl.lastDiagnostic = safeAgentControlErrorMessage(error);
+        walletControl.lastDiagnosticCode =
+          safeAgentControlErrorCode(error);
       });
     return {
       ok: true,
@@ -647,12 +664,16 @@ const handleConfiguredControlAction = async (
     try {
       const result = await service.recoverOperation(operationId);
       walletControl.lastDiagnostic = `operation-recovery-${result.status}`;
+      walletControl.lastDiagnosticCode =
+        `operation-recovery-${result.status}`;
       return {
         ok: true,
         message: `Operation recovery completed with status ${result.status}.`,
       };
     } catch (error) {
       walletControl.lastDiagnostic = safeAgentControlErrorMessage(error);
+      walletControl.lastDiagnosticCode =
+        safeAgentControlErrorCode(error);
       return { ok: false, message: walletControl.lastDiagnostic };
     }
   }
@@ -689,13 +710,18 @@ const handleConfiguredControlAction = async (
     }
     walletControl.lastDiagnostic =
       'operation-discard-awaiting-local-confirmation';
+    walletControl.lastDiagnosticCode =
+      'operation-discard-awaiting-local-confirmation';
     void service
       .discardOperation(operationId, operationHash)
       .then(() => {
         walletControl.lastDiagnostic = 'operation-discarded';
+        walletControl.lastDiagnosticCode = 'operation-discarded';
       })
       .catch((error: unknown) => {
         walletControl.lastDiagnostic = safeAgentControlErrorMessage(error);
+        walletControl.lastDiagnosticCode =
+          safeAgentControlErrorCode(error);
       });
     return {
       ok: true,
@@ -721,6 +747,7 @@ const runSigner = async (
     generatedBackup: null,
     restartRequired: false,
     lastDiagnostic: null,
+    lastDiagnosticCode: null,
   };
   const setupRpc = new HttpJsonRpcReader(initialConfig.rpcUrl);
   let active: ConfiguredSignerRuntime | null = null;
@@ -750,6 +777,7 @@ const runSigner = async (
         walletControl.displayAddress = configured.wallet;
         walletControl.restartRequired = false;
         walletControl.lastDiagnostic = 'agent-wallet-ready';
+        walletControl.lastDiagnosticCode = 'agent-wallet-ready';
         router.activate(configured.service);
       })();
     activation = pending;
@@ -758,6 +786,8 @@ const runSigner = async (
     } catch (error) {
       walletControl.restartRequired = false;
       walletControl.lastDiagnostic = safeAgentControlErrorMessage(error);
+      walletControl.lastDiagnosticCode =
+        safeAgentControlErrorCode(error);
       if (failOnError) throw error;
     } finally {
       if (activation === pending) activation = null;
@@ -865,7 +895,8 @@ const runSigner = async (
             : 'starting',
           requiredAssets,
           diagnosticCodes: [
-            walletControl.lastDiagnostic ?? 'wallet-setup-required',
+            walletControl.lastDiagnosticCode ??
+              'wallet-setup-required',
             control.controlPageReady
               ? 'control-page-ready'
               : 'control-page-starting',

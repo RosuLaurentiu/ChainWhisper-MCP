@@ -3,6 +3,7 @@ import type {
   SignedActionEnvelopeV1,
 } from '../shared/index.js';
 
+import { isSafeAgentControlDiagnosticCode } from './agentWallet.js';
 import { buildPublicSignerStatus, type LoadedSignerConfig } from './config.js';
 import {
   AutonomyPolicyManager,
@@ -54,6 +55,7 @@ export class ChainWhisperSignerService {
   readonly #control: LocalWebFormElicitor | null;
   readonly #autonomy: AutonomyPolicyManager | null;
   readonly #writesBlocked: () => boolean;
+  readonly #diagnosticCodes: () => string[];
   readonly #manifestHash: HexString | null;
 
   constructor(options: {
@@ -68,6 +70,7 @@ export class ChainWhisperSignerService {
     control?: LocalWebFormElicitor;
     autonomy?: AutonomyPolicyManager;
     writesBlocked?: () => boolean;
+    diagnosticCodes?: () => string[];
     manifestHash?: HexString;
   }) {
     this.#config = options.config;
@@ -81,6 +84,7 @@ export class ChainWhisperSignerService {
     this.#control = options.control ?? null;
     this.#autonomy = options.autonomy ?? null;
     this.#writesBlocked = options.writesBlocked ?? (() => false);
+    this.#diagnosticCodes = options.diagnosticCodes ?? (() => []);
     this.#manifestHash = options.manifestHash ?? null;
   }
 
@@ -108,6 +112,9 @@ export class ChainWhisperSignerService {
     const current = activePolicies.at(-1)?.policy;
     const privacyReady = await this.#privacyOnboarding.isReady();
     const writesBlocked = this.#writesBlocked();
+    const localDiagnosticCodes = this.#diagnosticCodes()
+      .filter(isSafeAgentControlDiagnosticCode)
+      .slice(0, 16);
     const status = buildPublicSignerStatus(
       this.#config,
       wallet,
@@ -129,6 +136,7 @@ export class ChainWhisperSignerService {
           globalPaused: autonomyStatus?.globalPaused ?? false,
         },
         diagnosticCodes: [
+          ...localDiagnosticCodes,
           ...(writesBlocked ? ['signer-restart-required'] : []),
           ...(autonomyDecision.allowed
             ? []

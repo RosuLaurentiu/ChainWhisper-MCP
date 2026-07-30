@@ -66,6 +66,7 @@ export type LocalWebFormElicitorOptions = {
   openUrl?: OpenUrl;
   requireBrowserArrival?: boolean;
   browserArrivalTimeoutMs?: number;
+  activeBrowserGraceMs?: number;
   getControlSummary?: () =>
     | AgentControlSummary
     | Promise<AgentControlSummary>;
@@ -115,6 +116,8 @@ const MAX_SUBMISSIONS_PER_WINDOW = 30;
 const BOOTSTRAP_LIFETIME_MS = 60_000;
 const SESSION_LIFETIME_SECONDS = 8 * 60 * 60;
 const DEFAULT_BROWSER_ARRIVAL_TIMEOUT_MS = 5_000;
+const MAX_ACTIVE_CSRF_TOKENS = 8;
+const DEFAULT_ACTIVE_BROWSER_GRACE_MS = 5_000;
 
 const digest = (value: string): Buffer =>
   createHash('sha256').update(value).digest();
@@ -290,10 +293,15 @@ export class LocalWebFormElicitor
   readonly #openUrl: OpenUrl;
   readonly #requireBrowserArrival: boolean;
   readonly #browserArrivalTimeoutMs: number;
+  readonly #activeBrowserGraceMs: number;
   readonly #getControlSummary?: LocalWebFormElicitorOptions['getControlSummary'];
   readonly #onControlAction?: LocalWebFormElicitorOptions['onControlAction'];
   readonly #rateWindows = new Map<string, RateWindow>();
   readonly #browserArrivalWaiters = new Set<BrowserArrivalWaiter>();
+  readonly #responseSessionGenerations = new WeakMap<
+    ServerResponse,
+    number
+  >();
 
   #server: Server | null = null;
   #serverStart: Promise<boolean> | null = null;
@@ -303,7 +311,11 @@ export class LocalWebFormElicitor
   #bootstrapToken: string | null = null;
   #bootstrapExpiresAt = 0;
   #sessionDigest: Buffer | null = null;
-  #csrfDigest: Buffer | null = null;
+  #sessionGeneration = 0;
+  #csrfDigests: Buffer[] = [];
+  #lastAuthenticatedActivityAt = 0;
+  #promptOpenAttemptActivityAt: number | null = null;
+  #promptOpenTimer: ReturnType<typeof setTimeout> | null = null;
   #pending: PendingPrompt | null = null;
   #closed = false;
 
@@ -314,6 +326,9 @@ export class LocalWebFormElicitor
     this.#browserArrivalTimeoutMs =
       options.browserArrivalTimeoutMs ??
       DEFAULT_BROWSER_ARRIVAL_TIMEOUT_MS;
+    this.#activeBrowserGraceMs =
+      options.activeBrowserGraceMs ??
+      DEFAULT_ACTIVE_BROWSER_GRACE_MS;
     this.#getControlSummary = options.getControlSummary;
     this.#onControlAction = options.onControlAction;
   }
@@ -384,7 +399,7 @@ export class LocalWebFormElicitor
             this.#bootstrapToken = bootstrapAtOpen;
             this.#bootstrapExpiresAt =
               Date.now() + BOOTSTRAP_LIFETIME_MS;
-            this.#csrfDigest = null;
+            this.#csrfDigests = [];
             return `http://127.0.0.1:${this.#port}/open/${bootstrapAtOpen}`;
           })();
       const reason = await this.#openAndAwaitArrival(controlUrl, {
@@ -404,7 +419,9 @@ export class LocalWebFormElicitor
         this.#sessionDigest === sessionAtOpen
       ) {
         this.#sessionDigest = null;
-        this.#csrfDigest = null;
+        this.#sessionGeneration += 1;
+        this.#csrfDigests = [];
+        this.#lastAuthenticatedActivityAt = 0;
       }
       return reason;
     };
@@ -440,7 +457,10 @@ export class LocalWebFormElicitor
     this.#closed = true;
     this.#bootstrapToken = null;
     this.#sessionDigest = null;
-    this.#csrfDigest = null;
+    this.#sessionGeneration += 1;
+    this.#csrfDigests = [];
+    this.#lastAuthenticatedActivityAt = 0;
+    this.#clearPromptOpenTimer();
     this.#signalBrowserArrival(null, false);
     this.#settlePending('cancelled');
     const server = this.#server;
@@ -555,6 +575,7 @@ export class LocalWebFormElicitor
       const timer = setTimeout(() => {
         if (this.#pending?.id !== id) return;
         this.#pending = null;
+        this.#clearPromptOpenTimer();
         resolve({ outcome: 'timeout' });
       }, timeoutMs);
       this.#pending = {
@@ -564,7 +585,7 @@ export class LocalWebFormElicitor
         resolve,
         timer,
       };
-      void this.openControlPanel();
+      this.#openForPendingPrompt(id);
     });
   }
 
@@ -582,6 +603,7 @@ export class LocalWebFormElicitor
       const timer = setTimeout(() => {
         if (this.#pending?.id !== id) return;
         this.#pending = null;
+        this.#clearPromptOpenTimer();
         resolve({ outcome: 'timeout' });
       }, timeoutMs);
       this.#pending = {
@@ -591,8 +613,47 @@ export class LocalWebFormElicitor
         resolve,
         timer,
       };
-      void this.openControlPanel();
+      this.#openForPendingPrompt(id);
     });
+  }
+
+  #openForPendingPrompt(id: string): void {
+    this.#clearPromptOpenTimer();
+    this.#promptOpenAttemptActivityAt = null;
+    this.#watchPendingPrompt(id);
+  }
+
+  #watchPendingPrompt(id: string): void {
+    if (this.#pending?.id !== id) return;
+    if (this.#hasRecentAuthenticatedActivity()) {
+      this.#promptOpenAttemptActivityAt = null;
+    } else if (
+      this.#promptOpenAttemptActivityAt !==
+      this.#lastAuthenticatedActivityAt
+    ) {
+      this.#promptOpenAttemptActivityAt =
+        this.#lastAuthenticatedActivityAt;
+      void this.openControlPanel();
+    }
+    this.#promptOpenTimer = setTimeout(() => {
+      this.#promptOpenTimer = null;
+      this.#watchPendingPrompt(id);
+    }, this.#activeBrowserGraceMs + 100);
+  }
+
+  #hasRecentAuthenticatedActivity(): boolean {
+    return (
+      this.#sessionDigest !== null &&
+      this.#lastAuthenticatedActivityAt > 0 &&
+      Date.now() - this.#lastAuthenticatedActivityAt <=
+        this.#activeBrowserGraceMs
+    );
+  }
+
+  #clearPromptOpenTimer(): void {
+    if (!this.#promptOpenTimer) return;
+    clearTimeout(this.#promptOpenTimer);
+    this.#promptOpenTimer = null;
   }
 
   async #ensureServer(): Promise<boolean> {
@@ -684,7 +745,9 @@ export class LocalWebFormElicitor
       const sessionToken = randomToken();
       const sessionDigest = digest(sessionToken);
       this.#sessionDigest = sessionDigest;
-      this.#csrfDigest = null;
+      this.#sessionGeneration += 1;
+      this.#csrfDigests = [];
+      this.#lastAuthenticatedActivityAt = 0;
       this.#bindBrowserArrivalSession(
         requestUrl.slice('/open/'.length),
         sessionDigest,
@@ -703,15 +766,26 @@ export class LocalWebFormElicitor
       return;
     }
     if (request.method === 'GET' && requestUrl === '/control') {
+      this.#responseSessionGenerations.set(
+        response,
+        this.#sessionGeneration,
+      );
+      this.#lastAuthenticatedActivityAt = Date.now();
       await this.#sendPage(response, 200);
       this.#signalBrowserArrival(request);
       return;
     }
     if (request.method === 'GET' && requestUrl === '/snapshot') {
+      this.#lastAuthenticatedActivityAt = Date.now();
       await this.#sendSnapshot(response);
       return;
     }
     if (request.method === 'POST' && requestUrl === '/action') {
+      this.#responseSessionGenerations.set(
+        response,
+        this.#sessionGeneration,
+      );
+      this.#lastAuthenticatedActivityAt = Date.now();
       await this.#handleAction(request, response);
       return;
     }
@@ -782,15 +856,24 @@ export class LocalWebFormElicitor
     status: number,
     messages: { flash?: string; error?: string } = {},
   ): Promise<void> {
-    const csrfToken = randomToken();
-    this.#csrfDigest = digest(csrfToken);
-    const nonce = randomToken(18);
+    const sessionGeneration =
+      this.#responseSessionGenerations.get(response);
     const model: AgentControlPageModel = {
-      csrfToken,
+      csrfToken: '',
       pending: this.#publicPending(),
       summary: await this.#summary(),
       ...messages,
     };
+    if (
+      this.#sessionDigest === null ||
+      sessionGeneration === undefined ||
+      this.#sessionGeneration !== sessionGeneration
+    ) {
+      this.#sendEmpty(response, 401);
+      return;
+    }
+    model.csrfToken = this.#issueCsrfToken();
+    const nonce = randomToken(18);
     response.writeHead(status, {
       ...securityHeaders(nonce),
       'Content-Type': 'text/html; charset=utf-8',
@@ -888,12 +971,10 @@ export class LocalWebFormElicitor
     }
     const form = new URLSearchParams(body);
     const csrf = singleFormValue(form, 'csrf');
-    if (!matchesDigest(csrf ?? undefined, this.#csrfDigest)) {
+    if (!this.#consumeCsrfToken(csrf)) {
       this.#sendEmpty(response, 403);
       return;
     }
-    // A form token is valid for one submission, including a rejected one.
-    this.#csrfDigest = null;
     const intent = singleFormValue(form, 'intent');
     if (intent === 'control') {
       await this.#handleControlAction(form, response);
@@ -906,6 +987,31 @@ export class LocalWebFormElicitor
       return;
     }
     await this.#handlePromptAction(form, response);
+  }
+
+  #issueCsrfToken(): string {
+    const token = randomToken();
+    this.#csrfDigests.push(digest(token));
+    if (this.#csrfDigests.length > MAX_ACTIVE_CSRF_TOKENS) {
+      this.#csrfDigests.splice(
+        0,
+        this.#csrfDigests.length - MAX_ACTIVE_CSRF_TOKENS,
+      );
+    }
+    return token;
+  }
+
+  #consumeCsrfToken(value: string | null): boolean {
+    if (!value) return false;
+    const actual = digest(value);
+    const index = this.#csrfDigests.findIndex(
+      (expected) =>
+        actual.length === expected.length &&
+        timingSafeEqual(actual, expected),
+    );
+    if (index < 0) return false;
+    this.#csrfDigests.splice(index, 1);
+    return true;
   }
 
   async #handleControlAction(
@@ -1213,6 +1319,7 @@ export class LocalWebFormElicitor
     const prompt = this.#pending;
     if (!prompt) return;
     this.#pending = null;
+    this.#clearPromptOpenTimer();
     clearTimeout(prompt.timer);
     if (prompt.kind === 'confirmation') {
       prompt.resolve(

@@ -18,6 +18,7 @@ const statusService = (options: {
   pendingMessages?: string[];
   privateTokenReady?: boolean;
   writesBlocked?: boolean;
+  diagnosticCodes?: string[];
 }) =>
   new ChainWhisperSignerService({
     config: configured,
@@ -48,6 +49,7 @@ const statusService = (options: {
       controlPageReady: true,
     } as never,
     writesBlocked: () => options.writesBlocked ?? false,
+    diagnosticCodes: () => options.diagnosticCodes ?? [],
   });
 
 describe('SignerStatusV2 next action', () => {
@@ -121,5 +123,29 @@ describe('SignerStatusV2 next action', () => {
       arguments: {},
       reason: 'signer-restart-required',
     });
+  });
+
+  it('includes only secret-safe Agent Control diagnostic codes', async () => {
+    const status = await statusService({
+      diagnosticCodes: [
+        'privacy-onboarding-awaiting-local-confirmation',
+        'signer-private-input-unavailable',
+        'unsafe diagnostic with spaces',
+        `0x${'ab'.repeat(32)}`,
+      ],
+    }).getStatus();
+
+    expect(status.diagnosticCodes).toContain(
+      'privacy-onboarding-awaiting-local-confirmation',
+    );
+    expect(status.diagnosticCodes).toContain(
+      'signer-private-input-unavailable',
+    );
+    expect(status.diagnosticCodes).not.toContain(
+      'unsafe diagnostic with spaces',
+    );
+    expect(status.diagnosticCodes).not.toContain(
+      `0x${'ab'.repeat(32)}`,
+    );
   });
 });
