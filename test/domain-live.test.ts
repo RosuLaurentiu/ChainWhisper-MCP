@@ -157,6 +157,7 @@ describe('LiveChainWhisperDomainGateway', () => {
       client,
       rpc: { request: vi.fn() },
       fetcher: fetcher as typeof fetch,
+      carbonApiUrl: `https://api.carbondefi.xyz/v1/coti${'/'.repeat(250_000)}`,
       now: () => Date.parse('2026-07-27T00:00:00.000Z')
     });
     const base = (await gateway.resolveAsset('gCOTI'))!;
@@ -176,6 +177,12 @@ describe('LiveChainWhisperDomainGateway', () => {
       })
     ]);
     expect(references[0]).not.toHaveProperty('canExecuteAmount', true);
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    for (const [url] of fetcher.mock.calls) {
+      expect(String(url)).toMatch(
+        /^https:\/\/api\.carbondefi\.xyz\/v1\/coti\/market-rate\?/u
+      );
+    }
   });
 
   it('fails closed when deployed bytecode does not match the runtime manifest', async () => {

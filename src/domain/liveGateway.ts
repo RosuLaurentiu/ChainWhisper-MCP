@@ -191,6 +191,14 @@ const accessFrom = (isPublic: unknown, taker: Address | null, _accessHash: unkno
 const makeHandle = (contract: Address, localId: string): string =>
   `cw_${contract.slice(2).toLowerCase()}_${localId}`;
 
+const trimTrailingAscii = (value: string, characterCode: number): string => {
+  let end = value.length;
+  while (end > 0 && value.charCodeAt(end - 1) === characterCode) {
+    end -= 1;
+  }
+  return end === value.length ? value : value.slice(0, end);
+};
+
 const trustedIdentity = (
   contract: Address,
   localId: bigint
@@ -215,7 +223,8 @@ const parseHandle = (handle: string): { escrowContract: Address; localId: string
 
 const numberToDecimal = (value: number): string | null => {
   if (!Number.isFinite(value) || value <= 0) return null;
-  const fixed = value.toFixed(18).replace(/0+$/u, '').replace(/\.$/u, '');
+  const withoutZeros = trimTrailingAscii(value.toFixed(18), 48);
+  const fixed = trimTrailingAscii(withoutZeros, 46);
   return fixed && fixed !== '0' ? fixed : null;
 };
 
@@ -250,7 +259,10 @@ export class LiveChainWhisperDomainGateway implements DomainGateway {
         transport: http(options.manifest.network.rpcUrl)
       }) as unknown as ContractReadClient);
     this.#fetcher = options.fetcher ?? fetch;
-    this.#carbonApiUrl = (options.carbonApiUrl ?? DEFAULT_CARBON_API).replace(/\/+$/u, '');
+    this.#carbonApiUrl = trimTrailingAscii(
+      options.carbonApiUrl ?? DEFAULT_CARBON_API,
+      47
+    );
     this.#executionPlanner = options.executionPlanner;
     this.#privacyBridgeStatusReader = options.privacyBridgeStatusReader;
     this.#auditTtlMs = options.auditTtlMs ?? 60_000;
