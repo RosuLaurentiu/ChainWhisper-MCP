@@ -520,6 +520,41 @@ class DeferredPrepareWallet extends TestWallet {
   }
 }
 
+class DeferredReceiptWallet extends TestWallet {
+  readonly waitStarted: Promise<void>;
+  receiptReads = 0;
+  #markWaitStarted: () => void = () => undefined;
+  #releaseWait: () => void = () => undefined;
+
+  constructor() {
+    super();
+    this.waitStarted = new Promise<void>((resolve) => {
+      this.#markWaitStarted = resolve;
+    });
+  }
+
+  release(): void {
+    this.#releaseWait();
+  }
+
+  override async getTransactionReceipt(
+    hash: HexString,
+  ): Promise<TransactionReceipt | null> {
+    this.receiptReads += 1;
+    return super.getTransactionReceipt(hash);
+  }
+
+  override async waitForTransaction(
+    hash: HexString,
+  ): Promise<TransactionReceipt> {
+    this.#markWaitStarted();
+    await new Promise<void>((resolve) => {
+      this.#releaseWait = resolve;
+    });
+    return super.waitForTransaction(hash);
+  }
+}
+
 const createTestAutonomy = () => {
   let paused = false;
   let reservationState: AutonomyReservationV1['state'] = 'reserved';
@@ -1074,6 +1109,22 @@ describe('local ChainWhisper signer core', () => {
     expect(wallet.broadcastCount).toBe(1);
   });
 
+  it('does not reconcile while the background worker owns the broadcast lifecycle', async () => {
+    const wallet = new DeferredReceiptWallet();
+    const setup = await createEngine({ wallet });
+    const envelope = createEnvelope('active-worker-owns-recovery');
+
+    await setup.engine.queueAction(envelope);
+    await wallet.waitStarted;
+    await expect(
+      setup.engine.getOperationStatus(envelope.operationId),
+    ).resolves.toMatchObject({ status: 'confirming' });
+    expect(wallet.receiptReads).toBe(0);
+
+    wallet.release();
+    await setup.engine.executeAction(envelope);
+  });
+
   it('removes the exact envelope after completion and retains only a redacted result', async () => {
     const setup = await createEngine({});
     const envelope = resignEnvelope(
@@ -1082,15 +1133,10 @@ describe('local ChainWhisper signer core', () => {
     );
 
     await setup.engine.queueAction(envelope);
-    let status = await setup.engine.getOperationStatus(
+    await setup.engine.executeAction(envelope);
+    const status = await setup.engine.getOperationStatus(
       envelope.operationId,
     );
-    for (let attempt = 0; status?.status !== 'completed' && attempt < 50; attempt += 1) {
-      await new Promise<void>((resolve) => setTimeout(resolve, 5));
-      status = await setup.engine.getOperationStatus(
-        envelope.operationId,
-      );
-    }
 
     expect(status).toMatchObject({
       status: 'completed',
@@ -1118,19 +1164,10 @@ describe('local ChainWhisper signer core', () => {
     setup.wallet.receiptLogs = [tradeOpenedLog(42n)];
 
     await setup.engine.queueAction(envelope);
-    let status = await setup.engine.getOperationStatus(
+    await setup.engine.executeAction(envelope);
+    const status = await setup.engine.getOperationStatus(
       envelope.operationId,
     );
-    for (
-      let attempt = 0;
-      status?.status !== 'completed' && attempt < 50;
-      attempt += 1
-    ) {
-      await new Promise<void>((resolve) => setTimeout(resolve, 5));
-      status = await setup.engine.getOperationStatus(
-        envelope.operationId,
-      );
-    }
 
     expect(status).toMatchObject({
       status: 'completed',
@@ -1472,16 +1509,8 @@ describe('local ChainWhisper signer core', () => {
     });
 
     await setup.engine.queueAction(envelope, 'policy-1');
-    await expect
-      .poll(() => wallet.broadcastCount, { timeout: 5_000 })
-      .toBe(1);
-    await expect
-      .poll(
-        async () =>
-          (await setup.journal.get(envelope.operationId))?.stage,
-        { timeout: 5_000 },
-      )
-      .toBe('broadcast');
+    await setup.engine.executeAction(envelope, 'policy-1');
+    expect(wallet.broadcastCount).toBe(1);
     expect(await setup.journal.get(envelope.operationId)).toMatchObject({
       stage: 'broadcast',
       nextStepIndex: 0,
@@ -1506,13 +1535,7 @@ describe('local ChainWhisper signer core', () => {
     });
 
     await restored.restorePendingOperations();
-    await expect
-      .poll(
-        async () =>
-          (await restored.getOperationStatus(envelope.operationId))?.status,
-        { timeout: 5_000 },
-      )
-      .toBe('completed');
+    await restored.executeAction(envelope, 'policy-1');
     const status = await restored.getOperationStatus(envelope.operationId);
     expect(status).toMatchObject({ status: 'completed' });
     expect(wallet.prepareCount).toBe(2);
@@ -1544,16 +1567,8 @@ describe('local ChainWhisper signer core', () => {
     });
 
     await setup.engine.queueAction(envelope, 'policy-1');
-    await expect
-      .poll(() => wallet.broadcastCount, { timeout: 5_000 })
-      .toBe(1);
-    await expect
-      .poll(
-        async () =>
-          (await setup.journal.get(envelope.operationId))?.stage,
-        { timeout: 5_000 },
-      )
-      .toBe('broadcast');
+    await setup.engine.executeAction(envelope, 'policy-1');
+    expect(wallet.broadcastCount).toBe(1);
 
     const stored = JSON.parse(
       (await setup.vault.get(
@@ -1580,15 +1595,10 @@ describe('local ChainWhisper signer core', () => {
     });
 
     await restored.restorePendingOperations();
-    await expect
-      .poll(
-        async () =>
-          (await setup.journal.get(envelope.operationId))?.errorCodes.at(
-            -1,
-          ),
-        { timeout: 5_000 },
-      )
-      .toBe('FEE_CHANGED');
+    await restored.executeAction(envelope, 'policy-1');
+    expect(
+      (await setup.journal.get(envelope.operationId))?.errorCodes.at(-1),
+    ).toBe('FEE_CHANGED');
     expect(wallet.prepareCount).toBe(1);
     expect(wallet.broadcastCount).toBe(1);
   });

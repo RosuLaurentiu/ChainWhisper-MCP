@@ -1312,10 +1312,12 @@ export class SignerEngine {
   ): Promise<OperationStatusV2 | null> {
     let record = await this.#journal.get(operationId);
     if (!record) return null;
+    const active = this.#activeOperations.has(operationId);
     const reconciling =
-      record.stage === 'awaiting-broadcast' ||
-      record.stage === 'prepared-broadcast' ||
-      record.stage === 'broadcast';
+      !active &&
+      (record.stage === 'awaiting-broadcast' ||
+        record.stage === 'prepared-broadcast' ||
+        record.stage === 'broadcast');
     if (reconciling) {
       await this.recoverOperation(operationId, record.operationHash);
       record = (await this.#journal.get(operationId)) ?? record;
