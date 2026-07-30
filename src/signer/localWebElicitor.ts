@@ -876,6 +876,11 @@ export class LocalWebFormElicitor
     const nonce = randomToken(18);
     response.writeHead(status, {
       ...securityHeaders(nonce),
+      // Chrome serializes Origin as "null" for form submissions from a
+      // document using no-referrer. Keep bootstrap responses on no-referrer,
+      // but let the authenticated page provide the exact same-origin value
+      // required by #handleAction.
+      'Referrer-Policy': 'same-origin',
       'Content-Type': 'text/html; charset=utf-8',
     });
     response.end(renderAgentControlPage(model, nonce));
