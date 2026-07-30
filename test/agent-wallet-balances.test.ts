@@ -274,4 +274,10 @@ describe('formatDashboardAmount', () => {
   ])('formats %s as %s', (exact, expected) => {
     expect(formatDashboardAmount(exact)).toBe(expected);
   });
+
+  it('trims a large untrusted zero suffix without a regular expression', () => {
+    expect(
+      formatDashboardAmount(`12.5${'0'.repeat(250_000)}`),
+    ).toBe('12.5');
+  });
 });
