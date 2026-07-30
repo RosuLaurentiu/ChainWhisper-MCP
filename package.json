@@ -38,7 +38,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "lint": "eslint .",
-    "test": "vitest run test --testTimeout=15000",
+    "test": "vitest run test --testTimeout=15000 --maxWorkers=1",
     "smoke": "node scripts/package-smoke.mjs",
     "smoke:live": "node scripts/package-smoke.mjs --live-status",
     "smoke:live:readonly": "node scripts/live-readonly-smoke.mjs",
