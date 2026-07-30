@@ -21,9 +21,13 @@ Initial public beta release candidate.
   expected-wallet pin; unbound root-vault privacy keys now require explicit
   privacy re-onboarding.
 - Added a persistent ChainWhisper-branded loopback Agent Control page with
-  one rotated session, CSRF/replay/origin protections, strict CSP, no remote
-  assets, no telemetry, redacted diagnostics, responsive accessible forms,
-  coalesced browser opens, and authenticated-page arrival checks.
+  one rotated session, bounded one-use CSRF tokens across concurrent reloads,
+  replay/origin protections, strict CSP, no remote assets, no telemetry,
+  redacted diagnostics, responsive accessible forms, active-tab prompt reuse,
+  stale-tab reopening, and authenticated-page arrival checks.
+- Added structured allowlisted Agent Control diagnostic codes to signer status
+  so agents can distinguish setup progress and safe failures without receiving
+  local error text or secrets.
 
 ### Signing and autonomy
 
@@ -83,6 +87,8 @@ Initial public beta release candidate.
 - Added exact-source Solidity reproduction for the deployed recurring
   contract, including compiler input, creation-bytecode, runtime, ABI, and
   selector evidence.
+- Overrode the Solidity compiler's legacy temporary-file helper with the
+  patched compatible release used by the evidence build.
 - Publish the previously built tarball and attach checksum, production SBOM,
   runtime audit, contract provenance, and release notes to a GitHub
   prerelease.
