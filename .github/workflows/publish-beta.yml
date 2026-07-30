@@ -72,19 +72,23 @@ jobs:
           npm run smoke
           npm run audit:dependencies
 
+      - name: Reproduce deployed contract provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-artifacts
+          node scripts/verify-contract-provenance.mjs \
+            --standard-input release-artifacts/contract-standard-input.json \
+            > release-artifacts/contract-provenance.json
+
       - name: Build and inspect the exact tarball
         shell: bash
         run: |
           set -euo pipefail
-          mkdir release-artifacts
+          mkdir -p release-artifacts
           node scripts/package-tarball-smoke.mjs --pack-destination release-artifacts
           node dist/bin/audit-runtime.js > release-artifacts/runtime-audit.json
           cp CHANGELOG.md release-artifacts/RELEASE_NOTES.md
-          (
-            cd release-artifacts
-            sha256sum ./*.tgz > SHA256SUMS
-            sha256sum -c SHA256SUMS
-          )
 
       - name: Generate production-only SBOM from installed tarball
         shell: bash
@@ -98,6 +102,21 @@ jobs:
           npm install --ignore-scripts --omit=dev --no-audit --no-fund "${tarball}"
           npm sbom --omit=dev --sbom-format cyclonedx \
             > "${GITHUB_WORKSPACE}/release-artifacts/sbom.cdx.json"
+
+      - name: Checksum immutable release evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release-artifacts
+          sha256sum \
+            ./*.tgz \
+            contract-provenance.json \
+            contract-standard-input.json \
+            runtime-audit.json \
+            sbom.cdx.json \
+            RELEASE_NOTES.md \
+            > SHA256SUMS
+          sha256sum -c SHA256SUMS
 
       - name: Upload immutable release evidence
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -134,6 +153,8 @@ jobs:
           set -euo pipefail
           cd release-artifacts
           sha256sum -c SHA256SUMS
+          test -s contract-provenance.json
+          test -s contract-standard-input.json
           test -s runtime-audit.json
           test -s sbom.cdx.json
 
@@ -327,6 +348,8 @@ jobs:
             "${tarballs[0]}"
             release-artifacts/SHA256SUMS
             release-artifacts/sbom.cdx.json
+            release-artifacts/contract-provenance.json
+            release-artifacts/contract-standard-input.json
             release-artifacts/runtime-audit.json
             release-artifacts/RELEASE_NOTES.md
           )

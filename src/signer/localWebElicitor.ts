@@ -162,15 +162,11 @@ const openDefaultBrowser: OpenUrl = (url) =>
     }
     const command =
       process.platform === 'win32'
-        ? process.env['COMSPEC'] || 'cmd.exe'
+        ? 'explorer.exe'
         : process.platform === 'darwin'
           ? 'open'
           : 'xdg-open';
-    const args =
-      process.platform === 'win32'
-        ? ['/d', '/c', 'start', '', url]
-        : [url];
-    const child = spawn(command, args, {
+    const child = spawn(command, [url], {
       detached: true,
       stdio: 'ignore',
       windowsHide: true,
