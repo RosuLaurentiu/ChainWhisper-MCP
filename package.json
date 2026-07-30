@@ -51,14 +51,14 @@
     "prepublishOnly": "npm run lint && npm run build && npm test && npm run smoke && npm run audit:dependencies && node scripts/package-tarball-smoke.mjs"
   },
   "dependencies": {
-    "@coti-io/coti-ethers": "1.0.5",
+    "@coti-io/coti-ethers": "1.0.6",
     "@coti-io/coti-sdk-private-messaging": "0.2.3",
-    "@coti-io/coti-sdk-typescript": "1.0.6",
+    "@coti-io/coti-sdk-typescript": "1.0.9",
     "@modelcontextprotocol/sdk": "1.30.0",
-    "@scure/bip39": "1.6.0",
+    "@scure/bip39": "2.2.0",
     "ethers": "6.17.0",
-    "viem": "2.55.1",
-    "zod": "3.25.76"
+    "viem": "2.55.10",
+    "zod": "4.4.3"
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",
