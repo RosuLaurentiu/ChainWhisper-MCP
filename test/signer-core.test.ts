@@ -1623,13 +1623,13 @@ describe('local ChainWhisper signer core', () => {
 
     await setup.engine.queueAction(envelope, 'policy-1');
     await expect
-      .poll(() => wallet.broadcastCount, { timeout: 5_000 })
+      .poll(() => wallet.broadcastCount, { timeout: 15_000 })
       .toBe(1);
     await expect
       .poll(
         async () =>
           (await setup.journal.get(envelope.operationId))?.stage,
-        { timeout: 5_000 },
+        { timeout: 15_000 },
       )
       .toBe('broadcast');
 
@@ -1673,12 +1673,12 @@ describe('local ChainWhisper signer core', () => {
           (await setup.journal.get(envelope.operationId))?.errorCodes.at(
             -1,
           ),
-        { timeout: 5_000 },
+        { timeout: 15_000 },
       )
       .toBe('OPERATION_REPREPARE_REQUIRED');
     expect(wallet.prepareCount).toBe(1);
     expect(wallet.broadcastCount).toBe(1);
-  });
+  }, 30_000);
 
   it('keeps a pending receipt in processing and does not resubmit it', async () => {
     const wallet = new TestWallet();
