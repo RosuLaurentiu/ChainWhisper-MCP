@@ -27,6 +27,11 @@ describe('LiveChainWhisperDomainGateway', () => {
       decimals: 18,
       publicCounterpart: { symbol: 'gCOTI' }
     });
+    await expect(gateway.resolveAsset('p.COTI')).resolves.toMatchObject({
+      kind: 'private-erc20',
+      decimals: 18,
+      publicCounterpart: { symbol: 'COTI', address: null }
+    });
     await expect(
       gateway.resolveAsset('0x0000000000000000000000000000000000000001')
     ).resolves.toBeNull();
@@ -183,6 +188,56 @@ describe('LiveChainWhisperDomainGateway', () => {
         /^https:\/\/api\.carbondefi\.xyz\/v1\/coti\/market-rate\?/u
       );
     }
+  });
+
+  it('uses native COTI as the verified public counterpart for p.COTI pricing', async () => {
+    const manifest = await loadRuntimeManifest();
+    const requestedAddresses: string[] = [];
+    const fetcher = vi.fn(async (url: URL | string) => {
+      const address = new URL(String(url)).searchParams.get('address')!;
+      requestedAddresses.push(address);
+      return new Response(
+        JSON.stringify({
+          data: {
+            USD: address.toLowerCase() ===
+              '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee'
+              ? 0.2
+              : 0.1
+          }
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } }
+      );
+    });
+    const gateway = await createLiveChainWhisperDomainGateway({
+      manifest,
+      client: { readContract: vi.fn() },
+      rpc: { request: vi.fn() },
+      fetcher: fetcher as typeof fetch,
+      now: () => Date.parse('2026-07-30T00:00:00.000Z')
+    });
+    const base = (await gateway.resolveAsset('p.WISP'))!;
+    const quote = (await gateway.resolveAsset('p.COTI'))!;
+
+    const references = await gateway.getPriceReferences({
+      baseAsset: base,
+      quoteAsset: quote,
+      side: 'buy',
+      amount: null
+    });
+
+    expect(references).toEqual([
+      expect.objectContaining({
+        venue: 'carbon',
+        price: '0.5',
+        note: 'Public-token counterparts were used for this reference.'
+      })
+    ]);
+    expect(requestedAddresses.map((address) => address.toLowerCase())).toEqual(
+      expect.arrayContaining([
+        manifest.tokens.find(({ symbol }) => symbol === 'WISP')!.address!.toLowerCase(),
+        '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee'
+      ])
+    );
   });
 
   it('fails closed when deployed bytecode does not match the runtime manifest', async () => {

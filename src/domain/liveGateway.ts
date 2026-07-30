@@ -549,11 +549,13 @@ export class LiveChainWhisperDomainGateway implements DomainGateway {
         decimals: token.decimals,
         address: address ?? null,
         verified: true,
-        ...(counterpart?.address
+        ...(counterpart
           ? {
               publicCounterpart: {
                 symbol: counterpart.symbol,
-                address: counterpart.address.toLowerCase() as Address
+                address: counterpart.address
+                  ? counterpart.address.toLowerCase() as Address
+                  : null
               }
             }
           : {})
@@ -1086,7 +1088,11 @@ export class LiveChainWhisperDomainGateway implements DomainGateway {
   #carbonAsset(asset: ResolvedAsset): { address: Address | typeof CARBON_NATIVE_ADDRESS } | null {
     if (asset.kind === 'native') return { address: CARBON_NATIVE_ADDRESS };
     if (asset.kind === 'erc20' && asset.address) return { address: asset.address };
-    if (asset.publicCounterpart) return { address: asset.publicCounterpart.address };
+    if (asset.publicCounterpart) {
+      return {
+        address: asset.publicCounterpart.address ?? CARBON_NATIVE_ADDRESS
+      };
+    }
     return null;
   }
 
