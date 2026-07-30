@@ -22,12 +22,17 @@ import {
   type ChainWhisperRuntimeManifestV1,
   type SignedActionEnvelopeV1
 } from '../src/shared/index.js';
+import { deriveOrderClassificationV1 } from '../src/shared/orderClassification.js';
 import {
   ManifestExecutionPlanner,
   SignedDomainEnvelopeFactory,
   createChainWhisperPlanningRuntime,
   type PlannerRpc
 } from '../src/planner/index.js';
+import {
+  buildActionConfirmation,
+  type MaterializedActionStep
+} from '../src/signer/index.js';
 
 const PAIRING_SECRET = 'planner-test-pairing-secret-that-is-long-enough';
 const FEE_RECIPIENT = '0x1111111111111111111111111111111111111111';
@@ -1062,6 +1067,14 @@ describe('ManifestExecutionPlanner', () => {
       ).toMatchObject({ source: 'signer-elicitation' });
       expect(execution.exactNativeValue).toBe('0');
       expect(execution.simulation.deferredPrivateArtifacts).toBe(true);
+      const prepared = await new SignedDomainEnvelopeFactory({
+        manifest,
+        pairingSecret: PAIRING_SECRET,
+        now: () => NOW
+      }).create(intent, execution);
+      expect(
+        (prepared.payload as SignedActionEnvelopeV1).intent.metadata
+      ).toMatchObject({ sourceMaker: order.maker });
     }
   );
 
@@ -1635,6 +1648,173 @@ describe('SignedDomainEnvelopeFactory', () => {
       [manifest.contracts.directEscrow!.address.toLowerCase()]: '123'
     });
   });
+
+  it('builds the complete p.WISP/p.COTI private recurring review at ±10% market price', async () => {
+    const manifest = await loadRuntimeManifest();
+    const rpc = new FakeRpc();
+    const intent: CreateRecurringIntent = {
+      action: 'create_recurring',
+      wallet: WALLET,
+      baseAsset: resolveAsset(manifest, 'p.WISP'),
+      quoteAsset: resolveAsset(manifest, 'p.COTI'),
+      orderType: deriveOrderClassificationV1({
+        route: 'recurring-escrow',
+        access: 'public',
+        privateLiquidity: true,
+        assets: [
+          resolveAsset(manifest, 'p.WISP'),
+          resolveAsset(manifest, 'p.COTI')
+        ],
+        relation: 'primary'
+      }),
+      buyPrice: '0.9',
+      sellPrice: '1.1',
+      buyQuoteLiquidity: '10',
+      sellBaseLiquidity: '10',
+      access: 'public',
+      recipient: null,
+      amountVisibility: 'private',
+      privateAmountMode: 'agent-provided',
+      priceReference: {
+        id: 'chainwhisper-pwisp-pcoti',
+        venue: 'Carbon DeFi',
+        price: '1',
+        observedAt: '2026-07-27T11:59:30.000Z',
+        buyOffsetBps: -1_000,
+        sellOffsetBps: 1_000
+      },
+      secretPolicy: { kind: 'none' }
+    };
+    const execution = await new ManifestExecutionPlanner({
+      manifest,
+      rpc,
+      now: () => NOW
+    }).plan(intent, statusFor(manifest));
+    const prepared = await new SignedDomainEnvelopeFactory({
+      manifest,
+      pairingSecret: PAIRING_SECRET,
+      now: () => NOW
+    }).create(intent, execution);
+    const signed = prepared.payload as SignedActionEnvelopeV1;
+    const steps: MaterializedActionStep[] = signed.steps.map((step) => ({
+      id: step.id,
+      kind: step.kind,
+      to: step.to,
+      data: step.data,
+      value: step.value,
+      gasCap: step.gasCap,
+      summary: step.summary,
+      ...(step.allowance
+        ? {
+            approval: {
+              token: step.allowance.token,
+              spender: step.allowance.spender,
+              amount: step.allowance.amount,
+              ...(step.allowance.scheme
+                ? { scheme: step.allowance.scheme }
+                : {}),
+              ...(step.allowance.amountCommitment
+                ? { amountCommitment: step.allowance.amountCommitment }
+                : {})
+            }
+          }
+        : {})
+    }));
+    steps.at(-1)!.privateDisplayAmounts = [
+      {
+        id: 'recurring-base-inventory',
+        amount: '10',
+        symbol: 'p.WISP'
+      },
+      {
+        id: 'recurring-quote-inventory',
+        amount: '10',
+        symbol: 'p.COTI'
+      }
+    ];
+
+    const confirmation = buildActionConfirmation(
+      signed,
+      steps,
+      0
+    );
+
+    expect(confirmation.details).toEqual(
+      expect.arrayContaining([
+        {
+          label: 'Buy price · public on-chain (p.COTI per p.WISP)',
+          value: '0.9 p.COTI per p.WISP'
+        },
+        {
+          label: 'Sell price · public on-chain (p.COTI per p.WISP)',
+          value: '1.1 p.COTI per p.WISP'
+        },
+        {
+          label: 'Buy-side budget · encrypted on-chain (p.COTI)',
+          value: '10 p.COTI'
+        },
+        {
+          label: 'Sell-side inventory · encrypted on-chain (p.WISP)',
+          value: '10 p.WISP'
+        },
+        {
+          label: 'On-chain visibility',
+          value:
+            'Sell inventory and buy budget are encrypted. Buy and sell prices, addresses, and order activity are public.'
+        },
+        {
+          label:
+            'Private sell-side inventory (recurring-base-inventory)',
+          value: '10 p.WISP'
+        },
+        {
+          label:
+            'Private buy-side budget (recurring-quote-inventory)',
+          value: '10 p.COTI'
+        },
+        {
+          label: 'Signed market reference source',
+          value: 'chainwhisper-pwisp-pcoti'
+        },
+        {
+          label: 'Signed market reference venue',
+          value: 'Carbon DeFi'
+        },
+        {
+          label: 'Signed market reference price (p.COTI per p.WISP)',
+          value: '1 p.COTI per p.WISP'
+        },
+        {
+          label: 'Signed market reference observed at',
+          value: '2026-07-27T11:59:30.000Z'
+        },
+        {
+          label: 'Buy-price deviation from market',
+          value: '-10% (-1000 bps)'
+        },
+        {
+          label: 'Sell-price deviation from market',
+          value: '+10% (+1000 bps)'
+        }
+      ])
+    );
+    expect(confirmation.fee).toBe(
+      '0.000000000000000123 COTI (123 wei)'
+    );
+    expect(signed.intent).toMatchObject({
+      amountVisibility: 'private-hidden',
+      orderType: {
+        id: 'recurring.private-liquidity.public'
+      },
+      metadata: {
+        privateAmountMode: 'agent-provided',
+        buyQuoteLiquidity: '10',
+        sellBaseLiquidity: '10',
+        buyPriceOffsetBps: -1000,
+        sellPriceOffsetBps: 1000
+      }
+    });
+  });
 });
 
 describe('chainwhisper-mcp definition', () => {
@@ -1652,6 +1832,7 @@ describe('chainwhisper-mcp definition', () => {
       'chainwhisper_list_orders',
       'chainwhisper_get_order',
       'chainwhisper_compare_price_references',
+      'chainwhisper_prepare_swap',
       'chainwhisper_privacy_bridge_status',
       'chainwhisper_prepare_privacy_bridge',
       'chainwhisper_prepare_create_trade',

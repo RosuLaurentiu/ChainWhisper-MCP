@@ -342,7 +342,7 @@ describe('audited private transaction routes', () => {
     });
     expect(buildActionConfirmation(signed, approval, 0)).toMatchObject({
       spender: manifest.contracts.standardEscrow!.address,
-      fee: '0 native on this approval step',
+      fee: '0 COTI (0 wei; approval step)',
       expectedResult: expect.stringContaining(
         'order is not created',
       ),

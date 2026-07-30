@@ -10,13 +10,13 @@ import type {
   ListOrdersInput,
   OrderIdentityInput,
   OrderUpdateInput,
+  PrepareSwapInput,
   PrivacyBridgeInput,
   PrivacyBridgeStatusInput,
   ToolResult
 } from './types.js';
-import { assertPlainRecord } from './validation.js';
+import { assertAllowedKeys, assertPlainRecord } from './validation.js';
 import { toolFailure } from './errors.js';
-import { ORDER_CLASSIFICATION_IDS_V1 } from '../shared/orderClassification.js';
 import { MAX_DECIMAL_INPUT_LENGTH } from './decimal.js';
 
 const addressSchema = { type: 'string', pattern: '^0x[a-fA-F0-9]{40}$' };
@@ -30,7 +30,35 @@ const privateAmountModeSchema = {
   enum: ['signer-input', 'agent-provided'],
   default: 'signer-input',
   description:
-    'In signer-input mode, the signer collects those locally inside Agent Control. agent-provided binds agent-visible amounts into the envelope and can execute only under a matching local autonomy policy.'
+    'signer-input collects private values inside Agent Control. agent-provided binds agent-visible private values into the envelope for either normal local confirmation or a matching autonomy policy.'
+};
+const liquidityVisibilitySchema = {
+  enum: ['visible', 'private'],
+  default: 'visible',
+  description:
+    'visible publishes inventory amounts. private keeps eligible private-token liquidity encrypted on-chain.'
+};
+const recurringPriceSchema = {
+  anyOf: [
+    decimalSchema,
+    {
+      type: 'object',
+      additionalProperties: false,
+      required: ['reference', 'offsetBps'],
+      properties: {
+        reference: { const: 'market' },
+        offsetBps: {
+          type: 'integer',
+          minimum: -9999,
+          maximum: 10000,
+          description:
+            '-1000 is 10% below and 1000 is 10% above the live market reference.'
+        }
+      }
+    }
+  ],
+  description:
+    'An exact quote-per-base decimal or an offset from the current compatible market reference.'
 };
 const assetSchema = {
   anyOf: [
@@ -68,12 +96,6 @@ const orderSchema = {
     }
   ]
 };
-const oneOffOrderTypes = ORDER_CLASSIFICATION_IDS_V1.filter((id) =>
-  id.startsWith('one-off.')
-);
-const recurringOrderTypes = ORDER_CLASSIFICATION_IDS_V1.filter((id) =>
-  id.startsWith('recurring.')
-);
 const privacyBridgePairs = [
   'coti',
   'weth',
@@ -203,7 +225,7 @@ export const createChainWhisperDomainTools = (
   {
     name: 'chainwhisper_order_types',
     description:
-      'List every canonical ChainWhisper order type, its access model, term and liquidity visibility, fill style, and whether the deployed route is currently safe to execute. Call this before asking the user to choose an orderType.',
+      'Explain the canonical ChainWhisper order classifications returned by the public beta. Create tools derive the classification from economic intent, so no orderType pre-call is required.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -216,7 +238,11 @@ export const createChainWhisperDomainTools = (
           ok: true,
           data: {
             version: 'OrderTypeCatalogV1',
-            orderTypes: ORDER_TYPE_CATALOG
+            orderTypes: ORDER_TYPE_CATALOG.filter(
+              ({ id }) =>
+                id !== 'recurring.direct' &&
+                id !== 'recurring.private-liquidity.direct'
+            )
           }
         };
       } catch (error) {
@@ -289,6 +315,30 @@ export const createChainWhisperDomainTools = (
     execute: safeExecute<ComparePriceReferencesInput>((input) => service.comparePriceReferences(input))
   },
   {
+    name: 'chainwhisper_prepare_swap',
+    description:
+      'Select the best single visible public ChainWhisper order that can fill the complete requested amount, then prepare its canonical fill envelope. It safely refuses when the complete listing does not fit in one response; it never combines orders, uses hidden liquidity, signs, or broadcasts.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        wallet: addressSchema,
+        sellAsset: assetSchema,
+        buyAsset: assetSchema,
+        inputMode: {
+          enum: ['sell', 'buy'],
+          default: 'sell',
+          description:
+            'sell treats amount as the exact asset paid; buy treats amount as the exact asset received.'
+        },
+        amount: decimalSchema
+      }
+    },
+    execute: safeExecute<PrepareSwapInput>((input) =>
+      service.prepareSwap(input)
+    )
+  },
+  {
     name: 'chainwhisper_privacy_bridge_status',
     description:
       'Read and verify one allowlisted Privacy Portal bridge pair, live pause/deposit policy, wallet blacklist status, limits, and an optional exact amount fee quote. This is keyless and read-only.',
@@ -329,20 +379,21 @@ export const createChainWhisperDomainTools = (
   {
       name: 'chainwhisper_prepare_create_trade',
       description:
-        'Validate and prepare an audited ChainWhisper one-off OTC order. Select an explicit orderType so public, unlisted, direct-recipient, and private-liquidity routes cannot be confused. Confidential amounts default to local signer input; agent-provided mode requires a matching local autonomy policy. This tool never signs or submits.',
+        'Prepare a one-off OTC order from its assets, access, liquidity visibility, amounts, recipient, expiry, and fill policy. The canonical order type is derived and returned. Confidential amounts default to local Agent Control; agent-provided values can use local confirmation or a matching autonomy policy.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
-      required: ['orderType'],
       properties: {
         wallet: addressSchema,
-        orderType: {
-          enum: oneOffOrderTypes,
-          description:
-            'Required. Use chainwhisper_order_types to explain the exact listing, recipient, terms, and liquidity privacy before the user chooses.'
-        },
         offerAsset: assetSchema,
         requestAsset: assetSchema,
+        access: {
+          enum: ['public', 'unlisted', 'direct'],
+          default: 'public',
+          description:
+            'Public listing, unlisted shareable link, or a fixed direct recipient.'
+        },
+        liquidityVisibility: liquidityVisibilitySchema,
         privateAmountMode: privateAmountModeSchema,
         offerAmount: {
           ...decimalSchema,
@@ -369,27 +420,37 @@ export const createChainWhisperDomainTools = (
         }
       }
     },
-    execute: safeExecute<CreateTradeInput>((input) => service.prepareCreateTrade(input))
+    execute: safeExecute<CreateTradeInput>((input) => {
+      assertAllowedKeys(input, [
+        'wallet',
+        'offerAsset',
+        'requestAsset',
+        'offerAmount',
+        'requestAmount',
+        'access',
+        'recipient',
+        'liquidityVisibility',
+        'privateAmountMode',
+        'expiresAt',
+        'fillPolicy'
+      ]);
+      return service.prepareCreateTrade(input);
+    })
   },
   {
       name: 'chainwhisper_prepare_create_recurring',
       description:
-        'Validate and prepare a public or fixed-recipient recurring ChainWhisper order with an explicit orderType. Visible and private-token inventory routes are supported. Confidential inventory defaults to local signer input; agent-provided mode requires a matching local autonomy policy. Prices use quote per base.',
+        'Prepare public-access reusable two-sided liquidity from a pair, maker buy budget and price, maker sell inventory and price, and liquidity visibility. The canonical recurring type is derived and returned. Each price may be exact or a live market offset in basis points.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
-      required: ['orderType'],
       properties: {
         wallet: addressSchema,
-        orderType: {
-          enum: recurringOrderTypes,
-          description:
-            'Required. Use chainwhisper_order_types before the user chooses between the actual public and fixed-recipient recurring variants.'
-        },
         baseAsset: assetSchema,
         quoteAsset: assetSchema,
-        buyPrice: decimalSchema,
-        sellPrice: decimalSchema,
+        buyPrice: recurringPriceSchema,
+        sellPrice: recurringPriceSchema,
+        liquidityVisibility: liquidityVisibilitySchema,
         privateAmountMode: privateAmountModeSchema,
         buyQuoteLiquidity: {
           ...decimalSchema,
@@ -400,16 +461,28 @@ export const createChainWhisperDomainTools = (
           ...decimalSchema,
           description:
             'Include public inventory. For private inventory, omit in signer-input mode or include it in agent-provided mode.'
-        },
-        recipient: addressSchema
+        }
       }
     },
-    execute: safeExecute<CreateRecurringInput>((input) => service.prepareCreateRecurring(input))
+    execute: safeExecute<CreateRecurringInput>((input) => {
+      assertAllowedKeys(input, [
+        'wallet',
+        'baseAsset',
+        'quoteAsset',
+        'buyPrice',
+        'sellPrice',
+        'buyQuoteLiquidity',
+        'sellBaseLiquidity',
+        'liquidityVisibility',
+        'privateAmountMode'
+      ]);
+      return service.prepareCreateRecurring(input);
+    })
   },
   {
     name: 'chainwhisper_prepare_fill',
     description:
-      'Prepare a fill for an existing trusted ChainWhisper order. Confidential amounts default to Agent Control; agent-provided mode binds them into the envelope for a matching local autonomy policy.',
+      'Prepare a fill for an existing trusted ChainWhisper order. Confidential amounts default to Agent Control; agent-provided values can use local confirmation or a matching autonomy policy.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -440,7 +513,7 @@ export const createChainWhisperDomainTools = (
   {
     name: 'chainwhisper_prepare_counter',
     description:
-      'Prepare a canonical Direct counterorder against a trusted one-off order. Counter terms are recipient-bound to the original maker. Confidential amounts default to Agent Control; agent-provided mode requires a matching local autonomy policy.',
+      'Prepare a canonical Direct counterorder against a trusted one-off order. Counter terms are recipient-bound to the original maker. Confidential amounts default to Agent Control; agent-provided values can use local confirmation or a matching autonomy policy.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,

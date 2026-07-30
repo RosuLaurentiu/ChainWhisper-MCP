@@ -13,11 +13,15 @@ import {
 } from './autonomy.js';
 import { ConfirmationGate } from './confirmation.js';
 import { SignerEngine } from './engine.js';
+import { SignerError } from './errors.js';
 import {
   LocalWebFormElicitor,
   type OpenControlPanelResult,
 } from './localWebElicitor.js';
-import { ChainWhisperMessagingBridge } from './messaging.js';
+import {
+  ChainWhisperMessagingBridge,
+  isMessageOperationId,
+} from './messaging.js';
 import {
   PrivacyOnboardingService,
   type PrivacyOnboardingResult,
@@ -29,9 +33,10 @@ import {
 } from './privateTokenAccount.js';
 import type {
   Address,
-  ConfirmationDiagnosticResult,
-  ExecuteActionResult,
-  OperationJournalRecord,
+  OperationStatusV2,
+  PrivateStateDisclosureDecisionV1,
+  PrivateStateDisclosureReader,
+  PrivateStateQueryV1,
   PublicSignerStatus,
   RecoverOperationResult,
   WalletTransport,
@@ -45,6 +50,7 @@ export class ChainWhisperSignerService {
   readonly #messaging: ChainWhisperMessagingBridge;
   readonly #privacyOnboarding: PrivacyOnboardingService;
   readonly #privateTokens: PrivateTokenAccountService;
+  readonly #privateState: PrivateStateDisclosureReader | null;
   readonly #control: LocalWebFormElicitor | null;
   readonly #autonomy: AutonomyPolicyManager | null;
   readonly #writesBlocked: () => boolean;
@@ -58,6 +64,7 @@ export class ChainWhisperSignerService {
     messaging: ChainWhisperMessagingBridge;
     privacyOnboarding: PrivacyOnboardingService;
     privateTokens: PrivateTokenAccountService;
+    privateState?: PrivateStateDisclosureReader;
     control?: LocalWebFormElicitor;
     autonomy?: AutonomyPolicyManager;
     writesBlocked?: () => boolean;
@@ -70,6 +77,7 @@ export class ChainWhisperSignerService {
     this.#messaging = options.messaging;
     this.#privacyOnboarding = options.privacyOnboarding;
     this.#privateTokens = options.privateTokens;
+    this.#privateState = options.privateState ?? null;
     this.#control = options.control ?? null;
     this.#autonomy = options.autonomy ?? null;
     this.#writesBlocked = options.writesBlocked ?? (() => false);
@@ -80,7 +88,9 @@ export class ChainWhisperSignerService {
     return this.#messaging;
   }
 
-  async getStatus(): Promise<PublicSignerStatus> {
+  async getStatus(
+    requiredAssets: string[] = [],
+  ): Promise<PublicSignerStatus> {
     let wallet: Address | null;
     try {
       wallet = await this.#wallet.getAddress();
@@ -91,10 +101,13 @@ export class ChainWhisperSignerService {
     const autonomyStatus = autonomyDecision.allowed
       ? autonomyDecision.value
       : null;
-    const activePolicies = autonomyStatus?.policies.filter(({ policy }) =>
-      ['active', 'paused'].includes(policy.lifecycle.state),
-    ) ?? [];
+    const activePolicies =
+      autonomyStatus?.policies.filter(({ policy }) =>
+        ['active', 'paused'].includes(policy.lifecycle.state),
+      ) ?? [];
     const current = activePolicies.at(-1)?.policy;
+    const privacyReady = await this.#privacyOnboarding.isReady();
+    const writesBlocked = this.#writesBlocked();
     const status = buildPublicSignerStatus(
       this.#config,
       wallet,
@@ -104,7 +117,7 @@ export class ChainWhisperSignerService {
             requestConfirmation: async () => ({ outcome: 'cancelled' }),
           }
         : null,
-      await this.#privacyOnboarding.isReady(),
+      privacyReady,
       {
         controlPageReadiness: this.#control?.controlPageReady
           ? 'ready'
@@ -116,7 +129,7 @@ export class ChainWhisperSignerService {
           globalPaused: autonomyStatus?.globalPaused ?? false,
         },
         diagnosticCodes: [
-          ...(this.#writesBlocked() ? ['signer-restart-required'] : []),
+          ...(writesBlocked ? ['signer-restart-required'] : []),
           ...(autonomyDecision.allowed
             ? []
             : [`autonomy-${autonomyDecision.denial.code.toLowerCase()}`]),
@@ -126,30 +139,133 @@ export class ChainWhisperSignerService {
         ],
       },
     );
-    return this.#writesBlocked()
+    const uniqueRequiredAssets = [
+      ...new Set(
+        requiredAssets
+          .map((asset) => asset.trim())
+          .filter(Boolean),
+      ),
+    ].slice(0, 16);
+    const assetReadiness = await Promise.all(
+      uniqueRequiredAssets.map(async (asset) => {
+        if (!privacyReady) {
+          return {
+            asset,
+            status: 'privacy-onboarding-required' as const,
+          };
+        }
+        try {
+          const token = await this.#privateTokens.status(asset);
+          return {
+            asset: token.symbol,
+            status: token.ready
+              ? ('ready' as const)
+              : ('private-token-setup-required' as const),
+          };
+        } catch (error) {
+          return {
+            asset,
+            status:
+              error &&
+              typeof error === 'object' &&
+              'code' in error &&
+              error.code === 'UNSUPPORTED_TOOL'
+                ? ('unsupported' as const)
+                : ('unavailable' as const),
+          };
+        }
+      }),
+    );
+    const pendingOperationIds = [
+      ...new Set([
+        ...(await this.#engine.listPendingOperationIds()),
+        ...(await this.#messaging.listPendingOperationIds()),
+      ]),
+    ];
+    const nextAction: PublicSignerStatus['nextAction'] = writesBlocked
       ? {
-          ...status,
+          tool: null,
+          arguments: {},
+          reason: 'signer-restart-required',
+        }
+      : !status.configured
+        ? {
+            tool: 'chainwhisper_open_control_panel',
+            arguments: {},
+            reason: 'wallet-setup-required',
+          }
+        : !privacyReady
+          ? {
+              tool: 'chainwhisper_open_control_panel',
+              arguments: {},
+              reason: 'privacy-onboarding-required',
+            }
+          : assetReadiness.some(
+                ({ status: assetStatus }) =>
+                  assetStatus ===
+                  'private-token-setup-required',
+              )
+            ? {
+                tool: 'chainwhisper_open_control_panel',
+                arguments: {},
+                reason: 'private-token-setup-required',
+              }
+            : pendingOperationIds.length > 0
+              ? {
+                  tool: 'chainwhisper_get_operation',
+                  arguments: {
+                    operationId: pendingOperationIds[0]!,
+                  },
+                  reason: 'pending-operation',
+                }
+              : status.controlPageReadiness !== 'ready'
+                ? {
+                    tool: 'chainwhisper_open_control_panel',
+                    arguments: {},
+                    reason: 'control-panel-required',
+                  }
+                : {
+                    tool: null,
+                    arguments: {},
+                    reason: 'ready',
+                  };
+    const enriched: PublicSignerStatus = {
+      ...status,
+      requiredAssets: assetReadiness,
+      pendingOperations: {
+        count: pendingOperationIds.length,
+        operationIds: pendingOperationIds.slice(0, 20),
+      },
+      nextAction,
+    };
+    return writesBlocked
+      ? {
+          ...enriched,
           mode: 'read-only',
           signerReadiness: 'confirmation-unavailable',
           diagnosticCodes: [
             ...new Set([
-              ...status.diagnosticCodes,
+              ...enriched.diagnosticCodes,
               'signer-restart-required',
             ]),
           ],
         }
-      : status;
+      : enriched;
   }
 
-  openControlPanel(): Promise<OpenControlPanelResult> {
-    return this.#control
-      ? this.#control.openControlPanel()
-      : Promise.resolve({
+  async openControlPanel(): Promise<OpenControlPanelResult> {
+    const result = this.#control
+      ? await this.#control.openControlPanel()
+      : {
           opened: false,
           ready: false,
           activePrompt: false,
-          reason: 'server-unavailable',
-        });
+          reason: 'server-unavailable' as const,
+        };
+    if (result.opened && result.ready) {
+      await this.restorePendingOperations();
+    }
+    return result;
   }
 
   autonomyStatus(): Promise<AutonomyDecision<AutonomyStatusV1>> {
@@ -227,9 +343,7 @@ export class ChainWhisperSignerService {
   }
 
   pauseAutonomy(): Promise<AutonomyDecision<AutonomyStatusV1>> {
-    return this.#autonomy
-      ? this.#autonomy.pauseGlobal()
-      : this.autonomyStatus();
+    return this.#engine.pauseAutonomy();
   }
 
   resumeAutonomy(): Promise<AutonomyDecision<AutonomyStatusV1>> {
@@ -253,17 +367,15 @@ export class ChainWhisperSignerService {
         });
   }
 
-  async testConfirmationForm(): Promise<ConfirmationDiagnosticResult> {
-    return this.#confirmation.diagnoseForm(
-      await this.#wallet.getAddress(),
-    );
-  }
-
-  onboardPrivacy(): Promise<PrivacyOnboardingResult> {
+  async onboardPrivacy(): Promise<PrivacyOnboardingResult> {
     if (this.#writesBlocked()) {
       throw new Error('Restart the signer before performing writes.');
     }
-    return this.#privacyOnboarding.onboard();
+    const result = await this.#privacyOnboarding.onboard();
+    if (result.status === 'ready') {
+      await this.#engine.markSetupCompleted();
+    }
+    return result;
   }
 
   getPrivateTokenStatus(
@@ -272,42 +384,71 @@ export class ChainWhisperSignerService {
     return this.#privateTokens.status(token);
   }
 
-  enablePrivateToken(
+  async enablePrivateToken(
     token: string,
   ): Promise<PrivateTokenAccountSetupResult> {
     if (this.#writesBlocked()) {
       throw new Error('Restart the signer before performing writes.');
     }
-    return this.#privateTokens.enable(token);
+    const result = await this.#privateTokens.enable(token);
+    if (result.ready) await this.#engine.markSetupCompleted();
+    return result;
+  }
+
+  getPrivateState(
+    query: PrivateStateQueryV1,
+    policyId?: string,
+  ): Promise<PrivateStateDisclosureDecisionV1> {
+    if (!this.#privateState) {
+      throw new SignerError(
+        'UNSUPPORTED_TOOL',
+        'Private ChainWhisper state disclosure is unavailable in this signer session.',
+      );
+    }
+    return this.#privateState.disclose(query, policyId);
   }
 
   executeAction(
     envelope: SignedActionEnvelopeV1,
     policyId?: string,
-  ): Promise<ExecuteActionResult> {
+  ): Promise<OperationStatusV2> {
     if (this.#writesBlocked()) {
       return Promise.resolve({
+        version: 'cw.operation-status/2',
         operationId: envelope.operationId,
         operationHash: envelope.operationHash,
-        status: 'read-only',
+        status: 'failed',
+        summary: envelope.summary,
         transactionHashes: [],
+        transactionLinks: [],
+        userActionRequired: true,
+        nextPollingIntervalMs: null,
         errorCode: 'SIGNER_RESTART_REQUIRED',
       });
     }
-    return this.#engine.executeAction(envelope, policyId);
+    return this.#engine.queueAction(envelope, policyId);
   }
 
   getOperation(
     operationId: string,
-  ): Promise<OperationJournalRecord | null> {
-    return this.#engine.getOperation(operationId);
+  ): Promise<OperationStatusV2 | null> {
+    return isMessageOperationId(operationId)
+      ? this.#messaging.getOperationStatus(operationId)
+      : this.#engine.getOperationStatus(operationId);
+  }
+
+  async restorePendingOperations(): Promise<void> {
+    await this.#messaging.restorePendingOperations();
+    await this.#engine.restorePendingOperations();
   }
 
   recoverOperation(
     operationId: string,
     operationHash?: string,
   ): Promise<RecoverOperationResult> {
-    return this.#engine.recoverOperation(operationId, operationHash);
+    return isMessageOperationId(operationId)
+      ? this.#messaging.recoverOperation(operationId, operationHash)
+      : this.#engine.recoverOperation(operationId, operationHash);
   }
 
   discardOperation(

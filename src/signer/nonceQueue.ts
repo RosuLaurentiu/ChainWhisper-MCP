@@ -21,6 +21,10 @@ export class NonceQueue {
     }
   }
 
+  runExclusive<T>(work: () => Promise<T>): Promise<T> {
+    return this.#exclusive(work);
+  }
+
   async runTransaction<T>(
     work: (nonce: number) => Promise<T>,
   ): Promise<{ nonce: number; result: T }> {

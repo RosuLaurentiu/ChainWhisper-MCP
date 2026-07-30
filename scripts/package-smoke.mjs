@@ -1,9 +1,11 @@
 import assert from 'node:assert/strict';
+import { execFile } from 'node:child_process';
 import { access, mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, resolve, sep } from 'node:path';
 import process from 'node:process';
-import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import {
@@ -14,6 +16,7 @@ import {
 // A clean Windows npm install can spend substantial time cold-loading the
 // COTI SDK dependency graph under real-time antivirus scanning.
 const REQUEST_TIMEOUT_MS = 90_000;
+const execFileAsync = promisify(execFile);
 const scriptDirectory = dirname(fileURLToPath(import.meta.url));
 const packageRootArgument = process.argv.indexOf('--package-root');
 const packageRoot =
@@ -102,9 +105,10 @@ assert.deepEqual(packageJson.files, [
 assert.deepEqual(packageJson.scripts, {
   build: 'tsc -p tsconfig.json',
   lint: 'eslint .',
-  test: 'vitest run test',
+  test: 'vitest run test --testTimeout=15000',
   smoke: 'node scripts/package-smoke.mjs',
   'smoke:live': 'node scripts/package-smoke.mjs --live-status',
+  'smoke:live:readonly': 'node scripts/live-readonly-smoke.mjs',
   'verify:tarball':
     'npm run build && node scripts/package-tarball-smoke.mjs',
   'pack:dry-run': 'npm run build && npm pack --dry-run',
@@ -119,6 +123,9 @@ const plannerBinary = resolve(packageRoot, packageJson.bin['chainwhisper-mcp']);
 const signerBinary = resolve(
   packageRoot,
   packageJson.bin['chainwhisper-coti-signer'],
+);
+const signerModule = await import(
+  pathToFileURL(resolve(packageRoot, packageJson.exports['./signer'])).href
 );
 for (const path of [
   plannerBinary,
@@ -147,6 +154,17 @@ const stateDirectory = await mkdtemp(
 );
 try {
   const environment = sanitizedEnvironment(stateDirectory);
+  await execFileAsync(
+    process.execPath,
+    [
+      resolve(scriptDirectory, 'live-readonly-smoke.mjs'),
+      '--check-environment-separation',
+    ],
+    {
+      cwd: packageRoot,
+      env: environment,
+    },
+  );
 
   await withStdioClient(
     'chainwhisper-coti-signer',
@@ -162,11 +180,30 @@ try {
           'chainwhisper_signer_status',
           'chainwhisper_open_control_panel',
           'chainwhisper_autonomy_status',
+          'chainwhisper_private_state',
+          'chainwhisper_request_autonomy',
+          'chainwhisper_pause_autonomy',
+          'chainwhisper_execute_action',
+          'chainwhisper_get_operation',
+          'chainwhisper_send_order_message',
+          'chainwhisper_list_order_messages',
+          'chainwhisper_read_order_message',
         ],
-        'A wallet-setup signer must expose only status and its signer-owned setup surface.',
+        'The public signer catalog must stay complete during wallet setup.',
+      );
+      const statusTool = tools.find(
+        (tool) => tool.name === 'chainwhisper_signer_status',
+      );
+      assert.equal(
+        statusTool?.inputSchema?.properties?.requiredAssets?.type,
+        'array',
+        'Wallet-setup status must retain required-asset preflight input.',
       );
       const result = await client.callTool(
-        { name: 'chainwhisper_signer_status', arguments: {} },
+        {
+          name: 'chainwhisper_signer_status',
+          arguments: { requiredAssets: ['p.WISP', 'p.COTI'] },
+        },
         undefined,
         { timeout: REQUEST_TIMEOUT_MS },
       );
@@ -178,21 +215,128 @@ try {
       assert.equal(status.walletSetup, 'required');
       assert.equal(status.signerReadiness, 'wallet-setup-required');
       assert.equal(status.controlPageReadiness, 'ready');
+      assert.deepEqual(status.requiredAssets, [
+        { asset: 'p.WISP', status: 'wallet-setup-required' },
+        { asset: 'p.COTI', status: 'wallet-setup-required' },
+      ]);
+      assert.deepEqual(status.nextAction, {
+        tool: 'chainwhisper_open_control_panel',
+        arguments: {},
+        reason: 'wallet-setup-required',
+      });
       assert.deepEqual(status.autonomy, {
         mode: 'manual',
         state: 'inactive',
         activePolicyCount: 0,
         globalPaused: false,
       });
+
+      const unavailable = readToolJson(
+        await client.callTool(
+          {
+            name: 'chainwhisper_private_state',
+            arguments: {
+              query: { kind: 'balances', assets: ['p.WISP'] },
+            },
+          },
+          undefined,
+          { timeout: REQUEST_TIMEOUT_MS },
+        ),
+      );
+      assert.equal(unavailable.allowed, false);
+      assert.equal(
+        unavailable.denial?.code,
+        'CONFIGURATION_REQUIRED',
+      );
+
+      const lockPath = resolve(
+        stateDirectory,
+        'signer.instance.lock',
+      );
+      const ownerBefore = JSON.parse(await readFile(lockPath, 'utf8'));
+      await signerModule.writeAgentWalletEnvFile(
+        resolve(stateDirectory, 'signer.env'),
+        { privateKey: `0x${'11'.repeat(32)}` },
+      );
+      const activatedResult = await client.callTool(
+        {
+          name: 'chainwhisper_signer_status',
+          arguments: { requiredAssets: ['p.WISP'] },
+        },
+        undefined,
+        { timeout: REQUEST_TIMEOUT_MS },
+      );
+      assert.equal(activatedResult.isError, undefined);
+      const activated = readToolJson(activatedResult);
+      assert.equal(activated.configured, true);
+      assert.equal(activated.walletSetup, 'ready');
+      assert.equal(
+        activated.signerReadiness,
+        'privacy-onboarding-required',
+      );
+      assert.deepEqual(activated.requiredAssets, [
+        {
+          asset: 'p.WISP',
+          status: 'privacy-onboarding-required',
+        },
+      ]);
+      const configuredOperation = readToolJson(
+        await client.callTool(
+          {
+            name: 'chainwhisper_get_operation',
+            arguments: { operationId: 'smoke-operation' },
+          },
+          undefined,
+          { timeout: REQUEST_TIMEOUT_MS },
+        ),
+      );
+      assert.equal(
+        configuredOperation,
+        null,
+        'Configured tool handlers must become live without reconnecting.',
+      );
+      const ownerAfter = JSON.parse(await readFile(lockPath, 'utf8'));
+      assert.equal(
+        ownerAfter.pid,
+        ownerBefore.pid,
+        'Wallet activation must preserve the signer process.',
+      );
+      assert.equal(
+        ownerAfter.controlPort,
+        ownerBefore.controlPort,
+        'Wallet activation must preserve Agent Control.',
+      );
+      assert.deepEqual(
+        (await client.listTools(undefined, {
+          timeout: REQUEST_TIMEOUT_MS,
+        })).tools.map((tool) => tool.name),
+        tools.map((tool) => tool.name),
+        'Wallet activation must not change the public tool catalog.',
+      );
     },
   );
+  const signerFiles = (await readdir(stateDirectory)).sort();
+  const allowedSignerFiles = [
+    'pairing.key',
+    'signer.env',
+    'signer.instance.lock',
+    'storage.key',
+    'wallets',
+  ];
   assert.deepEqual(
-    (await readdir(stateDirectory)).sort(),
-    ['pairing.key', 'signer.instance.lock', 'storage.key'],
-    'Wallet setup may create only the process lock, local pairing, and internal storage keys.',
+    signerFiles.filter((name) => !allowedSignerFiles.includes(name)),
+    [],
+    'Hot wallet activation must not create unexpected root signer state.',
+  );
+  assert.deepEqual(
+    signerFiles.filter((name) =>
+      ['pairing.key', 'signer.env', 'storage.key', 'wallets'].includes(name),
+    ),
+    ['pairing.key', 'signer.env', 'storage.key', 'wallets'],
+    'Hot wallet activation must persist only the expected setup and wallet-scoped state.',
   );
   process.stdout.write(
-    'chainwhisper-coti-signer: wallet-setup status and local control surface verified\n',
+    'chainwhisper-coti-signer: stable setup catalog and same-process wallet activation verified\n',
   );
 
   await withStdioClient(

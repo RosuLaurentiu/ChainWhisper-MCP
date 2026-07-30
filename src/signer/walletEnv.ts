@@ -186,7 +186,8 @@ export const writeAgentWalletEnvFile = async (
     CHAINWHISPER_SIGNER_PRIVATE_KEY: input.privateKey.toLowerCase(),
     // Privacy material and an expected-wallet pin are wallet-bound. A wallet
     // import or replacement must never inherit them from the previous key.
-    // The new wallet completes privacy onboarding after the signer restarts.
+    // The new wallet completes privacy onboarding only after the signer
+    // activates it; replacement remains restart-gated for beta.
     CHAINWHISPER_SIGNER_AES_KEY: null,
     CHAINWHISPER_SIGNER_EXPECTED_WALLET: null,
     ...(input.rpcUrl === undefined

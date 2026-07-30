@@ -189,7 +189,20 @@ const normalizedIntent = (
       buyPrice: intent.buyPrice,
       sellPrice: intent.sellPrice,
       buyQuoteLiquidity: intent.buyQuoteLiquidity,
-      sellBaseLiquidity: intent.sellBaseLiquidity
+      sellBaseLiquidity: intent.sellBaseLiquidity,
+      ...(intent.priceReference
+        ? {
+            marketReferenceId: intent.priceReference.id,
+            marketReferenceVenue: intent.priceReference.venue,
+            marketReferencePrice: intent.priceReference.price,
+            marketReferenceObservedAt:
+              intent.priceReference.observedAt,
+            buyPriceOffsetBps:
+              intent.priceReference.buyOffsetBps,
+            sellPriceOffsetBps:
+              intent.priceReference.sellOffsetBps
+          }
+        : {})
     };
   } else if (intent.action === 'fill') {
     base.sellAsset = normalizeAsset(
@@ -235,6 +248,7 @@ const normalizedIntent = (
       ...(intent.privateAmountMode
         ? { privateAmountMode: intent.privateAmountMode }
         : {}),
+      sourceMaker: intent.order.maker,
       recurringSide: intent.recurringSide,
       orderRelation: intent.order.relation?.kind ?? 'primary',
       ...(intent.order.relation?.parentOrder

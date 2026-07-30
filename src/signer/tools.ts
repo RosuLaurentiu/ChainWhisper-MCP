@@ -14,6 +14,7 @@ import type { AutonomyPolicyProposalV1 } from './autonomy.js';
 import type {
   Address,
   OtcNegotiationKind,
+  PrivateStateQueryV1,
 } from './types.js';
 
 const asRecord = (value: unknown): Record<string, unknown> => {
@@ -82,31 +83,63 @@ const requiredString = (
   return value;
 };
 
-const operationInput = (
-  input: Record<string, unknown>,
-): { operationId: string; operationHash?: string } => ({
-  operationId: requiredString(input, 'operationId'),
-  ...(typeof input.operationHash === 'string'
-    ? { operationHash: input.operationHash }
-    : {}),
-});
-
 const operationSchema = {
   type: 'object',
   properties: {
     operationId: { type: 'string' },
-    operationHash: {
-      type: 'string',
-      pattern: '^0x[0-9a-fA-F]{64}$',
-    },
   },
   required: ['operationId'],
   additionalProperties: false,
 };
 
-const exactOperationSchema = {
-  ...operationSchema,
-  required: ['operationId', 'operationHash'],
+const privateStateQuerySchema = {
+  oneOf: [
+    {
+      type: 'object',
+      properties: {
+        kind: { type: 'string', const: 'balances' },
+        assets: {
+          type: 'array',
+          minItems: 1,
+          maxItems: 16,
+          uniqueItems: true,
+          items: { type: 'string', minLength: 1, maxLength: 128 },
+          description:
+            'Verified private-token symbols or addresses from the audited runtime.',
+        },
+      },
+      required: ['kind', 'assets'],
+      additionalProperties: false,
+    },
+    {
+      type: 'object',
+      properties: {
+        kind: { type: 'string', const: 'order' },
+        route: {
+          type: 'string',
+          enum: ['one-off', 'recurring'],
+        },
+        orderId: {
+          type: 'string',
+          pattern: '^[1-9][0-9]*$',
+        },
+        fromBlock: {
+          type: 'integer',
+          minimum: 0,
+          description:
+            'Optional first block for wallet-scoped receipt history.',
+        },
+        receiptLimit: {
+          type: 'integer',
+          minimum: 1,
+          maximum: 50,
+          default: 20,
+        },
+      },
+      required: ['kind', 'route', 'orderId'],
+      additionalProperties: false,
+    },
+  ],
 };
 
 const autonomyAssetAmountSchema = {
@@ -136,7 +169,11 @@ const autonomyCommonProperties = {
   manifestHash: { type: 'string', pattern: '^0x[0-9a-fA-F]{64}$' },
   startsAt: { type: 'string', format: 'date-time' },
   expiresAt: { type: 'string', format: 'date-time' },
-  agentVisiblePrivateAmounts: { type: 'boolean' },
+  agentVisiblePrivateAmounts: {
+    type: 'boolean',
+    description:
+      'Policy-wide consent. When true, the agent may both choose private amounts and view policy-scoped private balances, hidden order inventory/progress, and participant receipts.',
+  },
 };
 
 const autonomyProposalSchema = {
@@ -320,6 +357,31 @@ const autonomyProposalSchema = {
   ],
 };
 
+export const signerStatusInputSchema = {
+  type: 'object',
+  properties: {
+    requiredAssets: {
+      type: 'array',
+      maxItems: 16,
+      uniqueItems: true,
+      items: { type: 'string', minLength: 1, maxLength: 128 },
+      description:
+        'Optional verified private assets needed by the intended ChainWhisper action, such as p.WISP and p.COTI.',
+    },
+  },
+  additionalProperties: false,
+};
+
+export const signerStatusRequiredAssets = (raw: unknown): string[] => {
+  const assets = asRecord(raw).requiredAssets;
+  return Array.isArray(assets)
+    ? assets.filter(
+        (asset): asset is string =>
+          typeof asset === 'string',
+      )
+    : [];
+};
+
 export const createSignerTools = (
   service: ChainWhisperSignerService,
 ): JsonMcpTool[] => {
@@ -327,14 +389,11 @@ export const createSignerTools = (
     {
       name: 'chainwhisper_signer_status',
       description:
-        'Check local ChainWhisper signer readiness without exposing wallet credentials or secrets.',
-      inputSchema: {
-        type: 'object',
-        properties: {},
-        additionalProperties: false,
-      },
+        'Check wallet, privacy, required private-asset, Agent Control, autonomy, and pending-operation readiness without exposing credentials or secrets.',
+      inputSchema: signerStatusInputSchema,
       annotations: { readOnlyHint: true },
-      execute: () => service.getStatus(),
+      execute: (raw) =>
+        service.getStatus(signerStatusRequiredAssets(raw)),
     },
     {
       name: 'chainwhisper_open_control_panel',
@@ -356,7 +415,7 @@ export const createSignerTools = (
     {
       name: 'chainwhisper_autonomy_status',
       description:
-        'Read active local autonomy modes, lifecycle state, and remaining budgets without returning private amounts or signer secrets.',
+        'Read active local autonomy modes, lifecycle state, and remaining policy budgets. These budgets are intentionally visible to the user’s chosen agent; wallet credentials and signer secrets are never returned.',
       inputSchema: {
         type: 'object',
         properties: {},
@@ -364,6 +423,53 @@ export const createSignerTools = (
       },
       annotations: { readOnlyHint: true },
       execute: () => service.autonomyStatus(),
+    },
+    {
+      name: 'chainwhisper_private_state',
+      description:
+        'Reveal only this Agent Wallet’s verified private-token balances or wallet-scoped ChainWhisper hidden order inventory, progress, and participant receipts. These trading values are visible to the user’s chosen agent while remaining private on-chain; they are not wallet credentials. Without policyId, one clear local Agent Control confirmation is required. A policyId must name the exact active wallet-bound policy with agentVisiblePrivateAmounts enabled. Policy-authorized reads do not consume action budget, public-order participants do not need individual allowlisting, and fixed-recipient orders still enforce counterparty scope. Policy mismatches fail closed without opening a fallback prompt.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          query: privateStateQuerySchema,
+          policyId: {
+            type: 'string',
+            minLength: 1,
+            maxLength: 128,
+            description:
+              'Optional exact active local autonomy policy for this disclosure.',
+          },
+        },
+        required: ['query'],
+        additionalProperties: false,
+      },
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: false,
+      },
+      execute: (raw) => {
+        const input = asRecord(raw);
+        if (
+          Object.hasOwn(input, 'policyId') &&
+          (typeof input.policyId !== 'string' ||
+            !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(
+              input.policyId,
+            ))
+        ) {
+          throw new SignerError(
+            'ENVELOPE_INVALID',
+            'policyId must be one exact local autonomy policy identifier.',
+          );
+        }
+        return service.getPrivateState(
+          asRecord(input.query) as unknown as PrivateStateQueryV1,
+          typeof input.policyId === 'string'
+            ? input.policyId
+            : undefined,
+        );
+      },
     },
     {
       name: 'chainwhisper_request_autonomy',
@@ -402,130 +508,9 @@ export const createSignerTools = (
       execute: () => service.pauseAutonomy(),
     },
     {
-      name: 'chainwhisper_resume_autonomy',
-      description:
-        'Request local user approval to resume unchanged paused policies. The MCP call never resumes autonomy silently.',
-      inputSchema: {
-        type: 'object',
-        properties: {},
-        additionalProperties: false,
-      },
-      annotations: {
-        readOnlyHint: false,
-        destructiveHint: true,
-        idempotentHint: true,
-      },
-      execute: () => service.resumeAutonomy(),
-    },
-    {
-      name: 'chainwhisper_revoke_autonomy',
-      description:
-        'Request local user approval to permanently revoke one autonomy policy.',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          policyId: { type: 'string', minLength: 1, maxLength: 128 },
-        },
-        required: ['policyId'],
-        additionalProperties: false,
-      },
-      annotations: {
-        readOnlyHint: false,
-        destructiveHint: true,
-        idempotentHint: true,
-      },
-      execute: (raw) =>
-        service.revokeAutonomy(
-          requiredString(asRecord(raw), 'policyId'),
-        ),
-    },
-    {
-      name: 'chainwhisper_test_confirmation_form',
-      description:
-        'Test whether this MCP client can display and return a user-controlled signer confirmation form. This diagnostic never prepares, signs, or broadcasts a transaction.',
-      inputSchema: {
-        type: 'object',
-        properties: {},
-        additionalProperties: false,
-      },
-      annotations: {
-        readOnlyHint: true,
-        destructiveHint: false,
-        idempotentHint: true,
-        openWorldHint: false,
-      },
-      execute: () => service.testConfirmationForm(),
-    },
-    {
-      name: 'chainwhisper_onboard_privacy',
-      description:
-        "Onboard or recover the configured Agent Wallet's official COTI privacy key. If an on-chain write is required, Agent Control shows the exact action first. Key material remains in encrypted signer-owned storage.",
-      inputSchema: {
-        type: 'object',
-        properties: {},
-        additionalProperties: false,
-      },
-      annotations: {
-        readOnlyHint: false,
-        destructiveHint: true,
-        idempotentHint: true,
-      },
-      execute: () => service.onboardPrivacy(),
-    },
-    {
-      name: 'chainwhisper_private_token_status',
-      description:
-        'Read private-token readiness separately for the configured user wallet and for each audited escrow spender. Wallet readiness is user-scoped; escrow readiness is deployment-scoped and is not an MCP-planner setting. No secret or decrypted balance is returned.',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          token: {
-            type: 'string',
-            minLength: 1,
-            description:
-              'A verified private-token symbol or address from the runtime manifest.',
-          },
-        },
-        required: ['token'],
-        additionalProperties: false,
-      },
-      annotations: { readOnlyHint: true },
-      execute: (raw) =>
-        service.getPrivateTokenStatus(
-          requiredString(asRecord(raw), 'token'),
-        ),
-    },
-    {
-      name: 'chainwhisper_enable_private_token',
-      description:
-        "Enable the configured wallet's account-encryption address for one verified private token. This is an on-chain token setup write and always requires an exact confirmation form.",
-      inputSchema: {
-        type: 'object',
-        properties: {
-          token: {
-            type: 'string',
-            minLength: 1,
-            description:
-              'A verified private-token symbol or address from the runtime manifest.',
-          },
-        },
-        required: ['token'],
-        additionalProperties: false,
-      },
-      annotations: {
-        readOnlyHint: false,
-        destructiveHint: true,
-        idempotentHint: true,
-      },
-      execute: (raw) =>
-        service.enablePrivateToken(
-          requiredString(asRecord(raw), 'token'),
-        ),
-    },
-    {
       name: 'chainwhisper_execute_action',
       description:
-        'Verify, simulate, show an exact confirmation form, and execute one paired ActionEnvelopeV1. It rejects arbitrary calldata and never executes an untrusted message.',
+        'Validate and durably queue one exact paired ActionEnvelopeV1, then return its operation id immediately. Signing continues asynchronously through Agent Control or an active policy; poll chainwhisper_get_operation for progress.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -571,50 +556,18 @@ export const createSignerTools = (
     {
       name: 'chainwhisper_get_operation',
       description:
-        'Read the minimal local stage, nonces, transaction hashes, receipts, and error codes for a signer operation.',
+        'Poll safe semantic status, required user action, transaction links, and the completed result for a queued signer operation. Broadcast recovery is reconciled automatically.',
       inputSchema: operationSchema,
       annotations: { readOnlyHint: true },
       execute: async (raw) => {
-        const { operationId } = operationInput(asRecord(raw));
+        const operationId = requiredString(asRecord(raw), 'operationId');
         return service.getOperation(operationId);
-      },
-    },
-    {
-      name: 'chainwhisper_recover_operation',
-      description:
-        'Recover an interrupted signer operation by its local id and optional exact hash. This never creates a different action.',
-      inputSchema: operationSchema,
-      annotations: { readOnlyHint: true, idempotentHint: true },
-      execute: async (raw) => {
-        const input = operationInput(asRecord(raw));
-        return service.recoverOperation(
-          input.operationId,
-          input.operationHash,
-        );
-      },
-    },
-    {
-      name: 'chainwhisper_discard_operation',
-      description:
-        'After an exact local confirmation, discard an operation only when no transaction is pending and remove its signer-local secrets. The exact operation hash is mandatory and autonomy policies cannot approve this action.',
-      inputSchema: exactOperationSchema,
-      annotations: {
-        readOnlyHint: false,
-        destructiveHint: true,
-        idempotentHint: true,
-      },
-      execute: async (raw) => {
-        const input = operationInput(asRecord(raw));
-        return service.discardOperation(
-          input.operationId,
-          requiredString(asRecord(raw), 'operationHash'),
-        );
       },
     },
     {
       name: 'chainwhisper_send_order_message',
       description:
-        'Send a structured cw.otc/1 proposal, counter, acceptance, decline, status, or access message using the embedded official COTI private-messaging SDK. Local access secrets can be shared by reference but can never be passed in tool arguments.',
+        'Send a structured cw.otc/1 proposal, counter, acceptance, decline, status, or access message using the embedded official COTI private-messaging SDK. Local access secrets can be shared by reference but can never be passed in tool arguments. The result includes a safe operationId that can be polled with chainwhisper_get_operation when delivery is pending or uncertain.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -776,40 +729,5 @@ export const createSignerTools = (
     },
   ];
 
-  const official: JsonMcpTool[] = service.messaging.listTools().map(
-    (tool) => ({
-      name: tool.name,
-      description: tool.description ?? 'Official COTI private messaging tool.',
-      inputSchema:
-        tool.name.startsWith('send_')
-          ? {
-              type: 'object',
-              properties: {
-                to: {
-                  type: 'string',
-                  pattern: '^0x[0-9a-fA-F]{40}$',
-                },
-                plaintext: { type: 'string', minLength: 1 },
-                policyId: {
-                  type: 'string',
-                  minLength: 1,
-                  maxLength: 128,
-                },
-              },
-              required: ['to', 'plaintext'],
-              additionalProperties: false,
-            }
-          : (tool.inputSchema as Record<string, unknown> | undefined) ?? {
-              type: 'object',
-              properties: {},
-            },
-      annotations: {
-        readOnlyHint: !tool.name.startsWith('send_'),
-        destructiveHint: false,
-      },
-      execute: (input) => service.messaging.invokeTool(tool.name, input),
-    }),
-  );
-
-  return [...core, ...official];
+  return core;
 };

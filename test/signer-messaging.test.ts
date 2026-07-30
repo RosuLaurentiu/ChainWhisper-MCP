@@ -63,6 +63,7 @@ const orderAccessReader = (
 
 class MessagingWallet implements WalletTransport {
   receiptStatus: TransactionReceipt['status'] = 'success';
+  receiptHash: HexString | null = null;
   waitError: Error | null = null;
   readonly transactions = new Map<string, { hash: HexString; nonce: number }>();
   readonly #address: Address;
@@ -108,12 +109,18 @@ class MessagingWallet implements WalletTransport {
     hash: HexString,
   ): Promise<TransactionReceipt | null> {
     return this.transactions.has(hash)
-      ? { transactionHash: hash, status: this.receiptStatus }
+      ? {
+          transactionHash: this.receiptHash ?? hash,
+          status: this.receiptStatus,
+        }
       : null;
   }
   async waitForTransaction(hash: HexString): Promise<TransactionReceipt> {
     if (this.waitError) throw this.waitError;
-    return { transactionHash: hash, status: this.receiptStatus };
+    return {
+      transactionHash: this.receiptHash ?? hash,
+      status: this.receiptStatus,
+    };
   }
 }
 
@@ -163,6 +170,17 @@ const createBridge = async (
       ...(orderMakers ? { orderMakers } : {}),
     }),
   };
+};
+
+const seedMessageBroadcast = async (
+  setup: Awaited<ReturnType<typeof createBridge>>,
+  operationHash: HexString = OPERATION_HASH,
+): Promise<string> => {
+  const operationId = `message-${operationHash.slice(2, 18)}`;
+  await setup.journal.begin(operationId, operationHash);
+  await setup.journal.reserveNonce(operationId, 8, 0);
+  await setup.journal.recordBroadcast(operationId, 8, TX_HASH, 0);
+  return operationId;
 };
 
 const officialReadResult = (input: {
@@ -1030,11 +1048,16 @@ describe('embedded official COTI negotiation messaging', () => {
       nonce: 8,
     });
     const second = await setup.bridge.sendOrderMessage(input);
+    const operationHash = setup.elicitor.requests[0]!.operationHash;
     expect(first).toMatchObject({
+      operationId: `message-${operationHash.slice(2, 18)}`,
+      operationHash,
       status: 'processing',
       errorCode: 'MESSAGE_BROADCAST_UNCERTAIN',
     });
     expect(second).toMatchObject({
+      operationId: `message-${operationHash.slice(2, 18)}`,
+      operationHash,
       status: 'processing',
       errorCode: 'MESSAGE_BROADCAST_UNCERTAIN',
     });
@@ -1049,6 +1072,49 @@ describe('embedded official COTI negotiation messaging', () => {
       nonces: [8],
       transactionHashes: [],
     });
+  });
+
+  it('single-flights concurrent identical message sends across the complete lifecycle', async () => {
+    let releaseSend: (() => void) | undefined;
+    const sendReleased = new Promise<void>((resolve) => {
+      releaseSend = resolve;
+    });
+    const invoke = vi.fn(async () => {
+      await sendReleased;
+      return { transactionHash: TX_HASH, messageId: 'provider-message-id' };
+    });
+    const setup = await createBridge(invoke);
+    const input: SendOrderMessageInput = {
+      to: RECIPIENT,
+      kind: 'status',
+      messageId: 'concurrent-identical-send',
+      body: { status: 'reviewing' },
+    };
+
+    const first = setup.bridge.sendOrderMessage(input);
+    await vi.waitFor(() => {
+      expect(invoke).toHaveBeenCalledTimes(1);
+    });
+    const second = setup.bridge.sendOrderMessage(input);
+    await Promise.resolve();
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(setup.elicitor.requests).toHaveLength(1);
+
+    releaseSend?.();
+    const [firstResult, secondResult] = await Promise.all([first, second]);
+    expect(secondResult).toBe(firstResult);
+    expect(firstResult).toMatchObject({
+      status: 'completed',
+      transactionHash: TX_HASH,
+      messageId: 'provider-message-id',
+    });
+    expect(invoke).toHaveBeenCalledTimes(1);
+
+    await expect(setup.bridge.sendOrderMessage(input)).resolves.toMatchObject({
+      status: 'completed',
+      transactionHashes: [TX_HASH],
+    });
+    expect(invoke).toHaveBeenCalledTimes(1);
   });
 
   it('never re-sends a missing-hash or temporarily invisible recorded send', async () => {
@@ -1080,6 +1146,174 @@ describe('embedded official COTI negotiation messaging', () => {
       expect(sends).toBe(1);
       expect(setup.elicitor.requests).toHaveLength(1);
     }
+  });
+
+  it('restores a recorded message broadcast from its exact receipt without plaintext or a second SDK send', async () => {
+    const invoke = vi.fn(async () => {
+      throw new Error('restart recovery must not invoke the messaging SDK');
+    });
+    const setup = await createBridge(invoke);
+    const operationId = await seedMessageBroadcast(setup);
+    setup.wallet.transactions.set(TX_HASH, {
+      hash: TX_HASH,
+      nonce: 8,
+    });
+
+    await setup.bridge.restorePendingOperations();
+
+    await expect(
+      setup.bridge.getOperationStatus(operationId),
+    ).resolves.toMatchObject({
+      version: 'cw.operation-status/2',
+      operationId,
+      operationHash: OPERATION_HASH,
+      status: 'completed',
+      summary: 'Send encrypted ChainWhisper order message.',
+      transactionHashes: [TX_HASH],
+      transactionLinks: [
+        `https://mainnet.cotiscan.io/tx/${TX_HASH}`,
+      ],
+      userActionRequired: false,
+      nextPollingIntervalMs: null,
+    });
+    expect(invoke).not.toHaveBeenCalled();
+    expect(await readFile(setup.journal.path, 'utf8')).not.toMatch(
+      /plaintext|message content|reviewing/iu,
+    );
+  });
+
+  it('fails a restored message only when its exact recorded receipt reverted', async () => {
+    const setup = await createBridge(async () => {
+      throw new Error('SDK must not be called during recovery');
+    });
+    const operationId = await seedMessageBroadcast(setup);
+    setup.wallet.transactions.set(TX_HASH, {
+      hash: TX_HASH,
+      nonce: 8,
+    });
+    setup.wallet.receiptStatus = 'reverted';
+
+    await setup.bridge.restorePendingOperations();
+
+    await expect(
+      setup.bridge.getOperationStatus(operationId),
+    ).resolves.toMatchObject({
+      status: 'failed',
+      errorCode: 'MESSAGE_TRANSACTION_REVERTED',
+      transactionHashes: [TX_HASH],
+      userActionRequired: false,
+      nextPollingIntervalMs: null,
+    });
+  });
+
+  it('keeps unknown and pending restored message broadcasts safe and pollable', async () => {
+    const setup = await createBridge(async () => {
+      throw new Error('SDK must not be called during recovery');
+    });
+    const operationId = await seedMessageBroadcast(setup);
+
+    await setup.bridge.restorePendingOperations();
+    await expect(
+      setup.bridge.getOperationStatus(operationId),
+    ).resolves.toMatchObject({
+      status: 'uncertain',
+      errorCode: 'MESSAGE_BROADCAST_UNCERTAIN',
+      transactionHashes: [TX_HASH],
+      userActionRequired: false,
+      nextPollingIntervalMs: 1_000,
+    });
+
+    setup.wallet.transactions.set(TX_HASH, {
+      hash: TX_HASH,
+      nonce: 8,
+    });
+    setup.wallet.receiptStatus = 'pending';
+    await expect(
+      setup.bridge.getOperationStatus(operationId),
+    ).resolves.toMatchObject({
+      status: 'confirming',
+      transactionHashes: [TX_HASH],
+      userActionRequired: false,
+      nextPollingIntervalMs: 1_000,
+    });
+  });
+
+  it('does not adopt a receipt returned for a different transaction hash', async () => {
+    const setup = await createBridge(async () => {
+      throw new Error('SDK must not be called during recovery');
+    });
+    const operationId = await seedMessageBroadcast(setup);
+    setup.wallet.transactions.set(TX_HASH, {
+      hash: TX_HASH,
+      nonce: 8,
+    });
+    setup.wallet.receiptHash = OTHER_OPERATION_HASH;
+
+    await expect(
+      setup.bridge.getOperationStatus(operationId),
+    ).resolves.toMatchObject({
+      status: 'uncertain',
+      errorCode: 'MESSAGE_BROADCAST_UNCERTAIN',
+      transactionHashes: [TX_HASH],
+    });
+    expect(await setup.journal.get(operationId)).toMatchObject({
+      stage: 'broadcast',
+      receipts: [],
+    });
+  });
+
+  it('does not complete a fresh send from a mismatched SDK receipt', async () => {
+    const setup = await createBridge(async () => ({
+      transactionHash: TX_HASH,
+    }));
+    setup.wallet.receiptHash = OTHER_OPERATION_HASH;
+
+    await expect(
+      setup.bridge.sendOrderMessage({
+        to: RECIPIENT,
+        kind: 'status',
+        messageId: 'mismatched-receipt',
+        body: { status: 'reviewing' },
+      }),
+    ).resolves.toMatchObject({
+      status: 'processing',
+      errorCode: 'MESSAGE_BROADCAST_UNCERTAIN',
+      transactionHashes: [TX_HASH],
+    });
+    const operationId =
+      setup.elicitor.requests[0]!.operationId;
+    expect(await setup.journal.get(operationId)).toMatchObject({
+      stage: 'broadcast',
+      transactionHashes: [TX_HASH],
+      receipts: [],
+    });
+  });
+
+  it('requires a fresh message preparation after restart before any write began', async () => {
+    const setup = await createBridge(async () => {
+      throw new Error('SDK must not be called during recovery');
+    });
+    const operationId = `message-${OPERATION_HASH.slice(2, 18)}`;
+    await setup.journal.begin(operationId, OPERATION_HASH);
+    await setup.journal.updateStage(
+      operationId,
+      'awaiting-confirmation',
+      0,
+    );
+
+    await setup.bridge.restorePendingOperations();
+
+    await expect(
+      setup.bridge.getOperationStatus(operationId),
+    ).resolves.toMatchObject({
+      status: 'needs_reprepare',
+      errorCode: 'OPERATION_REPREPARE_REQUIRED',
+      transactionHashes: [],
+      userActionRequired: true,
+    });
+    await expect(
+      setup.bridge.listPendingOperationIds(),
+    ).resolves.toContain(operationId);
   });
 
   it('bounds outbound plaintext and hostile provider result traversal', async () => {
@@ -1162,7 +1396,11 @@ describe('embedded official COTI negotiation messaging', () => {
       messageId: 'pending-message',
       body: { status: 'reviewing' },
     });
-    expect(result).toMatchObject({ status: 'processing' });
+    expect(result).toMatchObject({
+      operationId: expect.stringMatching(/^message-[0-9a-f]{16}$/u),
+      operationHash: expect.stringMatching(/^0x[0-9a-f]{64}$/u),
+      status: 'processing',
+    });
     expect(await readFile(setup.journal.path, 'utf8')).not.toContain(
       '"stage":"failed"',
     );

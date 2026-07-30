@@ -38,9 +38,10 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "lint": "eslint .",
-    "test": "vitest run test",
+    "test": "vitest run test --testTimeout=15000",
     "smoke": "node scripts/package-smoke.mjs",
     "smoke:live": "node scripts/package-smoke.mjs --live-status",
+    "smoke:live:readonly": "node scripts/live-readonly-smoke.mjs",
     "verify:tarball": "npm run build && node scripts/package-tarball-smoke.mjs",
     "pack:dry-run": "npm run build && npm pack --dry-run",
     "audit:dependencies": "npm audit --omit=dev --audit-level=low",

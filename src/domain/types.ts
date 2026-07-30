@@ -11,6 +11,7 @@ export type Address = `0x${string}`;
 export type DecimalString = string;
 export type OrderAccess = 'public' | 'unlisted' | 'direct';
 export type AmountVisibility = 'visible' | 'private';
+export type LiquidityVisibility = AmountVisibility;
 export type PrivateAmountMode = 'signer-input' | 'agent-provided';
 export type AssetKind = 'native' | 'erc20' | 'private-erc20';
 export type OrderKind = 'trade' | 'recurring';
@@ -283,6 +284,14 @@ export type CreateRecurringIntent = {
   recipient: Address | null;
   amountVisibility: AmountVisibility;
   privateAmountMode?: PrivateAmountMode;
+  priceReference?: {
+    id: string;
+    venue: string;
+    price: DecimalString;
+    observedAt: string;
+    buyOffsetBps: number | null;
+    sellOffsetBps: number | null;
+  };
   secretPolicy: SecretPolicy;
 };
 
@@ -582,32 +591,72 @@ export type ToolResult<T> =
 
 export type CreateTradeInput = {
   wallet?: string;
-  orderType?: OrderClassificationV1['id'];
   offerAsset?: AssetReference;
   requestAsset?: AssetReference;
   offerAmount?: DecimalString;
   requestAmount?: DecimalString;
   access?: OrderAccess;
   recipient?: string;
-  amountVisibility?: AmountVisibility;
+  liquidityVisibility?: LiquidityVisibility;
   privateAmountMode?: PrivateAmountMode;
   expiresAt?: string | null;
   fillPolicy?: Partial<FillPolicy>;
 };
 
+export type MarketReferencePriceInput = {
+  reference: 'market';
+  offsetBps: number;
+};
+
+export type RecurringPriceInput =
+  | DecimalString
+  | MarketReferencePriceInput;
+
 export type CreateRecurringInput = {
   wallet?: string;
-  orderType?: OrderClassificationV1['id'];
   baseAsset?: AssetReference;
   quoteAsset?: AssetReference;
-  buyPrice?: DecimalString;
-  sellPrice?: DecimalString;
+  buyPrice?: RecurringPriceInput;
+  sellPrice?: RecurringPriceInput;
   buyQuoteLiquidity?: DecimalString;
   sellBaseLiquidity?: DecimalString;
   access?: OrderAccess;
   recipient?: string;
-  amountVisibility?: AmountVisibility;
+  liquidityVisibility?: LiquidityVisibility;
   privateAmountMode?: PrivateAmountMode;
+};
+
+export type PrepareSwapInput = {
+  wallet?: string;
+  sellAsset?: AssetReference;
+  buyAsset?: AssetReference;
+  inputMode?: 'sell' | 'buy';
+  amount?: DecimalString;
+};
+
+export type SwapSelection = {
+  source: 'one-off' | 'recurring';
+  order: TrustedOrderIdentity;
+  orderType: OrderClassificationV1 | null;
+  recurringSide: 'buy' | 'sell' | null;
+  inputMode: 'sell' | 'buy';
+  sellAsset: ResolvedAsset;
+  buyAsset: ResolvedAsset;
+  sellAmount: DecimalString;
+  buyAmount: DecimalString;
+  price: DecimalString;
+  priceBasis: 'sell_per_buy';
+  visibleCandidateCount: number;
+};
+
+export type PrepareSwapResult = {
+  status: PrepareResult['status'];
+  intent: FillIntent | null;
+  selection: SwapSelection | null;
+  missing: MissingDetail[];
+  warnings: string[];
+  envelope: PreparedEnvelope | null;
+  reason?: string;
 };
 
 export type FillInput = {

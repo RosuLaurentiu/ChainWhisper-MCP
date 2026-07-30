@@ -24,7 +24,49 @@ export type SignerRuntimeConfig = {
   secrets: SignerSecrets;
 };
 
+export type RequiredAssetReadinessV2 = {
+  asset: string;
+  status:
+    | 'ready'
+    | 'wallet-setup-required'
+    | 'privacy-onboarding-required'
+    | 'private-token-setup-required'
+    | 'unsupported'
+    | 'unavailable';
+};
+
+export type SignerNextActionV2 =
+  | {
+      tool: 'chainwhisper_open_control_panel';
+      arguments: Record<string, never>;
+      reason:
+        | 'wallet-setup-required'
+        | 'privacy-onboarding-required'
+        | 'private-token-setup-required'
+        | 'control-panel-required';
+    }
+  | {
+      tool: 'chainwhisper_get_operation';
+      arguments: {
+        operationId: string;
+      };
+      reason: 'pending-operation';
+    }
+  | {
+      tool: null;
+      arguments: Record<string, never>;
+      reason:
+        | 'ready'
+        | 'configuration-invalid'
+        | 'signer-restart-required';
+    };
+
 export type PublicSignerStatus = {
+  version: 'cw.signer-status/2';
+  network: {
+    name: 'COTI Mainnet';
+    chainId: number;
+  };
   chainId: number;
   wallet: Address | null;
   configured: boolean;
@@ -50,6 +92,12 @@ export type PublicSignerStatus = {
     activePolicyCount: number;
     globalPaused: boolean;
   };
+  requiredAssets: RequiredAssetReadinessV2[];
+  pendingOperations: {
+    count: number;
+    operationIds: string[];
+  };
+  nextAction: SignerNextActionV2;
   diagnosticCodes: string[];
 };
 
@@ -139,15 +187,28 @@ export type ConfirmationRequest = {
   }>;
   acknowledgements?: string[];
   autonomyEditor?: {
+    startsAt?: string;
     expiresAt: string;
+    duration?: string;
+    /**
+     * One policy-wide consent for the agent to both choose private amounts and
+     * view policy-scoped private balances, hidden order inventory/progress, and
+     * participant receipts.
+     */
     agentVisiblePrivateAmounts: boolean;
     perActionSpend: Array<{
       asset: string;
       amount: string;
+      symbol?: string;
+      decimals?: number;
+      displayAmount?: string;
     }>;
     cumulativeSpend: Array<{
       asset: string;
       amount: string;
+      symbol?: string;
+      decimals?: number;
+      displayAmount?: string;
     }>;
     maximumNativeValuePerAction?: string;
     maximumNativeValueCumulative?: string;
@@ -162,6 +223,12 @@ export type ConfirmationRequest = {
       minimumDenominator: string;
       maximumNumerator: string;
       maximumDenominator: string;
+      sellSymbol?: string;
+      buySymbol?: string;
+      sellDecimals?: number;
+      buyDecimals?: number;
+      minimumDisplay?: string;
+      maximumDisplay?: string;
     }>;
   };
 };
@@ -174,18 +241,6 @@ export type ConfirmationResult =
     }
   | { outcome: 'cancelled' }
   | { outcome: 'timeout' };
-
-export type ConfirmationDiagnosticResult = {
-  supported: boolean;
-  outcome:
-    | 'accepted'
-    | 'declined'
-    | 'cancelled'
-    | 'timeout'
-    | 'unsupported';
-  reason?: 'client-declined' | 'confirmation-not-enabled';
-  writeAttempted: false;
-};
 
 export interface FormElicitor {
   isSupported(): boolean;
@@ -233,6 +288,13 @@ export type TransactionReceipt = {
   transactionHash: HexString;
   status: 'success' | 'reverted' | 'pending';
   blockNumber?: number;
+  logs?: TransactionLog[];
+};
+
+export type TransactionLog = {
+  address: Address;
+  topics: HexString[];
+  data: HexString;
 };
 
 export type TransactionFeeQuote = {
@@ -300,6 +362,7 @@ export type OperationStage =
   | 'prepared-broadcast'
   | 'broadcast'
   | 'completed'
+  | 'declined'
   | 'failed'
   | 'discarded';
 
@@ -317,6 +380,7 @@ export type OperationJournalRecord = {
   nonces: number[];
   transactionHashes: HexString[];
   receipts: JournalReceipt[];
+  semanticResult?: OperationSemanticResultV2;
   errorCodes: string[];
   updatedAt: string;
 };
@@ -340,6 +404,171 @@ export type ExecuteActionResult = {
     field?: string;
   };
 };
+
+export type OperationStatusV2State =
+  | 'queued'
+  | 'needs_setup'
+  | 'needs_reprepare'
+  | 'needs_private_input'
+  | 'needs_confirmation'
+  | 'signing'
+  | 'broadcasting'
+  | 'confirming'
+  | 'uncertain'
+  | 'completed'
+  | 'declined'
+  | 'failed';
+
+export type OperationSemanticResultV2 = {
+  action: SignedActionEnvelopeV1['intent']['action'];
+  status: 'completed';
+  canonicalType?: OrderClassificationV1;
+  order?: {
+    handle: string;
+    status: 'open';
+    shareableAppLink: string;
+  };
+};
+
+export type OperationSetupRequirementV2 =
+  | {
+      kind: 'privacy-onboarding';
+      assets: [];
+    }
+  | {
+      kind: 'private-token-setup';
+      assets: string[];
+    };
+
+export type OperationStatusV2 = {
+  version: 'cw.operation-status/2';
+  operationId: string;
+  operationHash: HexString;
+  status: OperationStatusV2State;
+  summary: string;
+  transactionHashes: HexString[];
+  transactionLinks: string[];
+  userActionRequired: boolean;
+  nextPollingIntervalMs: number | null;
+  errorCode?: string;
+  setupRequirement?: OperationSetupRequirementV2;
+  result?: OperationSemanticResultV2;
+};
+
+export type PrivateStateQueryV1 =
+  | {
+      kind: 'balances';
+      assets: string[];
+    }
+  | {
+      kind: 'order';
+      route: 'one-off' | 'recurring';
+      orderId: string;
+      fromBlock?: number;
+      receiptLimit?: number;
+    };
+
+export type PrivateStateAuthorizationV1 =
+  | {
+      mode: 'local-confirmation';
+    }
+  | {
+      mode: 'autonomy-policy';
+      policyId: string;
+    };
+
+export type PrivateBalanceDisclosureV1 = {
+  symbol: string;
+  token: Address;
+  decimals: number;
+  amountAtomic: string;
+};
+
+export type PrivateOrderReceiptV1 = {
+  fillIndex: number;
+  filler: Address;
+  side?: 'buy' | 'sell';
+  offerAmountAtomic?: string;
+  requestAmountAtomic?: string;
+  baseAmountAtomic?: string;
+  quoteAmountAtomic?: string;
+  remainingOfferAmountAtomic?: string;
+  remainingBaseInventoryAtomic?: string;
+  remainingQuoteInventoryAtomic?: string;
+  transactionHash: HexString;
+  blockNumber: number;
+};
+
+export type PrivateStateResultV1 =
+  | {
+      version: 'cw.private-state/1';
+      wallet: Address;
+      authorization: PrivateStateAuthorizationV1;
+      data: {
+        kind: 'balances';
+        balances: PrivateBalanceDisclosureV1[];
+      };
+    }
+  | {
+      version: 'cw.private-state/1';
+      wallet: Address;
+      authorization: PrivateStateAuthorizationV1;
+      data: {
+        kind: 'order';
+        route: 'one-off';
+        orderId: string;
+        role: 'maker' | 'participant' | 'none';
+        orderType: OrderClassificationV1;
+        offerAsset: string;
+        requestAsset: string;
+        remainingOfferAmountAtomic?: string;
+        privateFillReceiptTotal: number;
+        receipts: PrivateOrderReceiptV1[];
+        receiptsTruncated: boolean;
+      };
+    }
+  | {
+      version: 'cw.private-state/1';
+      wallet: Address;
+      authorization: PrivateStateAuthorizationV1;
+      data: {
+        kind: 'order';
+        route: 'recurring';
+        orderId: string;
+        role: 'maker' | 'participant' | 'none';
+        orderType: OrderClassificationV1;
+        baseAsset: string;
+        quoteAsset: string;
+        privateBaseInventoryAtomic?: string;
+        privateQuoteInventoryAtomic?: string;
+        executionCount: number;
+        privateFillReceiptTotal: number;
+        receipts: PrivateOrderReceiptV1[];
+        receiptsTruncated: boolean;
+      };
+    };
+
+export type PrivateStateDisclosureDecisionV1 =
+  | {
+      allowed: true;
+      value: PrivateStateResultV1;
+    }
+  | {
+      allowed: false;
+      denial: {
+        code: string;
+        message: string;
+        policyId?: string;
+        field?: string;
+      };
+    };
+
+export interface PrivateStateDisclosureReader {
+  disclose(
+    query: PrivateStateQueryV1,
+    policyId?: string,
+  ): Promise<PrivateStateDisclosureDecisionV1>;
+}
 
 export type RecoverOperationResult = {
   operationId: string;

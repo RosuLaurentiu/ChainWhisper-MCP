@@ -11,7 +11,6 @@ import {
   connectStdioMcpServer,
   createJsonMcpServer,
   writeFatalMcpError,
-  type JsonMcpTool,
 } from '../server/index.js';
 import {
   CHAINWHISPER_AGENT_TOOLS_VERSION,
@@ -32,10 +31,12 @@ import {
   ControlPageAutonomyApprovals,
   CotiSdkPrivateUint256Encoder,
   EncryptedSecretVault,
+  HotSignerToolRouter,
   LocalWebFormElicitor,
   NonceQueue,
   OperationJournal,
   PrivacyOnboardingService,
+  PrivateStateDisclosureService,
   PrivateTokenAccountService,
   RpcAllowlistedOrderMakerReader,
   RpcStandardOrderFactsReader,
@@ -47,7 +48,6 @@ import {
   buildPublicSignerStatus,
   createCotiSignerRuntime,
   createOfficialMessagingInvoker,
-  createSignerTools,
   ensurePrivateStateDirectory,
   loadSignerConfig,
   pendingOperation,
@@ -55,10 +55,15 @@ import {
   resolveWalletPrivacyKey,
   safeAgentControlErrorMessage,
   saveAgentWallet,
+  signerStatusInputSchema,
+  signerStatusRequiredAssets,
   type Address,
+  type AgentControlAction,
+  type AgentControlActionResult,
   type AgentControlSummary,
   type AutonomyStatusV1,
   type LoadedSignerConfig,
+  type SignerInstanceLock,
   type WalletControlState,
 } from '../signer/index.js';
 
@@ -84,6 +89,16 @@ const readCotiBalance = async (
   }
 };
 
+const startBoundControlServer = async (
+  control: LocalWebFormElicitor,
+  instanceLock: SignerInstanceLock,
+): Promise<void> => {
+  if (!(await control.startControlServer()) || control.controlPort === null) {
+    throw new Error('The signer-owned Agent Control server could not start.');
+  }
+  await instanceLock.setControlPort(control.controlPort);
+};
+
 const createUnsafeConfigurationServer = (diagnostic: string) => {
   const server = createJsonMcpServer({
     name: 'chainwhisper-coti-signer',
@@ -95,15 +110,12 @@ const createUnsafeConfigurationServer = (diagnostic: string) => {
         name: 'chainwhisper_signer_status',
         description:
           'Return a secret-safe local configuration diagnostic.',
-        inputSchema: {
-          type: 'object',
-          properties: {},
-          additionalProperties: false,
-        },
+        inputSchema: signerStatusInputSchema,
         annotations: { readOnlyHint: true },
-        execute: async () =>
+        execute: async (raw) =>
           buildPublicSignerStatus(null, null, null, false, {
             diagnosticCodes: [diagnostic],
+            requiredAssets: signerStatusRequiredAssets(raw),
           }),
       },
     ],
@@ -111,146 +123,12 @@ const createUnsafeConfigurationServer = (diagnostic: string) => {
   return server;
 };
 
-const setupSignerTools = (
-  config: LoadedSignerConfig,
-  control: LocalWebFormElicitor,
-): JsonMcpTool[] => [
-  {
-    name: 'chainwhisper_signer_status',
-    description:
-      'Report wallet setup and local Agent Control readiness without exposing credentials.',
-    inputSchema: {
-      type: 'object',
-      properties: {},
-      additionalProperties: false,
-    },
-    annotations: { readOnlyHint: true },
-    execute: async () =>
-      buildPublicSignerStatus(config, null, control, false, {
-        controlPageReadiness: control.controlPageReady
-          ? 'ready'
-          : 'starting',
-        diagnosticCodes: [
-          'wallet-setup-required',
-          control.controlPageReady
-            ? 'control-page-ready'
-            : 'control-page-starting',
-        ],
-      }),
-  },
-  {
-    name: 'chainwhisper_open_control_panel',
-    description:
-      'Open local ChainWhisper Agent Control for Agent Wallet import or generation. The URL, session, and credentials are never returned to the agent.',
-    inputSchema: {
-      type: 'object',
-      properties: {},
-      additionalProperties: false,
-    },
-    annotations: {
-      readOnlyHint: true,
-      destructiveHint: false,
-      idempotentHint: true,
-      openWorldHint: false,
-    },
-    execute: () => control.openControlPanel(),
-  },
-  {
-    name: 'chainwhisper_autonomy_status',
-    description:
-      'Report that autonomy is inactive until an Agent Wallet is configured.',
-    inputSchema: {
-      type: 'object',
-      properties: {},
-      additionalProperties: false,
-    },
-    annotations: { readOnlyHint: true },
-    execute: async () => ({ allowed: true, value: inactiveAutonomy() }),
-  },
-];
-
-const runWalletSetupSigner = async (
-  config: LoadedSignerConfig,
-): Promise<void> => {
-  const rpc = new HttpJsonRpcReader(config.rpcUrl);
-  const state: WalletControlState = {
-    environmentFilePath:
-      config.environmentFilePath ??
-      resolve(config.stateDirectory, 'signer.env'),
-    displayAddress: null,
-    generatedBackup: null,
-    restartRequired: false,
-    lastDiagnostic: null,
-  };
-  const control = new LocalWebFormElicitor({
-    getControlSummary: async (): Promise<AgentControlSummary> => ({
-      wallet: state.displayAddress,
-      network: 'COTI Mainnet',
-      balance: await readCotiBalance(rpc, state.displayAddress),
-      privacyStatus: 'onboarding-required',
-      signerStatus: 'setup-required',
-      autonomy: { mode: 'manual' },
-      pendingOperations: 0,
-      recentOperations: [],
-      diagnostics: [
-        {
-          label: 'Setup',
-          value:
-            state.lastDiagnostic ?? 'wallet-setup-required',
-        },
-      ],
-      walletSetup: {
-        required: true,
-        environmentFilePath: state.environmentFilePath,
-        restartRequired: state.restartRequired,
-        ...(state.generatedBackup
-          ? { generatedBackup: state.generatedBackup }
-          : {}),
-      },
-    }),
-    onControlAction: async (action, fields) => {
-      if (action === 'clear-wallet-backup') {
-        state.generatedBackup = null;
-        return {
-          ok: true,
-          message:
-            'Backup view cleared. Restart the signer to load the Agent Wallet.',
-        };
-      }
-      if (action !== 'import-wallet' && action !== 'generate-wallet') {
-        return {
-          ok: false,
-          message: 'Finish Agent Wallet setup before using this control.',
-        };
-      }
-      return saveAgentWallet({
-        action,
-        fields,
-        state,
-        replacing: false,
-      });
-    },
-  });
-  await control.startControlServer();
-  const server = createJsonMcpServer({
-    name: 'chainwhisper-coti-signer',
-    version: CHAINWHISPER_AGENT_TOOLS_VERSION,
-    instructions:
-      'Local ChainWhisper signer in wallet-setup-required mode. Use chainwhisper_open_control_panel; wallet import and generation exist only on that signer-owned local page. No credentials are accepted through MCP.',
-    tools: setupSignerTools(config, control),
-  });
-  try {
-    await connectStdioMcpServer(server);
-  } finally {
-    await control.close();
-  }
-};
-
 const configuredControlSummary = async (options: {
   wallet: Address;
   rpc: HttpJsonRpcReader;
   manifest: Awaited<ReturnType<typeof loadRuntimeManifest>>;
   journal: OperationJournal;
+  service: ChainWhisperSignerService;
   autonomy: AutonomyPolicyManager;
   privacy: PrivacyOnboardingService;
   walletControl: WalletControlState;
@@ -288,12 +166,84 @@ const configuredControlSummary = async (options: {
         ...(remaining.actions === null
           ? []
           : [{ label: 'Actions', value: String(remaining.actions) }]),
-        ...(remaining.messages === null
+      ...(remaining.messages === null
           ? []
           : [{ label: 'Messages', value: String(remaining.messages) }]),
       ]
     : undefined;
   const pending = operations.filter(pendingOperation);
+  const recentOperations = await Promise.all(
+    operations.slice(0, 8).map(async (operation) => {
+      const semanticStatus = await options.service
+        .getOperation(operation.operationId)
+        .catch(() => null);
+      const fallbackTransaction = operation.transactionHashes.at(-1);
+      const fallbackUrl = fallbackTransaction
+        ? `${options.manifest.network.explorerUrl}/tx/${fallbackTransaction}`
+        : undefined;
+      const rawLabel =
+        semanticStatus?.summary.trim() || 'ChainWhisper operation';
+      const label = rawLabel.includes(operation.operationId)
+        ? 'ChainWhisper operation'
+        : rawLabel;
+      const setupAssets =
+        semanticStatus?.setupRequirement?.kind ===
+        'private-token-setup'
+          ? (
+              await Promise.all(
+                semanticStatus.setupRequirement.assets.map(
+                  async (asset) => {
+                    const token = options.manifest.tokens.find(
+                      (candidate) =>
+                        candidate.kind === 'private-erc20' &&
+                        (candidate.symbol.toLowerCase() ===
+                          asset.toLowerCase() ||
+                          candidate.address?.toLowerCase() ===
+                            asset.toLowerCase()),
+                    );
+                    if (!token) return null;
+                    try {
+                      return (await options.service.getPrivateTokenStatus(
+                        token.symbol,
+                      )).ready
+                        ? null
+                        : token.symbol;
+                    } catch {
+                      return token.symbol;
+                    }
+                  },
+                ),
+              )
+            ).filter((asset): asset is string => asset !== null)
+          : [];
+      return {
+        label,
+        status: semanticStatus?.status ?? 'uncertain',
+        operationId: operation.operationId,
+        operationHash: operation.operationHash,
+        recoverable:
+          operation.stage !== 'completed' &&
+          operation.stage !== 'declined' &&
+          operation.stage !== 'discarded',
+        discardable:
+          operation.stage !== 'completed' &&
+          operation.stage !== 'discarded' &&
+          operation.stage !== 'prepared-broadcast' &&
+          operation.stage !== 'broadcast' &&
+          !(
+            operation.stage === 'awaiting-broadcast' &&
+            operation.transactionHashes.length > 0
+          ),
+        ...(semanticStatus?.transactionLinks.at(-1) ?? fallbackUrl
+          ? {
+              transactionUrl:
+                semanticStatus?.transactionLinks.at(-1) ?? fallbackUrl,
+            }
+          : {}),
+        ...(setupAssets.length > 0 ? { setupAssets } : {}),
+      };
+    }),
+  );
   return {
     wallet: options.wallet,
     network: options.manifest.network.name,
@@ -307,19 +257,13 @@ const configuredControlSummary = async (options: {
           mode: current.policy.mode,
           state: current.policy.lifecycle.state,
           expiresAt: current.policy.expiresAt,
+          agentVisiblePrivateAmounts:
+            current.policy.agentVisiblePrivateAmounts,
           ...(remainingBudgets ? { remainingBudgets } : {}),
         }
       : { mode: 'manual' },
     pendingOperations: pending.length,
-    recentOperations: operations.slice(0, 8).map((operation) => ({
-      label: operation.operationId,
-      status: operation.stage,
-      ...(operation.transactionHashes.at(-1)
-        ? {
-            transactionUrl: `${options.manifest.network.explorerUrl}/tx/${operation.transactionHashes.at(-1)}`,
-          }
-        : {}),
-    })),
+    recentOperations,
     diagnostics: [
       {
         label: 'Signer',
@@ -351,6 +295,8 @@ const configuredControlSummary = async (options: {
     },
     controlActions: {
       onboardPrivacy: !privacyReady && !options.walletControl.restartRequired,
+      enablePrivateToken:
+        privacyReady && !options.walletControl.restartRequired,
       pause:
         Boolean(current) &&
         !autonomyStatus.globalPaused &&
@@ -364,9 +310,23 @@ const configuredControlSummary = async (options: {
   };
 };
 
-const runConfiguredSigner = async (
+type ConfiguredSignerRuntime = {
+  config: LoadedSignerConfig;
+  wallet: Address;
+  rpc: HttpJsonRpcReader;
+  manifest: Awaited<ReturnType<typeof loadRuntimeManifest>>;
+  journal: OperationJournal;
+  privacy: PrivacyOnboardingService;
+  autonomy: AutonomyPolicyManager;
+  autonomyApprovals: ControlPageAutonomyApprovals;
+  service: ChainWhisperSignerService;
+};
+
+const initializeConfiguredSigner = async (
   config: LoadedSignerConfig,
-): Promise<void> => {
+  control: LocalWebFormElicitor,
+  walletControl: WalletControlState,
+): Promise<ConfiguredSignerRuntime> => {
   const manifest = await loadRuntimeManifest();
   const credentials = config.credentialMaterial();
   const walletAddress = new EthersWallet(
@@ -425,122 +385,12 @@ const runConfiguredSigner = async (
     throw new Error('The configured Agent Wallet address changed unexpectedly.');
   }
   const journal = new OperationJournal(walletStateDirectory);
-  const walletControl: WalletControlState = {
-    environmentFilePath:
-      config.environmentFilePath ??
-      resolve(config.stateDirectory, 'signer.env'),
-    displayAddress: walletAddress,
-    generatedBackup: null,
-    restartRequired: false,
-    lastDiagnostic: null,
-  };
-  let service: ChainWhisperSignerService | null = null;
-  let privacyOnboarding: PrivacyOnboardingService | null = null;
-  let autonomy: AutonomyPolicyManager | null = null;
-  let autonomyApprovals: ControlPageAutonomyApprovals | null = null;
-  const control = new LocalWebFormElicitor({
-    getControlSummary: async () =>
-      service && privacyOnboarding && autonomy
-        ? configuredControlSummary({
-            wallet: walletAddress,
-            rpc,
-            manifest,
-            journal,
-            autonomy,
-            privacy: privacyOnboarding,
-            walletControl,
-          })
-        : {
-            wallet: walletAddress,
-            network: manifest.network.name,
-            signerStatus: 'unavailable',
-            privacyStatus: 'unknown',
-            autonomy: { mode: 'manual' },
-            diagnostics: [
-              { label: 'Signer', value: 'starting' },
-            ],
-          },
-    onControlAction: async (action, fields) => {
-      if (!service || !autonomy || !autonomyApprovals) {
-        return { ok: false, message: 'The signer is still starting.' };
-      }
-      if (action === 'clear-wallet-backup') {
-        walletControl.generatedBackup = null;
-        return { ok: true, message: 'Generated wallet backup view cleared.' };
-      }
-      if (action === 'import-wallet' || action === 'generate-wallet') {
-        const blockedReason = await replacementBlockReason(
-          journal,
-          autonomy,
-        );
-        return saveAgentWallet({
-          action,
-          fields,
-          state: walletControl,
-          replacing: true,
-          replacementBlockedReason: blockedReason,
-        });
-      }
-      if (action === 'pause-autonomy') {
-        const paused = await service.pauseAutonomy();
-        return paused.allowed
-          ? { ok: true, message: 'Autonomy paused immediately.' }
-          : { ok: false, message: paused.denial.message };
-      }
-      if (action === 'resume-autonomy') {
-        autonomyApprovals.preapproveNextResumeFromControlPage();
-        const resumed = await service.resumeAutonomy();
-        return resumed.allowed
-          ? { ok: true, message: 'Autonomy resumed under unchanged terms.' }
-          : { ok: false, message: resumed.denial.message };
-      }
-      if (action === 'revoke-autonomy') {
-        const status = await service.autonomyStatus();
-        const current = status.allowed
-          ? status.value.policies
-              .filter(({ policy }) =>
-                ['active', 'paused'].includes(policy.lifecycle.state),
-              )
-              .at(-1)?.policy
-          : undefined;
-        if (!current) {
-          return { ok: false, message: 'No active autonomy policy exists.' };
-        }
-        autonomyApprovals.preapproveNextRevocationFromControlPage(
-          current.id,
-        );
-        const revoked = await service.revokeAutonomy(current.id);
-        return revoked.allowed
-          ? { ok: true, message: 'Autonomy policy permanently revoked.' }
-          : { ok: false, message: revoked.denial.message };
-      }
-      if (action === 'onboard-privacy') {
-        walletControl.lastDiagnostic =
-          'privacy-onboarding-awaiting-local-confirmation';
-        void service
-          .onboardPrivacy()
-          .then(() => {
-            walletControl.lastDiagnostic = 'privacy-ready';
-          })
-          .catch((error: unknown) => {
-            walletControl.lastDiagnostic =
-              safeAgentControlErrorMessage(error);
-          });
-        return {
-          ok: true,
-          message:
-            'Privacy onboarding review is opening in Agent Control.',
-        };
-      }
-      return { ok: false, message: 'Unsupported Agent Control action.' };
-    },
-  });
   const confirmation = new ConfirmationGate(
     control,
     config.confirmationTimeoutMs,
   );
-  autonomyApprovals = new ControlPageAutonomyApprovals(confirmation);
-  autonomy = new AutonomyPolicyManager({
+  const autonomyApprovals = new ControlPageAutonomyApprovals(confirmation);
+  const autonomy = new AutonomyPolicyManager({
     store: new VaultAutonomyStore({
       vault,
       wallet: walletAddress,
@@ -584,6 +434,17 @@ const runConfiguredSigner = async (
     simulator: runtime.simulator,
     nonceQueue,
     journal,
+    assertRuntimeAttested,
+  });
+  const privateState = new PrivateStateDisclosureService({
+    manifest,
+    manifestHash: hashRuntimeManifest(manifest),
+    rpc,
+    wallet: runtime.transport,
+    privacyKey: () =>
+      runtime.wallet.getUserOnboardInfo()?.aesKey ?? null,
+    confirmation,
+    autonomy,
     assertRuntimeAttested,
   });
   const verifier = new ActionEnvelopeVerifier(config, runtimeState);
@@ -630,14 +491,14 @@ const runConfiguredSigner = async (
     manifestHash: hashRuntimeManifest(manifest),
     assertRuntimeAttested,
   });
-  privacyOnboarding = new PrivacyOnboardingService({
+  const privacyOnboarding = new PrivacyOnboardingService({
     wallet: runtime.wallet,
     vault,
     confirmation,
     nonceQueue,
     assertRuntimeAttested,
   });
-  service = new ChainWhisperSignerService({
+  const service = new ChainWhisperSignerService({
     config,
     wallet: runtime.transport,
     confirmation,
@@ -645,18 +506,390 @@ const runConfiguredSigner = async (
     messaging,
     privacyOnboarding,
     privateTokens,
+    privateState,
     control,
     autonomy,
     writesBlocked: () => walletControl.restartRequired,
     manifestHash: hashRuntimeManifest(manifest),
   });
-  await control.startControlServer();
+  await service.restorePendingOperations();
+  return {
+    config,
+    wallet: walletAddress,
+    rpc,
+    manifest,
+    journal,
+    privacy: privacyOnboarding,
+    autonomy,
+    autonomyApprovals,
+    service,
+  };
+};
+
+const handleConfiguredControlAction = async (
+  runtime: ConfiguredSignerRuntime,
+  walletControl: WalletControlState,
+  action: AgentControlAction,
+  fields: Readonly<Record<string, string>>,
+): Promise<AgentControlActionResult> => {
+  const {
+    autonomy,
+    autonomyApprovals,
+    journal,
+    manifest,
+    service,
+  } = runtime;
+  if (action === 'clear-wallet-backup') {
+    walletControl.generatedBackup = null;
+    return { ok: true, message: 'Generated wallet backup view cleared.' };
+  }
+  if (action === 'import-wallet' || action === 'generate-wallet') {
+    const blockedReason = await replacementBlockReason(journal, autonomy);
+    return saveAgentWallet({
+      action,
+      fields,
+      state: walletControl,
+      replacing: true,
+      replacementBlockedReason: blockedReason,
+    });
+  }
+  if (action === 'pause-autonomy') {
+    const paused = await service.pauseAutonomy();
+    return paused.allowed
+      ? { ok: true, message: 'Autonomy paused immediately.' }
+      : { ok: false, message: paused.denial.message };
+  }
+  if (action === 'resume-autonomy') {
+    autonomyApprovals.preapproveNextResumeFromControlPage();
+    const resumed = await service.resumeAutonomy();
+    return resumed.allowed
+      ? { ok: true, message: 'Autonomy resumed under unchanged terms.' }
+      : { ok: false, message: resumed.denial.message };
+  }
+  if (action === 'revoke-autonomy') {
+    const status = await service.autonomyStatus();
+    const current = status.allowed
+      ? status.value.policies
+          .filter(({ policy }) =>
+            ['active', 'paused'].includes(policy.lifecycle.state),
+          )
+          .at(-1)?.policy
+      : undefined;
+    if (!current) {
+      return { ok: false, message: 'No active autonomy policy exists.' };
+    }
+    autonomyApprovals.preapproveNextRevocationFromControlPage(current.id);
+    const revoked = await service.revokeAutonomy(current.id);
+    return revoked.allowed
+      ? { ok: true, message: 'Autonomy policy permanently revoked.' }
+      : { ok: false, message: revoked.denial.message };
+  }
+  if (action === 'onboard-privacy') {
+    walletControl.lastDiagnostic =
+      'privacy-onboarding-awaiting-local-confirmation';
+    void service
+      .onboardPrivacy()
+      .then(() => {
+        walletControl.lastDiagnostic = 'privacy-ready';
+      })
+      .catch((error: unknown) => {
+        walletControl.lastDiagnostic = safeAgentControlErrorMessage(error);
+      });
+    return {
+      ok: true,
+      message: 'Privacy onboarding review is opening in Agent Control.',
+    };
+  }
+  if (action === 'enable-private-token') {
+    const token = fields.token?.trim();
+    if (!token) {
+      return {
+        ok: false,
+        message: 'Choose a verified private token.',
+      };
+    }
+    const verifiedToken = manifest.tokens.find(
+      (candidate) =>
+        candidate.kind === 'private-erc20' &&
+        Boolean(candidate.address) &&
+        (candidate.symbol.toLowerCase() === token.toLowerCase() ||
+          candidate.address?.toLowerCase() === token.toLowerCase()),
+    );
+    if (!verifiedToken) {
+      return {
+        ok: false,
+        message:
+          'Only a verified private token from the signed runtime manifest can be prepared.',
+      };
+    }
+    walletControl.lastDiagnostic =
+      'private-token-setup-awaiting-local-confirmation';
+    void service
+      .enablePrivateToken(verifiedToken.symbol)
+      .then((result) => {
+        walletControl.lastDiagnostic = result.ready
+          ? `private-token-${result.symbol}-ready`
+          : 'private-token-setup-incomplete';
+      })
+      .catch((error: unknown) => {
+        walletControl.lastDiagnostic = safeAgentControlErrorMessage(error);
+      });
+    return {
+      ok: true,
+      message: 'Private-token setup review is opening in Agent Control.',
+    };
+  }
+  if (action === 'recover-operation') {
+    const operationId = fields.operationId?.trim();
+    if (!operationId) {
+      return { ok: false, message: 'Enter a local operation ID.' };
+    }
+    try {
+      const result = await service.recoverOperation(operationId);
+      walletControl.lastDiagnostic = `operation-recovery-${result.status}`;
+      return {
+        ok: true,
+        message: `Operation recovery completed with status ${result.status}.`,
+      };
+    } catch (error) {
+      walletControl.lastDiagnostic = safeAgentControlErrorMessage(error);
+      return { ok: false, message: walletControl.lastDiagnostic };
+    }
+  }
+  if (action === 'discard-operation') {
+    const operationId = fields.operationId?.trim();
+    const operationHash = fields.operationHash?.trim();
+    if (!operationId || !operationHash) {
+      return {
+        ok: false,
+        message: 'Enter the operation ID and exact operation hash.',
+      };
+    }
+    try {
+      const record = await journal.get(operationId);
+      if (!record) {
+        return {
+          ok: false,
+          message: 'No local operation matches this identifier.',
+        };
+      }
+      if (
+        record.operationHash.toLowerCase() !== operationHash.toLowerCase()
+      ) {
+        return {
+          ok: false,
+          message: 'Operation hash does not match the local journal.',
+        };
+      }
+    } catch (error) {
+      return {
+        ok: false,
+        message: safeAgentControlErrorMessage(error),
+      };
+    }
+    walletControl.lastDiagnostic =
+      'operation-discard-awaiting-local-confirmation';
+    void service
+      .discardOperation(operationId, operationHash)
+      .then(() => {
+        walletControl.lastDiagnostic = 'operation-discarded';
+      })
+      .catch((error: unknown) => {
+        walletControl.lastDiagnostic = safeAgentControlErrorMessage(error);
+      });
+    return {
+      ok: true,
+      message: 'Exact discard review is opening in Agent Control.',
+    };
+  }
+  return { ok: false, message: 'Unsupported Agent Control action.' };
+};
+
+const runSigner = async (
+  initialConfig: LoadedSignerConfig,
+  instanceLock: SignerInstanceLock,
+): Promise<void> => {
+  const walletControl: WalletControlState = {
+    environmentFilePath:
+      initialConfig.environmentFilePath ??
+      resolve(initialConfig.stateDirectory, 'signer.env'),
+    displayAddress: initialConfig.walletConfigured
+      ? (new EthersWallet(
+          initialConfig.credentialMaterial().privateKey,
+        ).address.toLowerCase() as Address)
+      : null,
+    generatedBackup: null,
+    restartRequired: false,
+    lastDiagnostic: null,
+  };
+  const setupRpc = new HttpJsonRpcReader(initialConfig.rpcUrl);
+  let active: ConfiguredSignerRuntime | null = null;
+  let activation: Promise<void> | null = null;
+
+  const activateFromEnvironmentFile = async (
+    failOnError = false,
+  ): Promise<void> => {
+    if (active) return;
+    const pending =
+      activation ??
+      (async () => {
+        const config = await loadSignerConfig({
+          ...process.env,
+          CHAINWHISPER_SIGNER_ENV_FILE:
+            walletControl.environmentFilePath,
+          CHAINWHISPER_SIGNER_STATE_DIRECTORY:
+            initialConfig.stateDirectory,
+        });
+        if (!config.walletConfigured) return;
+        const configured = await initializeConfiguredSigner(
+          config,
+          control,
+          walletControl,
+        );
+        active = configured;
+        walletControl.displayAddress = configured.wallet;
+        walletControl.restartRequired = false;
+        walletControl.lastDiagnostic = 'agent-wallet-ready';
+        router.activate(configured.service);
+      })();
+    activation = pending;
+    try {
+      await pending;
+    } catch (error) {
+      walletControl.restartRequired = false;
+      walletControl.lastDiagnostic = safeAgentControlErrorMessage(error);
+      if (failOnError) throw error;
+    } finally {
+      if (activation === pending) activation = null;
+    }
+  };
+
+  const control = new LocalWebFormElicitor({
+    getControlSummary: async (): Promise<AgentControlSummary> => {
+      if (active) {
+        return configuredControlSummary({
+          wallet: active.wallet,
+          rpc: active.rpc,
+          manifest: active.manifest,
+          journal: active.journal,
+          service: active.service,
+          autonomy: active.autonomy,
+          privacy: active.privacy,
+          walletControl,
+        });
+      }
+      return {
+        wallet: walletControl.displayAddress,
+        network: 'COTI Mainnet',
+        balance: await readCotiBalance(
+          setupRpc,
+          walletControl.displayAddress,
+        ),
+        privacyStatus: 'onboarding-required',
+        signerStatus: 'setup-required',
+        autonomy: { mode: 'manual' },
+        pendingOperations: 0,
+        recentOperations: [],
+        diagnostics: [
+          {
+            label: 'Setup',
+            value:
+              walletControl.lastDiagnostic ?? 'wallet-setup-required',
+          },
+        ],
+        walletSetup: {
+          required: true,
+          environmentFilePath: walletControl.environmentFilePath,
+          restartRequired: false,
+          ...(walletControl.generatedBackup
+            ? { generatedBackup: walletControl.generatedBackup }
+            : {}),
+        },
+      };
+    },
+    onControlAction: async (action, fields) => {
+      if (active) {
+        return handleConfiguredControlAction(
+          active,
+          walletControl,
+          action,
+          fields,
+        );
+      }
+      if (action === 'clear-wallet-backup') {
+        walletControl.generatedBackup = null;
+        return { ok: true, message: 'Generated wallet backup view cleared.' };
+      }
+      if (action !== 'import-wallet' && action !== 'generate-wallet') {
+        return {
+          ok: false,
+          message: 'Finish Agent Wallet setup before using this control.',
+        };
+      }
+      const saved = await saveAgentWallet({
+        action,
+        fields,
+        state: walletControl,
+        replacing: false,
+        activateInProcess: true,
+      });
+      if (!saved.ok) return saved;
+      try {
+        await activateFromEnvironmentFile(true);
+        return {
+          ok: true,
+          message:
+            action === 'generate-wallet'
+              ? 'Agent Wallet created and active. Back up the displayed private key, then fund the wallet and enable private trading.'
+              : 'Agent Wallet imported and active. Fund the wallet and enable private trading when ready.',
+        };
+      } catch (error) {
+        return {
+          ok: false,
+          message: safeAgentControlErrorMessage(error),
+        };
+      }
+    },
+  });
+
+  const router = new HotSignerToolRouter({
+    getStatus: async (requiredAssets) =>
+      buildPublicSignerStatus(
+        initialConfig,
+        walletControl.displayAddress,
+        control,
+        false,
+        {
+          controlPageReadiness: control.controlPageReady
+            ? 'ready'
+            : 'starting',
+          requiredAssets,
+          diagnosticCodes: [
+            walletControl.lastDiagnostic ?? 'wallet-setup-required',
+            control.controlPageReady
+              ? 'control-page-ready'
+              : 'control-page-starting',
+          ],
+        },
+      ),
+    openControlPanel: () => control.openControlPanel(),
+    autonomyStatus: async () => ({
+      allowed: true,
+      value: inactiveAutonomy(),
+    }),
+    activateFromEnvironmentFile,
+  });
+
+  await startBoundControlServer(control, instanceLock);
+  if (initialConfig.walletConfigured) {
+    await activateFromEnvironmentFile(true);
+  }
   const server = createJsonMcpServer({
     name: 'chainwhisper-coti-signer',
     version: CHAINWHISPER_AGENT_TOOLS_VERSION,
     instructions:
-      'Local ChainWhisper COTI signer. Agent Wallet credentials, privacy material, policies, and signing authority stay in this process. Manual actions open signer-owned Agent Control once per complete logical action. A supplied policyId must match an active wallet-bound policy or the write is denied without a fallback prompt. Only audited ChainWhisper contracts, selectors, Privacy Portal routes, and embedded official COTI private messaging are supported.',
-    tools: createSignerTools(service),
+      'Local ChainWhisper COTI signer. Its complete public tool catalog stays stable while Agent Control sets up the first wallet and activates the verified runtime in this process. Wallet credentials, privacy material, policies, and signing authority remain local. Manual actions open signer-owned Agent Control once per complete logical action. Only audited ChainWhisper contracts, selectors, Privacy Portal routes, and embedded official COTI private messaging are supported.',
+    tools: router.tools,
   });
   try {
     await connectStdioMcpServer(server);
@@ -686,11 +919,7 @@ const main = async (): Promise<void> => {
     config.stateDirectory,
   );
   try {
-    if (!config.walletConfigured) {
-      await runWalletSetupSigner(config);
-      return;
-    }
-    await runConfiguredSigner(config);
+    await runSigner(config, instanceLock);
   } finally {
     await instanceLock.release();
   }

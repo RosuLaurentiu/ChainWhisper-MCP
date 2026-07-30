@@ -10,11 +10,19 @@ ChainWhisper on COTI Mainnet:
 No ChainWhisper skill or separate messaging MCP is required. Official COTI
 private messaging is embedded in the signer.
 
+If an agent also uses a compatible COTI MCP, keep it as an independent companion
+for generic, read-only COTI network and account functions. ChainWhisper does not
+call that MCP, receive credentials from it, or republish its tools. Never share
+the ChainWhisper Agent Wallet private key, wallet privacy/AES material, or
+access secrets with the companion. The ChainWhisper planner and signer expose
+the economic actions a person can perform in the ChainWhisper app.
+
 ## Security boundary
 
 The planner never holds a wallet key, privacy key, access secret, ABI,
 arbitrary calldata, or signing authority. It reads audited ChainWhisper state
-and returns a paired `ActionEnvelopeV1`.
+and returns a paired `ActionEnvelopeV1`. At startup it also removes inherited
+signer-only environment variables before loading the planning runtime.
 
 The signer:
 
@@ -73,7 +81,8 @@ Agent Control offers:
 
 Only a standard 32-byte EVM private key is accepted during beta. Import and
 generation happen exclusively in Agent Control, never in MCP arguments or a
-conversation. Restart the signer after saving or replacing the wallet.
+conversation. The first wallet activates in the running signer immediately;
+replacing an active wallet remains restart-gated for beta.
 
 The default wallet file is `signer.env` in the ChainWhisper state directory.
 To select another absolute path, set:
@@ -122,21 +131,23 @@ not expose a portable Node API for complete ACL ownership verification, so the
 documented beta boundary is the same signed-in Windows user and a trusted local
 host.
 
-Only one signer process may use a state directory. If the process terminates
-uncleanly, verify no signer remains before removing only the exact
-`signer.instance.lock` inside that state directory.
+Only one signer process may use a state directory. A lock is reclaimed
+automatically only when both its recorded owner process is gone and its bound
+loopback Agent Control port is closed. Live, malformed, inaccessible, or
+otherwise unverifiable locks fail closed.
 
 ## Privacy onboarding
 
 After funding the Agent Wallet with COTI for gas:
 
-1. Open Agent Control.
-2. Choose **Set up wallet privacy**.
-3. Review and confirm the exact official COTI onboarding action.
-4. Let the signer recover and encrypt the wallet-specific privacy key
+1. Open Agent Control and choose **Enable private trading**.
+2. Review and confirm the exact official COTI onboarding action.
+3. Let the signer recover and encrypt the wallet-specific privacy key
    internally.
-5. Enable each verified private token when first needed; this remains a
-   separately confirmed setup action.
+4. When an intended ChainWhisper action first needs a verified private asset,
+   prepare only that missing token account locally.
+5. Prepare a fresh action after setup. An envelope created before setup is
+   never reused.
 
 Users never enter privacy key material. Private state, policies, operation
 recovery, and access secrets are stored under the active Agent Wallet
@@ -173,11 +184,12 @@ A manual approval covers the complete logical action. For example:
 
 > Create recurring private-liquidity order
 
-Agent Control shows send and receive amounts, privacy labels, exact order type,
-prices, recurring inventory, recipient or counterparty, expiry, protocol fee,
-and maximum network cost. Approvals, resets, contracts, selectors, calldata
-digests, step hashes, and the operation hash are collapsed under technical
-details.
+Agent Control shows privacy labels, exact order type, prices, sell-side
+inventory, buy-side budget, recipient or counterparty, expiry, protocol fee,
+and maximum network cost. Recurring means reusable two-sided liquidity, not
+scheduled execution. Approvals, resets, native value, gas ceilings, contracts,
+selectors, calldata digests, step hashes, and the operation hash are collapsed
+under technical details.
 
 There is one action-specific button such as **Confirm complete order creation**
 plus **Decline**. After approval, every step is re-attested, revalidated, and
@@ -209,40 +221,68 @@ reserved atomically before signing. A failure before any signature releases
 the reservation; signed, pending, and uncertain broadcasts continue consuming
 it until safe recovery.
 
-Private amounts may be selected by the agent only when:
+For manual execution, agent-provided private values are reviewed in Agent
+Control like the other exact action terms. Under autonomy,
+`agentVisiblePrivateAmounts: true` is one policy-wide consent. Enabling it lets
+the agent both:
 
-- the prepare call explicitly uses
+- choose private amounts when a prepare call explicitly uses
   `privateAmountMode: "agent-provided"`; and
-- the active policy records `agentVisiblePrivateAmounts: true`.
+- view policy-scoped private balances, hidden order inventory/progress, and
+  participant receipts through `chainwhisper_private_state`.
+
+Agent Control states both capabilities in the policy editor, activation
+confirmation, active-policy summary, resume confirmation, and revocation
+confirmation. Disabling the field removes both capabilities.
+
+Order amounts, prices, budgets, inventory, progress, and fill receipts are
+trading context for the user's chosen agent, not wallet credentials. In a
+recurring private-liquidity order, each private-token inventory or budget side
+is encrypted on-chain; a public-token side remains visible. Buy and sell prices
+are public order terms. Autonomy budgets and price bands are local signer policy
+and are not published on-chain. A policy-authorized private-state read does not
+consume an action budget, and public-order participants do not need individual
+counterparty allowlisting. Fixed-recipient/direct orders still enforce the
+policy's counterparty scope.
 
 Those amounts remain encrypted/private on-chain where the deployed
 ChainWhisper contract supports private inputs. A Privacy Portal conversion
-amount is public calldata because that is the deployed bridge interface.
+amount is public calldata because that is the deployed bridge interface. Only
+wallet private keys, wallet privacy/AES material, pairing/session tokens, and
+raw access secrets remain signer-only; agents may see or choose trade amounts,
+prices, and budgets when the user instruction or autonomy policy allows it.
 
 ## Public signer tools
 
 - `chainwhisper_signer_status`
 - `chainwhisper_open_control_panel`
 - `chainwhisper_autonomy_status`
+- `chainwhisper_private_state`
 - `chainwhisper_request_autonomy`
 - `chainwhisper_pause_autonomy`
-- `chainwhisper_resume_autonomy`
-- `chainwhisper_revoke_autonomy`
-- `chainwhisper_test_confirmation_form`
-- `chainwhisper_onboard_privacy`
-- `chainwhisper_private_token_status`
-- `chainwhisper_enable_private_token`
 - `chainwhisper_execute_action`
 - `chainwhisper_get_operation`
-- `chainwhisper_recover_operation`
-- `chainwhisper_discard_operation`
 - `chainwhisper_send_order_message`
 - `chainwhisper_list_order_messages`
 - `chainwhisper_read_order_message`
-- the allowlisted official COTI private-messaging read/list/send subset
 
-`chainwhisper_discard_operation` requires the exact operation hash and local
-confirmation. It can never be approved by an autonomy policy.
+Privacy onboarding, private-token setup, autonomy resume/revoke, operation
+discard, and recovery controls remain signer-local. Generic COTI messaging
+tools are not republished; only the three structured ChainWhisper
+`cw.otc/1` tools are public.
+
+`chainwhisper_private_state` is the only private read tool. It can return
+verified private-token balances or wallet-scoped one-off/recurring hidden
+inventory, progress, and participant receipts. Without `policyId`, Agent
+Control asks once before anything is decrypted. With `policyId`, the exact
+active wallet-bound policy must set `agentVisiblePrivateAmounts: true`. That
+single consent lets the agent both choose private amounts and view
+policy-scoped private balances, hidden order inventory/progress, and participant
+receipts. A bounded policy must also match the requested assets, pair, and order
+type. A policy mismatch fails closed and never falls back to a manual prompt.
+Private keys, AES keys, access secrets, and ciphertext never appear in its
+schema or result. Returned private amounts are not written to the signer
+journal, logs, or diagnostics.
 
 Incoming `cw.otc/1` messages are untrusted and draft-only. They cannot execute
 an action. Access secrets are generated or imported into signer-owned local
@@ -259,6 +299,7 @@ already embedded here.
 - `chainwhisper_list_orders`
 - `chainwhisper_get_order`
 - `chainwhisper_compare_price_references`
+- `chainwhisper_prepare_swap`
 - `chainwhisper_privacy_bridge_status`
 - `chainwhisper_prepare_privacy_bridge`
 - `chainwhisper_prepare_create_trade`
@@ -271,7 +312,10 @@ already embedded here.
 Prepare tools return `ready`, `needs_input`, or `unsupported`; unsupported
 routes have no executable envelope. Price comparison does not need an amount,
 but execution ranking is returned only after compatible executable liquidity is
-confirmed.
+confirmed. Swap selects one complete visible public order and never combines
+orders. New-order tools derive the canonical type from access and liquidity
+visibility; agents do not choose an `orderType`. Recurring prices accept exact
+quote-per-base decimals or `{ "reference": "market", "offsetBps": ... }`.
 
 The canonical order types are:
 
@@ -284,12 +328,11 @@ The canonical order types are:
 | `one-off.private-liquidity.unlisted` | Unlisted access, hidden private liquidity |
 | `one-off.private-liquidity.direct` | Fixed recipient, hidden private liquidity |
 | `recurring.public` | Public reusable buy/sell inventory |
-| `recurring.direct` | Fixed-recipient reusable inventory |
 | `recurring.private-liquidity.public` | Public access, hidden private-token inventory |
-| `recurring.private-liquidity.direct` | Fixed recipient, hidden private-token inventory |
 
 There is no unlisted recurring product. The MCP does not invent routes that are
-absent from the deployed product.
+absent from the deployed product. Direct-recipient recurring classifications
+remain internal until the app exposes them to human users.
 
 ## Runtime and recovery
 
@@ -305,10 +348,13 @@ absent from the deployed product.
 Every write target must match deployed runtime bytecode. Recurring writes are
 available only when their complete selector set also passes the live audit.
 
-Hash-bound writes with an uncertain RPC outcome remain `processing`. Recovery
-reconciles the same signed hash and never silently prepares a replacement.
-Official messaging remains fail-closed when the SDK does not expose a
-transaction hash.
+Execution validates and stores the exact paired envelope in encrypted,
+wallet-scoped storage before returning an operation id. The agent polls
+`chainwhisper_get_operation` while Agent Control or an active policy advances
+the operation. Nonterminal operations are restored after a signer restart.
+Hash-bound writes with an uncertain RPC outcome reconcile the same signed hash
+and never silently prepare a replacement. Official messaging remains
+fail-closed when the SDK does not expose a transaction hash.
 
 Desktop-local writes and autonomy are the beta default. A headless signer is
 read-only unless its signer-owned confirmation and policy surface is available.
@@ -329,7 +375,15 @@ Read-only live verification:
 
 ```sh
 npm run smoke:live
+npm run smoke:live:readonly
 npm run audit:runtime
+```
+
+The maintained read-only surface smoke may also preflight one configured
+private asset and optionally list one wallet's public orders:
+
+```sh
+npm run smoke:live:readonly -- --private-token p.WISP --orders-for-wallet 0x...
 ```
 
 The tarball gate creates the exact npm archive, checks its contents, installs it

@@ -11,12 +11,18 @@ import {
   type ServerResponse,
 } from 'node:http';
 
+import { isSafeOperationId } from '../shared/index.js';
 import {
+  agentControlStateKey,
   renderAgentControlPage,
   type AgentControlPageModel,
   type AgentControlPendingPrompt,
   type AgentControlSummary,
 } from './localControlPage.js';
+import {
+  policyAmountFromDisplay,
+  policyPriceFromDisplay,
+} from './autonomyPresentation.js';
 import type {
   ConfirmationRequest,
   ConfirmationResult,
@@ -32,7 +38,11 @@ export type OpenControlPanelResult = {
   opened: boolean;
   ready: boolean;
   activePrompt: boolean;
-  reason?: 'browser-open-failed' | 'server-unavailable' | 'closed';
+  reason?:
+    | 'browser-open-failed'
+    | 'browser-arrival-timeout'
+    | 'server-unavailable'
+    | 'closed';
 };
 
 export type AgentControlAction =
@@ -42,7 +52,10 @@ export type AgentControlAction =
   | 'import-wallet'
   | 'generate-wallet'
   | 'clear-wallet-backup'
-  | 'onboard-privacy';
+  | 'onboard-privacy'
+  | 'enable-private-token'
+  | 'recover-operation'
+  | 'discard-operation';
 
 export type AgentControlActionResult = {
   ok: boolean;
@@ -51,6 +64,8 @@ export type AgentControlActionResult = {
 
 export type LocalWebFormElicitorOptions = {
   openUrl?: OpenUrl;
+  requireBrowserArrival?: boolean;
+  browserArrivalTimeoutMs?: number;
   getControlSummary?: () =>
     | AgentControlSummary
     | Promise<AgentControlSummary>;
@@ -84,6 +99,12 @@ type RateWindow = {
   submissions: number;
 };
 
+type BrowserArrivalWaiter = {
+  bootstrapToken: string | null;
+  sessionDigest: Buffer | null;
+  settle: (arrived: boolean) => void;
+};
+
 class BodyTooLargeError extends Error {}
 
 const COOKIE_NAME = 'cw_agent_control';
@@ -93,6 +114,7 @@ const MAX_REQUESTS_PER_WINDOW = 120;
 const MAX_SUBMISSIONS_PER_WINDOW = 30;
 const BOOTSTRAP_LIFETIME_MS = 60_000;
 const SESSION_LIFETIME_SECONDS = 8 * 60 * 60;
+const DEFAULT_BROWSER_ARRIVAL_TIMEOUT_MS = 5_000;
 
 const digest = (value: string): Buffer =>
   createHash('sha256').update(value).digest();
@@ -109,17 +131,44 @@ const matchesDigest = (
 const randomToken = (bytes = 32): string =>
   randomBytes(bytes).toString('base64url');
 
+const isPrivateTokenIdentifier = (value: string): boolean =>
+  /^(?:0x[0-9a-fA-F]{40}|[A-Za-z0-9][A-Za-z0-9._-]{0,63})$/u.test(
+    value,
+  );
+
+const isExactOperationHash = (value: string): boolean =>
+  /^0x[0-9a-fA-F]{64}$/u.test(value);
+
+const redactSnapshotDiagnostic = (value: string): string => {
+  if (
+    /(?:private.?key|mnemonic|recovery.?phrase|aes.?key|passphrase|secret)/iu.test(
+      value,
+    )
+  ) {
+    return '[redacted]';
+  }
+  return value.replace(/\b0x[0-9a-f]{64}\b/giu, '[redacted]');
+};
+
 const openDefaultBrowser: OpenUrl = (url) =>
   new Promise<void>((resolve, reject) => {
+    if (
+      !/^http:\/\/127\.0\.0\.1:\d+\/(?:control|open\/[A-Za-z0-9_-]+)$/u.test(
+        url,
+      )
+    ) {
+      reject(new Error('Refusing to open a non-local Agent Control URL.'));
+      return;
+    }
     const command =
       process.platform === 'win32'
-        ? 'rundll32.exe'
+        ? process.env['COMSPEC'] || 'cmd.exe'
         : process.platform === 'darwin'
           ? 'open'
           : 'xdg-open';
     const args =
       process.platform === 'win32'
-        ? ['url.dll,FileProtocolHandler', url]
+        ? ['/d', '/c', 'start', '', url]
         : [url];
     const child = spawn(command, args, {
       detached: true,
@@ -243,12 +292,16 @@ export class LocalWebFormElicitor
   implements FormElicitor, PrivateValueElicitor
 {
   readonly #openUrl: OpenUrl;
+  readonly #requireBrowserArrival: boolean;
+  readonly #browserArrivalTimeoutMs: number;
   readonly #getControlSummary?: LocalWebFormElicitorOptions['getControlSummary'];
   readonly #onControlAction?: LocalWebFormElicitorOptions['onControlAction'];
   readonly #rateWindows = new Map<string, RateWindow>();
+  readonly #browserArrivalWaiters = new Set<BrowserArrivalWaiter>();
 
   #server: Server | null = null;
   #serverStart: Promise<boolean> | null = null;
+  #controlOpen: Promise<OpenControlPanelResult> | null = null;
   #port: number | null = null;
   #expectedHost: string | null = null;
   #bootstrapToken: string | null = null;
@@ -257,20 +310,28 @@ export class LocalWebFormElicitor
   #csrfDigest: Buffer | null = null;
   #pending: PendingPrompt | null = null;
   #closed = false;
-  #browserAvailable: boolean | null = null;
 
   constructor(options: LocalWebFormElicitorOptions = {}) {
     this.#openUrl = options.openUrl ?? openDefaultBrowser;
+    this.#requireBrowserArrival =
+      options.requireBrowserArrival ?? options.openUrl === undefined;
+    this.#browserArrivalTimeoutMs =
+      options.browserArrivalTimeoutMs ??
+      DEFAULT_BROWSER_ARRIVAL_TIMEOUT_MS;
     this.#getControlSummary = options.getControlSummary;
     this.#onControlAction = options.onControlAction;
   }
 
   isSupported(): boolean {
-    return !this.#closed && this.#browserAvailable !== false;
+    return !this.#closed;
   }
 
   get controlPageReady(): boolean {
     return !this.#closed && this.#server !== null && this.#port !== null;
+  }
+
+  get controlPort(): number | null {
+    return this.controlPageReady ? this.#port : null;
   }
 
   async startControlServer(): Promise<boolean> {
@@ -279,6 +340,26 @@ export class LocalWebFormElicitor
   }
 
   async openControlPanel(): Promise<OpenControlPanelResult> {
+    if (this.#controlOpen) {
+      const result = await this.#controlOpen;
+      if (
+        result.reason === 'browser-open-failed' &&
+        !this.#closed
+      ) {
+        return this.openControlPanel();
+      }
+      return result;
+    }
+    const opening = this.#performOpenControlPanel();
+    this.#controlOpen = opening;
+    try {
+      return await opening;
+    } finally {
+      if (this.#controlOpen === opening) this.#controlOpen = null;
+    }
+  }
+
+  async #performOpenControlPanel(): Promise<OpenControlPanelResult> {
     if (this.#closed) {
       return {
         opened: false,
@@ -288,7 +369,6 @@ export class LocalWebFormElicitor
       };
     }
     if (!(await this.#ensureServer()) || this.#port === null) {
-      this.#browserAvailable = false;
       return {
         opened: false,
         ready: false,
@@ -296,32 +376,67 @@ export class LocalWebFormElicitor
         reason: 'server-unavailable',
       };
     }
+    const open = async (): Promise<
+      OpenControlPanelResult['reason'] | null
+    > => {
+      const sessionAtOpen = this.#sessionDigest;
+      let bootstrapAtOpen: string | null = null;
+      const controlUrl = sessionAtOpen
+        ? `http://127.0.0.1:${this.#port}/control`
+        : (() => {
+            bootstrapAtOpen = randomToken();
+            this.#bootstrapToken = bootstrapAtOpen;
+            this.#bootstrapExpiresAt =
+              Date.now() + BOOTSTRAP_LIFETIME_MS;
+            this.#csrfDigest = null;
+            return `http://127.0.0.1:${this.#port}/open/${bootstrapAtOpen}`;
+          })();
+      const reason = await this.#openAndAwaitArrival(controlUrl, {
+        bootstrapToken: bootstrapAtOpen,
+        sessionDigest: sessionAtOpen,
+      });
+      if (
+        reason &&
+        bootstrapAtOpen &&
+        this.#bootstrapToken === bootstrapAtOpen
+      ) {
+        this.#bootstrapToken = null;
+      }
+      if (
+        reason === 'browser-arrival-timeout' &&
+        sessionAtOpen &&
+        this.#sessionDigest === sessionAtOpen
+      ) {
+        this.#sessionDigest = null;
+        this.#csrfDigest = null;
+      }
+      return reason;
+    };
 
-    const bootstrapToken = randomToken();
-    this.#bootstrapToken = bootstrapToken;
-    this.#bootstrapExpiresAt = Date.now() + BOOTSTRAP_LIFETIME_MS;
-    this.#sessionDigest = null;
-    this.#csrfDigest = null;
-    try {
-      await this.#openUrl(
-        `http://127.0.0.1:${this.#port}/open/${bootstrapToken}`,
-      );
-      this.#browserAvailable = true;
-      return {
-        opened: true,
-        ready: true,
-        activePrompt: Boolean(this.#pending),
-      };
-    } catch {
-      this.#browserAvailable = false;
-      this.#bootstrapToken = null;
+    const hadSession = this.#sessionDigest !== null;
+    let reason = await open();
+    // A browser cookie can be cleared while the signer still remembers the
+    // old session. Rotate to a fresh one-time bootstrap and try once more.
+    if (
+      reason === 'browser-arrival-timeout' &&
+      hadSession &&
+      this.#sessionDigest === null
+    ) {
+      reason = await open();
+    }
+    if (reason) {
       return {
         opened: false,
         ready: true,
         activePrompt: Boolean(this.#pending),
-        reason: 'browser-open-failed',
+        reason,
       };
     }
+    return {
+      opened: true,
+      ready: true,
+      activePrompt: Boolean(this.#pending),
+    };
   }
 
   async close(): Promise<void> {
@@ -330,6 +445,7 @@ export class LocalWebFormElicitor
     this.#bootstrapToken = null;
     this.#sessionDigest = null;
     this.#csrfDigest = null;
+    this.#signalBrowserArrival(null, false);
     this.#settlePending('cancelled');
     const server = this.#server;
     this.#server = null;
@@ -340,6 +456,93 @@ export class LocalWebFormElicitor
       server.close(() => resolve());
       server.closeAllConnections();
     });
+  }
+
+  async #openAndAwaitArrival(
+    url: string,
+    expected: {
+      bootstrapToken: string | null;
+      sessionDigest: Buffer | null;
+    },
+  ): Promise<
+    'browser-open-failed' | 'browser-arrival-timeout' | null
+  > {
+    const arrival = this.#requireBrowserArrival
+      ? this.#waitForBrowserArrival(expected)
+      : null;
+    try {
+      await this.#openUrl(url);
+    } catch {
+      arrival?.cancel();
+      return 'browser-open-failed';
+    }
+    if (!arrival) return null;
+    return (await arrival.promise)
+      ? null
+      : 'browser-arrival-timeout';
+  }
+
+  #waitForBrowserArrival(expected: {
+    bootstrapToken: string | null;
+    sessionDigest: Buffer | null;
+  }): {
+    promise: Promise<boolean>;
+    cancel: () => void;
+  } {
+    let settle!: (arrived: boolean) => void;
+    let waiter!: BrowserArrivalWaiter;
+    const promise = new Promise<boolean>((resolve) => {
+      let settled = false;
+      const timer = setTimeout(
+        () => settle(false),
+        this.#browserArrivalTimeoutMs,
+      );
+      settle = (arrived) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        this.#browserArrivalWaiters.delete(waiter);
+        resolve(arrived);
+      };
+      waiter = {
+        bootstrapToken: expected.bootstrapToken,
+        sessionDigest: expected.sessionDigest,
+        settle,
+      };
+      this.#browserArrivalWaiters.add(waiter);
+    });
+    return { promise, cancel: () => settle(false) };
+  }
+
+  #bindBrowserArrivalSession(
+    bootstrapToken: string,
+    sessionDigest: Buffer,
+  ): void {
+    for (const waiter of this.#browserArrivalWaiters) {
+      if (waiter.bootstrapToken !== bootstrapToken) continue;
+      waiter.bootstrapToken = null;
+      waiter.sessionDigest = sessionDigest;
+    }
+  }
+
+  #signalBrowserArrival(
+    request: IncomingMessage | null = null,
+    arrived = true,
+  ): void {
+    if (!arrived) {
+      for (const waiter of [...this.#browserArrivalWaiters]) {
+        waiter.settle(false);
+      }
+      return;
+    }
+    const session = request
+      ? parseCookies(request).get(COOKIE_NAME)
+      : undefined;
+    for (const waiter of [...this.#browserArrivalWaiters]) {
+      if (matchesDigest(session, waiter.sessionDigest)) {
+        waiter.settle(true);
+      }
+    }
   }
 
   requestConfirmation(
@@ -365,11 +568,7 @@ export class LocalWebFormElicitor
         resolve,
         timer,
       };
-      void this.openControlPanel().then((result) => {
-        if (!result.opened && this.#pending?.id === id) {
-          this.#settlePending('cancelled');
-        }
-      });
+      void this.openControlPanel();
     });
   }
 
@@ -396,11 +595,7 @@ export class LocalWebFormElicitor
         resolve,
         timer,
       };
-      void this.openControlPanel().then((result) => {
-        if (!result.opened && this.#pending?.id === id) {
-          this.#settlePending('cancelled');
-        }
-      });
+      void this.openControlPanel();
     });
   }
 
@@ -491,8 +686,13 @@ export class LocalWebFormElicitor
       }
       this.#bootstrapToken = null;
       const sessionToken = randomToken();
-      this.#sessionDigest = digest(sessionToken);
+      const sessionDigest = digest(sessionToken);
+      this.#sessionDigest = sessionDigest;
       this.#csrfDigest = null;
+      this.#bindBrowserArrivalSession(
+        requestUrl.slice('/open/'.length),
+        sessionDigest,
+      );
       response.writeHead(303, {
         ...securityHeaders(),
         Location: '/control',
@@ -508,6 +708,7 @@ export class LocalWebFormElicitor
     }
     if (request.method === 'GET' && requestUrl === '/control') {
       await this.#sendPage(response, 200);
+      this.#signalBrowserArrival(request);
       return;
     }
     if (request.method === 'GET' && requestUrl === '/snapshot') {
@@ -624,18 +825,28 @@ export class LocalWebFormElicitor
           }
       : null;
     const summary = await this.#summary();
-    const safeSummary = summary.walletSetup?.generatedBackup
-      ? {
-          ...summary,
-          walletSetup: {
-            ...summary.walletSetup,
-            generatedBackup: {
-              address: summary.walletSetup.generatedBackup.address,
-              privateKey: '[redacted]',
+    const safeSummary: AgentControlSummary = {
+      ...summary,
+      ...(summary.diagnostics
+        ? {
+            diagnostics: summary.diagnostics.map(({ label, value }) => ({
+              label,
+              value: redactSnapshotDiagnostic(value),
+            })),
+          }
+        : {}),
+      ...(summary.walletSetup?.generatedBackup
+        ? {
+            walletSetup: {
+              ...summary.walletSetup,
+              generatedBackup: {
+                address: summary.walletSetup.generatedBackup.address,
+                privateKey: '[redacted]',
+              },
             },
-          },
-        }
-      : summary;
+          }
+        : {}),
+    };
     response.writeHead(200, {
       ...securityHeaders(),
       'Content-Type': 'application/json; charset=utf-8',
@@ -644,6 +855,10 @@ export class LocalWebFormElicitor
       JSON.stringify({
         pending: safePending,
         summary: safeSummary,
+        stateKey: agentControlStateKey({
+          pending,
+          summary: safeSummary,
+        }),
       }),
     );
   }
@@ -709,7 +924,10 @@ export class LocalWebFormElicitor
       action !== 'import-wallet' &&
       action !== 'generate-wallet' &&
       action !== 'clear-wallet-backup' &&
-      action !== 'onboard-privacy'
+      action !== 'onboard-privacy' &&
+      action !== 'enable-private-token' &&
+      action !== 'recover-operation' &&
+      action !== 'discard-operation'
     ) {
       await this.#sendPage(response, 400, {
         error: 'Unknown Agent Control action.',
@@ -718,16 +936,56 @@ export class LocalWebFormElicitor
     }
     if (!this.#onControlAction) {
       await this.#sendPage(response, 409, {
-        error: 'Autonomy controls are not available in this signer session.',
+        error: 'Agent Control actions are not available in this signer session.',
       });
       return;
     }
     try {
-      const fields = Object.fromEntries(
+      let fields: Record<string, string> = Object.fromEntries(
         [...form.entries()]
           .filter(([key]) => !['csrf', 'intent', 'action'].includes(key))
           .map(([key, value]) => [key, value]),
       );
+      if (action === 'enable-private-token') {
+        const token = singleFormValue(form, 'token')?.trim() ?? '';
+        if (!isPrivateTokenIdentifier(token)) {
+          await this.#sendPage(response, 400, {
+            error:
+              'Enter one verified private-token symbol or 20-byte token address.',
+          });
+          return;
+        }
+        fields = { token };
+      } else if (action === 'recover-operation') {
+        const operationId =
+          singleFormValue(form, 'operationId')?.trim() ?? '';
+        if (!isSafeOperationId(operationId)) {
+          await this.#sendPage(response, 400, {
+            error: 'Enter a valid local operation ID.',
+          });
+          return;
+        }
+        fields = { operationId };
+      } else if (action === 'discard-operation') {
+        const operationId =
+          singleFormValue(form, 'operationId')?.trim() ?? '';
+        const operationHash =
+          singleFormValue(form, 'operationHash')?.trim() ?? '';
+        if (!isSafeOperationId(operationId)) {
+          await this.#sendPage(response, 400, {
+            error: 'Enter a valid local operation ID.',
+          });
+          return;
+        }
+        if (!isExactOperationHash(operationHash)) {
+          await this.#sendPage(response, 400, {
+            error:
+              'Enter the exact 0x-prefixed 32-byte operation hash.',
+          });
+          return;
+        }
+        fields = { operationId, operationHash };
+      }
       const result = await this.#onControlAction(action, fields);
       await this.#sendPage(response, result.ok ? 200 : 409, {
         ...(result.ok
@@ -736,7 +994,7 @@ export class LocalWebFormElicitor
       });
     } catch {
       await this.#sendPage(response, 500, {
-        error: 'The signer could not update autonomy safely.',
+        error: 'The signer could not complete that local action safely.',
       });
     }
   }
@@ -798,58 +1056,133 @@ export class LocalWebFormElicitor
           ) === 'true'
             ? 'true'
             : 'false';
-        const numericNames = [
-          ...editor.perActionSpend.map(
-            (_entry, index) => `autonomy.perAction.${index}`,
-          ),
-          ...editor.cumulativeSpend.map(
-            (_entry, index) => `autonomy.cumulative.${index}`,
-          ),
-          ...[
-            'maximumNativeValuePerAction',
-            'maximumNativeValueCumulative',
-            'maximumNetworkFeePerAction',
-            'maximumNetworkFeeCumulative',
-            'maximumActions',
-            'maximumMessages',
-          ].filter(
-            (name) =>
-              editor[
-                name as keyof typeof editor
-              ] !== undefined,
-          ).map((name) => `autonomy.${name}`),
-          ...editor.priceBands.flatMap((_band, index) => [
-            `autonomy.price.${index}.minNumerator`,
-            `autonomy.price.${index}.minDenominator`,
-            `autonomy.price.${index}.maxNumerator`,
-            `autonomy.price.${index}.maxDenominator`,
-          ]),
-        ];
-        for (const name of numericNames) {
-          const value = singleFormValue(form, name);
-          if (!value || !/^(?:0|[1-9][0-9]*)$/u.test(value)) {
+        for (const [prefix, entries] of [
+          ['perAction', editor.perActionSpend],
+          ['cumulative', editor.cumulativeSpend],
+        ] as const) {
+          for (const [index, entry] of entries.entries()) {
+            const name = `autonomy.${prefix}.${index}`;
+            const input = singleFormValue(form, name);
+            const amount =
+              input &&
+              entry.decimals !== undefined &&
+              entry.displayAmount !== undefined
+                ? policyAmountFromDisplay(input, entry.decimals)
+                : input && /^(?:0|[1-9][0-9]*)$/u.test(input)
+                  ? input
+                  : undefined;
+            if (amount === undefined) {
+              await this.#sendPage(response, 400, {
+                error: 'Enter a valid token amount for every policy budget.',
+              });
+              return;
+            }
+            values[name] = amount;
+          }
+        }
+        for (const name of [
+          'maximumNativeValuePerAction',
+          'maximumNativeValueCumulative',
+          'maximumNetworkFeePerAction',
+          'maximumNetworkFeeCumulative',
+        ] as const) {
+          if (editor[name] === undefined) continue;
+          const input = singleFormValue(form, `autonomy.${name}`);
+          const amount = input
+            ? policyAmountFromDisplay(input, 18)
+            : undefined;
+          if (amount === undefined) {
             await this.#sendPage(response, 400, {
-              error: 'Policy budgets and limits must be whole base-unit values.',
+              error: 'Enter valid COTI amounts for value and network limits.',
             });
             return;
           }
+          values[`autonomy.${name}`] = amount;
+        }
+        for (const name of [
+          'maximumActions',
+          'maximumMessages',
+        ] as const) {
+          if (editor[name] === undefined) continue;
+          const field = `autonomy.${name}`;
+          const value = singleFormValue(form, field);
           if (
-            (name.endsWith('Denominator') ||
-              name === 'autonomy.maximumActions') &&
-            value === '0'
+            !value ||
+            !/^(?:0|[1-9][0-9]*)$/u.test(value) ||
+            (name === 'maximumActions' && value === '0')
           ) {
             await this.#sendPage(response, 400, {
-              error: 'Policy denominators and maximum actions must be positive.',
+              error:
+                'Maximum actions must be positive and message limits must be whole numbers.',
             });
             return;
           }
-          values[name] = value;
+          values[field] = value;
+        }
+        for (const [index, band] of editor.priceBands.entries()) {
+          const human =
+            band.minimumDisplay !== undefined &&
+            band.maximumDisplay !== undefined &&
+            band.sellDecimals !== undefined &&
+            band.buyDecimals !== undefined;
+          if (human) {
+            const minimum = policyPriceFromDisplay(
+              singleFormValue(
+                form,
+                `autonomy.price.${index}.minimum`,
+              ) ?? '',
+              band.sellDecimals,
+              band.buyDecimals,
+            );
+            const maximum = policyPriceFromDisplay(
+              singleFormValue(
+                form,
+                `autonomy.price.${index}.maximum`,
+              ) ?? '',
+              band.sellDecimals,
+              band.buyDecimals,
+            );
+            if (!minimum || !maximum) {
+              await this.#sendPage(response, 400, {
+                error: 'Enter valid positive prices for every policy band.',
+              });
+              return;
+            }
+            values[`autonomy.price.${index}.minNumerator`] =
+              minimum.numerator;
+            values[`autonomy.price.${index}.minDenominator`] =
+              minimum.denominator;
+            values[`autonomy.price.${index}.maxNumerator`] =
+              maximum.numerator;
+            values[`autonomy.price.${index}.maxDenominator`] =
+              maximum.denominator;
+            continue;
+          }
+          for (const suffix of [
+            'minNumerator',
+            'minDenominator',
+            'maxNumerator',
+            'maxDenominator',
+          ]) {
+            const name = `autonomy.price.${index}.${suffix}`;
+            const value = singleFormValue(form, name);
+            if (
+              !value ||
+              !/^[1-9][0-9]*$/u.test(value)
+            ) {
+              await this.#sendPage(response, 400, {
+                error: 'Policy price ratios must be positive whole numbers.',
+              });
+              return;
+            }
+            values[name] = value;
+          }
         }
       }
       this.#settlePending('accepted', editor ? values : undefined);
       await this.#sendPage(response, 200, {
         flash:
-          'Action approved. The signer will verify each bound transaction before signing.',
+          'Approved. The signer is validating the bound transactions and will show progress here.',
       });
       return;
     }

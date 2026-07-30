@@ -120,7 +120,7 @@ const prompts: JsonMcpPrompt[] = [
       }
     ],
     render: (args) =>
-      `Prepare this request with the matching chainwhisper_prepare_* tool: ${args.request ?? ''}\nIf the request has no explicit orderType, call chainwhisper_order_types first, explain the exact cadence, access, terms visibility, liquidity visibility, and fill style, then let the user choose. Return editable missing details when needed. Never request a private key, mnemonic, privacy key, access secret, ABI, calldata, or arbitrary contract address. The returned plan must be executed by chainwhisper-coti-signer under either one complete local confirmation or an exact active policyId.`
+      `Prepare this request with the matching chainwhisper_prepare_* tool: ${args.request ?? ''}\nFor new orders, pass the economic terms and let the planner derive the canonical order type. Use chainwhisper_prepare_swap for the best single visible public order; it refuses when the complete listing cannot be compared. Return editable missing details when needed. Never request a private key, mnemonic, privacy key, access secret, ABI, calldata, or arbitrary contract address. The returned plan must be executed by chainwhisper-coti-signer under either one complete local confirmation or an exact active policyId.`
   }
 ];
 
@@ -156,7 +156,7 @@ export const createChainWhisperPlanningRuntime = async (
     name: 'chainwhisper-mcp',
     version: CHAINWHISPER_AGENT_TOOLS_VERSION,
     instructions:
-      'ChainWhisper MCP is a keyless COTI Mainnet OTC and Privacy Portal planner. Use reads before preparation. Amounts are decimal strings, never JSON numbers. Price comparison does not need an amount; rank execution only when the tool confirms executable liquidity. Privacy Portal actions must name an allowlisted pair and public-to-private or private-to-public direction. Preparation validates only repository-allowlisted contracts and selectors and returns a paired ActionEnvelopeV1. It never signs, broadcasts, sends messages, or accepts wallet credentials, privacy keys, mnemonics, access secrets, ABIs, calldata, arbitrary contracts, tokens, spenders, or admin actions. Missing optional terms are editable. Execute an envelope only through the separately registered local chainwhisper-coti-signer, using one complete local confirmation or an exact active policyId.',
+      'ChainWhisper MCP is a keyless COTI Mainnet OTC and Privacy Portal planner. Use reads before preparation. Amounts are decimal strings, never JSON numbers. New-order classifications are derived from access and liquidity visibility. Swap selects one complete visible public order and never combines liquidity. Recurring prices accept exact quote-per-base values or live market-reference offsets in basis points. Privacy Portal actions must name an allowlisted pair and public-to-private or private-to-public direction. Preparation validates only repository-allowlisted contracts and selectors and returns a paired ActionEnvelopeV1. It never signs, broadcasts, sends messages, or accepts wallet credentials, privacy keys, mnemonics, access secrets, ABIs, calldata, arbitrary contracts, tokens, spenders, or admin actions. Missing optional terms are editable. Execute an envelope only through the separately registered local chainwhisper-coti-signer, using one complete local confirmation or an exact active policyId.',
     tools: tools.map(toMcpTool),
     resources: resourcesFor(manifest),
     prompts

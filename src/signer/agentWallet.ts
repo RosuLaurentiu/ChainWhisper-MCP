@@ -58,6 +58,7 @@ export const saveAgentWallet = async (options: {
   fields: Readonly<Record<string, string>>;
   state: WalletControlState;
   replacing: boolean;
+  activateInProcess?: boolean;
   replacementBlockedReason?: string;
   environment?: Readonly<Record<string, string | undefined>>;
 }): Promise<AgentControlActionResult> => {
@@ -112,14 +113,20 @@ export const saveAgentWallet = async (options: {
             privateKey: wallet.privateKey,
           }
         : null;
-    options.state.restartRequired = true;
-    options.state.lastDiagnostic = 'agent-wallet-saved-restart-required';
+    options.state.restartRequired = !options.activateInProcess;
+    options.state.lastDiagnostic = options.activateInProcess
+      ? 'agent-wallet-saved-activating'
+      : 'agent-wallet-saved-restart-required';
     return {
       ok: true,
       message:
-        options.action === 'generate-wallet'
-          ? 'Agent Wallet created and saved locally. Back up the displayed private key, then restart the signer.'
-          : 'Agent Wallet saved locally. Restart the signer to load it.',
+        options.activateInProcess
+          ? options.action === 'generate-wallet'
+            ? 'Agent Wallet created and saved locally. Back up the displayed private key while the signer activates it.'
+            : 'Agent Wallet saved locally. The signer is activating it now.'
+          : options.action === 'generate-wallet'
+            ? 'Agent Wallet created and saved locally. Back up the displayed private key, then restart the signer.'
+            : 'Agent Wallet saved locally. Restart the signer to load it.',
     };
   } catch (error) {
     return {
@@ -132,7 +139,7 @@ export const saveAgentWallet = async (options: {
 export const pendingOperation = (
   record: OperationJournalRecord,
 ): boolean =>
-  !['completed', 'failed', 'discarded'].includes(record.stage);
+  !['completed', 'declined', 'failed', 'discarded'].includes(record.stage);
 
 export const replacementBlockReason = async (
   journal: Pick<OperationJournal, 'list'>,

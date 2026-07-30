@@ -27,26 +27,71 @@ const ordersForWallet =
   ordersArgument >= 0 && process.argv[ordersArgument + 1]
     ? process.argv[ordersArgument + 1]
     : null;
+const publicOrderTypeIds = [
+  'one-off.standard-public',
+  'one-off.unlisted',
+  'one-off.direct',
+  'one-off.private-liquidity.public',
+  'one-off.private-liquidity.unlisted',
+  'one-off.private-liquidity.direct',
+  'recurring.public',
+  'recurring.private-liquidity.public',
+];
 
-const signerEnvironmentNames = [
+const sharedEnvironmentNames = [
+  'CHAINWHISPER_STATE_DIRECTORY',
+  'CHAINWHISPER_PAIRING_FILE',
+  'CHAINWHISPER_PAIRING_SECRET',
+];
+const signerOnlyEnvironmentNames = [
+  'CHAINWHISPER_SIGNER_ENV_FILE',
   'CHAINWHISPER_SIGNER_CONFIG_FILE',
   'CHAINWHISPER_SIGNER_PRIVATE_KEY',
   'CHAINWHISPER_SIGNER_AES_KEY',
   'CHAINWHISPER_SIGNER_VAULT_PASSPHRASE',
   'CHAINWHISPER_SIGNER_EXPECTED_WALLET',
   'CHAINWHISPER_COTI_RPC_URL',
-  'CHAINWHISPER_STATE_DIRECTORY',
   'CHAINWHISPER_SIGNER_STATE_DIRECTORY',
-  'CHAINWHISPER_PAIRING_SECRET',
+  'CHAINWHISPER_SIGNER_CONFIRMATION_CHANNEL',
+  'CHAINWHISPER_SIGNER_CONFIRMATION_TIMEOUT_MS',
+  'CHAINWHISPER_SIGNER_EXPIRY_SKEW_MS',
 ];
 
-const childEnvironment = () => {
+const childEnvironment = (role, source = process.env) => {
   const environment = { ...getDefaultEnvironment() };
-  for (const name of signerEnvironmentNames) {
-    const value = process.env[name];
+  for (const name of signerOnlyEnvironmentNames) {
+    delete environment[name];
+  }
+  const names =
+    role === 'signer'
+      ? [...sharedEnvironmentNames, ...signerOnlyEnvironmentNames]
+      : sharedEnvironmentNames;
+  for (const name of names) {
+    const value = source[name];
     if (value) environment[name] = value;
   }
   return environment;
+};
+
+const assertEnvironmentSeparation = () => {
+  const names = [...sharedEnvironmentNames, ...signerOnlyEnvironmentNames];
+  const sentinels = Object.fromEntries(
+    names.map((name, index) => [name, `sentinel-${index}`]),
+  );
+  const planner = childEnvironment('planner', sentinels);
+  const signer = childEnvironment('signer', sentinels);
+  for (const name of sharedEnvironmentNames) {
+    assert.equal(planner[name], sentinels[name]);
+    assert.equal(signer[name], sentinels[name]);
+  }
+  for (const name of signerOnlyEnvironmentNames) {
+    assert.equal(
+      planner[name],
+      undefined,
+      `The keyless planner must not receive ${name}.`,
+    );
+    assert.equal(signer[name], sentinels[name]);
+  }
 };
 
 const readToolJson = (result) => {
@@ -55,13 +100,13 @@ const readToolJson = (result) => {
   return JSON.parse(block.text);
 };
 
-const withClient = async (name, binaryPath, callback) => {
+const withClient = async (name, binaryPath, role, callback) => {
   let stderr = '';
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: [binaryPath],
     cwd: packageRoot,
-    env: childEnvironment(),
+    env: childEnvironment(role),
     stderr: 'pipe',
   });
   transport.stderr?.on('data', (chunk) => {
@@ -104,6 +149,14 @@ const callReadOnly = async (client, toolName, args = {}) => {
   return readToolJson(result);
 };
 
+const environmentCheckRequested = process.argv.includes(
+  '--check-environment-separation',
+);
+assertEnvironmentSeparation();
+if (environmentCheckRequested) {
+  process.stdout.write('ChainWhisper child environment separation verified.\n');
+  process.exit(0);
+}
 const packageJson = JSON.parse(
   await readFile(resolve(packageRoot, 'package.json'), 'utf8'),
 );
@@ -119,6 +172,7 @@ const signerBinary = resolve(
 const plannerResult = await withClient(
   'chainwhisper-mcp',
   plannerBinary,
+  'planner',
   async (client) => {
     const status = await callReadOnly(client, 'chainwhisper_status');
     const orderTypes = await callReadOnly(
@@ -127,10 +181,9 @@ const plannerResult = await withClient(
     );
     assert.equal(orderTypes.ok, true);
     assert.equal(orderTypes.data?.version, 'OrderTypeCatalogV1');
-    assert.equal(orderTypes.data?.orderTypes?.length, 10);
-    assert.equal(
-      new Set(orderTypes.data.orderTypes.map(({ id }) => id)).size,
-      10,
+    assert.deepEqual(
+      orderTypes.data?.orderTypes?.map(({ id }) => id),
+      publicOrderTypeIds,
     );
     for (const orderType of orderTypes.data.orderTypes) {
       assert.equal(typeof orderType.id, 'string');
@@ -157,20 +210,38 @@ const plannerResult = await withClient(
 const signerResult = await withClient(
   'chainwhisper-coti-signer',
   signerBinary,
+  'signer',
   async (client) => {
-    const signerStatus = await callReadOnly(
+    const baseSignerStatus = await callReadOnly(
       client,
       'chainwhisper_signer_status',
     );
-    const tokenStatus =
-      privateToken && signerStatus.configured
+    const signerStatus =
+      privateToken && baseSignerStatus.configured
         ? await callReadOnly(
             client,
-            'chainwhisper_private_token_status',
-            { token: privateToken },
+            'chainwhisper_signer_status',
+            { requiredAssets: [privateToken] },
           )
+        : baseSignerStatus;
+    const requiredAsset =
+      privateToken && signerStatus.configured
+        ? signerStatus.requiredAssets?.find(
+            ({ asset }) =>
+              typeof asset === 'string' &&
+              asset.toLowerCase() === privateToken.toLowerCase(),
+          ) ?? signerStatus.requiredAssets?.[0] ?? null
         : null;
-    return { signerStatus, tokenStatus };
+    if (privateToken && signerStatus.configured) {
+      assert.equal(signerStatus.requiredAssets?.length, 1);
+      assert.ok(
+        requiredAsset &&
+          typeof requiredAsset.asset === 'string' &&
+          typeof requiredAsset.status === 'string',
+        'Signer status must return one required private-asset readiness result.',
+      );
+    }
+    return { signerStatus, requiredAsset };
   },
 );
 
@@ -183,8 +254,8 @@ process.stdout.write(
         ? { openMakerOrders: plannerResult.orders }
         : {}),
       signer: signerResult.signerStatus,
-      ...(signerResult.tokenStatus
-        ? { privateToken: signerResult.tokenStatus }
+      ...(signerResult.requiredAsset
+        ? { requiredPrivateAsset: signerResult.requiredAsset }
         : {}),
     },
     null,
