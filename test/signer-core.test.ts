@@ -1416,6 +1416,221 @@ describe('local ChainWhisper signer core', () => {
     });
   });
 
+  it('resumes the exact materialized manual bundle without a second confirmation', async () => {
+    const wallet = new TestWallet();
+    wallet.receiptStatus = 'pending';
+    const setup = await createEngine({ wallet });
+    const base = createEnvelope('manual-restart-single-confirmation');
+    const envelope = resignEnvelope(base, {
+      steps: [
+        base.steps[0]!,
+        {
+          ...base.steps[0]!,
+          id: 'second-authorized-step',
+          summary: 'Complete the second authorized transaction.',
+        },
+      ],
+      gasCap: '200000',
+    });
+
+    await expect(
+      setup.engine.executeAction(envelope),
+    ).resolves.toMatchObject({ status: 'processing' });
+    expect(setup.elicitor.requests).toHaveLength(1);
+    const stored = JSON.parse(
+      (await setup.vault.get(
+        `operation:${envelope.operationId}:request`,
+      ))!,
+    ) as {
+      version: number;
+      materializedBundle?: { steps: unknown[] };
+      manualAuthorization?: { stepDigests: string[] };
+    };
+    expect(stored).toMatchObject({
+      version: 2,
+      materializedBundle: { steps: expect.any(Array) },
+      manualAuthorization: {
+        stepDigests: expect.any(Array),
+      },
+    });
+    expect(stored.materializedBundle?.steps).toHaveLength(2);
+    expect(stored.manualAuthorization?.stepDigests).toHaveLength(2);
+
+    wallet.receiptStatus = 'success';
+    wallet.pendingNonce = 5;
+    const restoredElicitor = new TestElicitor();
+    let rematerializeCalls = 0;
+    const restored = new SignerEngine({
+      verifier: new ActionEnvelopeVerifier(
+        createConfig(setup.stateDirectory),
+        setup.runtime,
+        () => NOW,
+      ),
+      wallet,
+      materializer: {
+        materializeStep: async () => {
+          rematerializeCalls += 1;
+          throw new Error('manual steps must come from the encrypted bundle');
+        },
+      },
+      confirmation: new ConfirmationGate(restoredElicitor, 5_000),
+      simulator: setup.simulator,
+      intentValidator: new StrictMaterializedIntentValidator(),
+      journal: setup.journal,
+      vault: setup.vault,
+    });
+
+    await restored.restorePendingOperations();
+    let status = await restored.getOperationStatus(envelope.operationId);
+    for (
+      let attempt = 0;
+      status?.status !== 'completed' && attempt < 50;
+      attempt += 1
+    ) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 5));
+      status = await restored.getOperationStatus(envelope.operationId);
+    }
+
+    expect(status).toMatchObject({ status: 'completed' });
+    expect(restoredElicitor.requests).toHaveLength(0);
+    expect(rematerializeCalls).toBe(0);
+    expect(wallet.prepareCount).toBe(2);
+    expect(wallet.broadcastCount).toBe(2);
+  });
+
+  it('requires repreparation when a persisted manual bundle is tampered', async () => {
+    const wallet = new TestWallet();
+    wallet.receiptStatus = 'pending';
+    const setup = await createEngine({ wallet });
+    const base = createEnvelope('manual-restart-tampered-bundle');
+    const envelope = resignEnvelope(base, {
+      steps: [
+        base.steps[0]!,
+        {
+          ...base.steps[0]!,
+          id: 'second-tamper-bound-step',
+          summary: 'Complete the second tamper-bound transaction.',
+        },
+      ],
+      gasCap: '200000',
+    });
+
+    await setup.engine.executeAction(envelope);
+    const reference = `operation:${envelope.operationId}:request`;
+    const stored = JSON.parse((await setup.vault.get(reference))!) as {
+      materializedBundle: {
+        steps: Array<{
+          step: MaterializedActionStep;
+          stepDigest: string;
+        }>;
+      };
+    };
+    const second = stored.materializedBundle.steps[1]!;
+    second.step.data =
+      `${second.step.data.slice(0, -2)}${
+        second.step.data.endsWith('00') ? '01' : '00'
+      }` as HexString;
+    await setup.vault.put(reference, JSON.stringify(stored), {
+      kind: 'recovery-note',
+    });
+
+    wallet.receiptStatus = 'success';
+    const restoredElicitor = new TestElicitor();
+    const restored = new SignerEngine({
+      verifier: new ActionEnvelopeVerifier(
+        createConfig(setup.stateDirectory),
+        setup.runtime,
+        () => NOW,
+      ),
+      wallet,
+      materializer: new PassthroughPrivateInputMaterializer(),
+      confirmation: new ConfirmationGate(restoredElicitor, 5_000),
+      simulator: setup.simulator,
+      intentValidator: new StrictMaterializedIntentValidator(),
+      journal: setup.journal,
+      vault: setup.vault,
+    });
+
+    await restored.restorePendingOperations();
+    await expect
+      .poll(async () =>
+        (await restored.getOperationStatus(envelope.operationId))
+          ?.status,
+      )
+      .toBe('needs_reprepare');
+    expect(restoredElicitor.requests).toHaveLength(0);
+    expect(wallet.prepareCount).toBe(1);
+    expect(wallet.broadcastCount).toBe(1);
+  });
+
+  it('enforces persisted manual fee ceilings after restart', async () => {
+    const wallet = new TestWallet();
+    wallet.receiptStatus = 'pending';
+    const simulator = new SequencedFeeSimulator([
+      '10',
+      '20',
+      '10',
+      '21',
+    ]);
+    const setup = await createEngine({ wallet, simulator });
+    const base = createEnvelope('manual-restart-fee-ceiling');
+    const envelope = resignEnvelope(base, {
+      steps: [
+        base.steps[0]!,
+        {
+          ...base.steps[0]!,
+          id: 'second-manual-fee-bound-step',
+          summary: 'Complete the second fee-bound transaction.',
+        },
+      ],
+      gasCap: '200000',
+    });
+
+    await setup.engine.executeAction(envelope);
+    expect(setup.elicitor.requests).toHaveLength(1);
+    expect(wallet.broadcastCount).toBe(1);
+
+    wallet.receiptStatus = 'success';
+    const restoredElicitor = new TestElicitor();
+    const restored = new SignerEngine({
+      verifier: new ActionEnvelopeVerifier(
+        createConfig(setup.stateDirectory),
+        setup.runtime,
+        () => NOW,
+      ),
+      wallet,
+      materializer: new PassthroughPrivateInputMaterializer(),
+      confirmation: new ConfirmationGate(restoredElicitor, 5_000),
+      simulator,
+      intentValidator: new StrictMaterializedIntentValidator(),
+      journal: setup.journal,
+      vault: setup.vault,
+    });
+
+    await restored.restorePendingOperations();
+    await expect
+      .poll(async () =>
+        (await restored.getOperationStatus(envelope.operationId))
+          ?.errorCode,
+      )
+      .toBe('FEE_CHANGED');
+    await expect(
+      restored.getOperationStatus(envelope.operationId),
+    ).resolves.toMatchObject({
+      status: 'needs_reprepare',
+      errorCode: 'FEE_CHANGED',
+    });
+    await expect(
+      restored.executeAction(envelope),
+    ).resolves.toMatchObject({
+      status: 'retryable',
+      errorCode: 'FEE_CHANGED',
+    });
+    expect(restoredElicitor.requests).toHaveLength(0);
+    expect(wallet.prepareCount).toBe(1);
+    expect(wallet.broadcastCount).toBe(1);
+  });
+
   it('reuses the complete autonomy exposure when resuming a later step after restart', async () => {
     const wallet = new TestWallet();
     wallet.receiptStatus = 'pending';
@@ -1739,7 +1954,7 @@ describe('local ChainWhisper signer core', () => {
     });
   });
 
-  it('returns a nonce-only preparation failure to a safely retryable stage', async () => {
+  it('retries a nonce-only preparation failure under the original manual authorization', async () => {
     const wallet = new TestWallet();
     wallet.throwPrepareOnce = true;
     const setup = await createEngine({ wallet });
@@ -1760,7 +1975,7 @@ describe('local ChainWhisper signer core', () => {
     });
     expect(wallet.prepareCount).toBe(2);
     expect(wallet.broadcastCount).toBe(1);
-    expect(setup.elicitor.requests).toHaveLength(2);
+    expect(setup.elicitor.requests).toHaveLength(1);
   });
 
   it('advances a prepared step when its receipt proves a successful broadcast', async () => {

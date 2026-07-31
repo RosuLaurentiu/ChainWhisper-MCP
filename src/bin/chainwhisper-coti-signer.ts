@@ -12,6 +12,7 @@ import {
   createJsonMcpServer,
   writeFatalMcpError,
 } from '../server/index.js';
+import { LiveChainWhisperDomainGateway } from '../domain/index.js';
 import {
   CHAINWHISPER_AGENT_TOOLS_VERSION,
   HttpJsonRpcReader,
@@ -20,6 +21,7 @@ import {
 } from '../shared/index.js';
 import {
   ACCOUNT_ONBOARD_CONTRACT,
+  AgentActivityReader,
   AgentWalletBalanceReader,
   AbiCallTemplateMaterializer,
   ActionEnvelopeVerifier,
@@ -134,14 +136,21 @@ const configuredControlSummary = async (options: {
   autonomy: AutonomyPolicyManager;
   privacy: PrivacyOnboardingService;
   balances: AgentWalletBalanceReader;
+  activity: AgentActivityReader;
+  focusedOperationId?: string | null;
   walletControl: WalletControlState;
 }): Promise<AgentControlSummary> => {
-  const [operations, privacyReady, autonomyDecision, blockedReason] =
+  const [operations, privacyReady, autonomyDecision, blockedReason, activity] =
     await Promise.all([
       options.journal.list(),
       options.privacy.isReady(),
       options.autonomy.status(),
       replacementBlockReason(options.journal, options.autonomy),
+      options.activity.page(
+        options.focusedOperationId
+          ? 0
+          : options.walletControl.activityPage ?? 0,
+      ),
     ]);
   const autonomyStatus = autonomyDecision.allowed
     ? autonomyDecision.value
@@ -258,9 +267,20 @@ const configuredControlSummary = async (options: {
       };
     }),
   );
-  const requiredBalanceAssets = [...pendingStatuses.values()].flatMap(
-    (status) => status?.setupRequirement?.assets ?? [],
-  );
+  const requiredBalanceAssets = [
+    ...[...pendingStatuses.values()].flatMap(
+      (status) => status?.setupRequirement?.assets ?? [],
+    ),
+    ...activity.recentEntries
+      .flatMap(({ pair }) =>
+        pair
+          ? pair
+              .split('/')
+              .map((asset) => asset.trim())
+              .filter(Boolean)
+          : [],
+      ),
+  ];
   const balances = await options.balances.snapshot(
     requiredBalanceAssets,
   );
@@ -284,6 +304,8 @@ const configuredControlSummary = async (options: {
       : { mode: 'manual' },
     pendingOperations: pending.length,
     recentOperations,
+    activity,
+    focusedOperationId: options.focusedOperationId ?? null,
     diagnostics: [
       {
         label: 'Signer',
@@ -339,6 +361,7 @@ type ConfiguredSignerRuntime = {
   journal: OperationJournal;
   privacy: PrivacyOnboardingService;
   balances: AgentWalletBalanceReader;
+  activity: AgentActivityReader;
   autonomy: AutonomyPolicyManager;
   autonomyApprovals: ControlPageAutonomyApprovals;
   service: ChainWhisperSignerService;
@@ -525,6 +548,7 @@ const initializeConfiguredSigner = async (
     vault,
     confirmation,
     nonceQueue,
+    journal,
     assertRuntimeAttested,
   });
   const service = new ChainWhisperSignerService({
@@ -545,6 +569,18 @@ const initializeConfiguredSigner = async (
         : [],
     manifestHash: hashRuntimeManifest(manifest),
   });
+  const activity = new AgentActivityReader({
+    wallet: walletAddress,
+    journal,
+    vault,
+    orders: new LiveChainWhisperDomainGateway({
+      manifest,
+      rpc,
+    }),
+    getOperationStatus: (operationId) =>
+      service.getOperation(operationId),
+    explorerUrl: manifest.network.explorerUrl,
+  });
   await service.restorePendingOperations();
   return {
     config,
@@ -554,6 +590,7 @@ const initializeConfiguredSigner = async (
     journal,
     privacy: privacyOnboarding,
     balances,
+    activity,
     autonomy,
     autonomyApprovals,
     service,
@@ -580,6 +617,26 @@ const handleConfiguredControlAction = async (
   if (action === 'refresh-balances') {
     await runtime.balances.refresh();
     return { ok: true, message: 'Wallet balances refreshed.' };
+  }
+  if (action === 'history-previous') {
+    walletControl.activityPage = Math.max(
+      0,
+      (walletControl.activityPage ?? 0) - 1,
+    );
+    return {
+      ok: true,
+      message: `Showing activity page ${walletControl.activityPage + 1}.`,
+    };
+  }
+  if (action === 'history-next') {
+    walletControl.activityPage = Math.min(
+      49,
+      (walletControl.activityPage ?? 0) + 1,
+    );
+    return {
+      ok: true,
+      message: `Showing activity page ${walletControl.activityPage + 1}.`,
+    };
   }
   if (action === 'import-wallet' || action === 'generate-wallet') {
     const blockedReason = await replacementBlockReason(journal, autonomy);
@@ -629,8 +686,9 @@ const handleConfiguredControlAction = async (
       'privacy-onboarding-awaiting-local-confirmation';
     void service
       .onboardPrivacy()
-      .then(() => {
+      .then(async () => {
         runtime.balances.invalidate();
+        await runtime.balances.refresh().catch(() => undefined);
         walletControl.lastDiagnostic = 'privacy-ready';
         walletControl.lastDiagnosticCode = 'privacy-ready';
       })
@@ -841,6 +899,8 @@ const runSigner = async (
           autonomy: active.autonomy,
           privacy: active.privacy,
           balances: active.balances,
+          activity: active.activity,
+          focusedOperationId: control.focusedOperationId,
           walletControl,
         });
       }

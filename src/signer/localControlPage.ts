@@ -2,7 +2,15 @@ import type {
   ConfirmationRequest,
   PrivateValueRequest,
 } from './types.js';
+import type {
+  ConfirmationRequestWithOrderReview,
+  OrderReviewV1,
+} from './confirmation.js';
 import type { AgentWalletBalanceSnapshot } from './agentWalletBalances.js';
+import type {
+  ActivityEntryV1,
+  AgentActivityPageV1,
+} from './agentActivity.js';
 import {
   localDateTimeValue,
   policyAmountDisplay,
@@ -35,6 +43,8 @@ export type AgentControlSummary = {
   };
   pendingOperations?: number;
   recentOperations?: AgentControlOperation[];
+  activity?: AgentActivityPageV1;
+  focusedOperationId?: string | null;
   diagnostics?: Array<{ label: string; value: string }>;
   walletSetup?: {
     required: boolean;
@@ -113,6 +123,16 @@ export const agentControlStateKey = (
         setupAssets ?? [],
       ],
     ),
+    activity: model.summary.activity
+      ? [
+          model.summary.activity.revision,
+          model.summary.activity.page,
+          model.summary.activity.hasPrevious,
+          model.summary.activity.hasNext,
+        ]
+      : null,
+    focusedOperationId:
+      model.summary.focusedOperationId ?? null,
     localActions: model.summary.controlActions
       ? [
           Boolean(model.summary.controlActions.enablePrivateToken),
@@ -400,11 +420,218 @@ const renderAutonomyEditor = (
   </section>`;
 };
 
+const reviewOffset = (
+  basisPoints: number | null,
+  venue: string,
+): string => {
+  if (basisPoints === null) return '';
+  const sign = basisPoints > 0 ? '+' : '';
+  const venueLabel = venue.toLowerCase().includes('carbon')
+    ? 'Carbon'
+    : venue;
+  return `${sign}${basisPoints / 100}% vs ${venueLabel}`;
+};
+
+const reviewObservedAt = (value: string | null): string | null => {
+  if (!value) return null;
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return value;
+  return parsed.toLocaleString('en', {
+    dateStyle: 'medium',
+    timeStyle: 'short',
+  });
+};
+
+const renderOrderReviewSide = (
+  side: OrderReviewV1['sellSide'] | OrderReviewV1['buySide'],
+  venue: string,
+): string => {
+  const amount = side.amount
+    ? `${side.amount} ${side.asset}`
+    : `Amount provided locally · ${side.asset}`;
+  const offset = reviewOffset(side.offsetBps, venue);
+  return `<section class="order-side">
+    <span class="order-side-label">${escapeHtml(side.label)}</span>
+    <strong class="order-amount">${escapeHtml(amount)}</strong>
+    <div class="order-price">
+      <span>${side.price ? escapeHtml(side.price) : 'Price unavailable'}</span>
+      <small>${escapeHtml(side.priceUnit)}</small>
+    </div>
+    ${offset ? `<span class="price-offset">${escapeHtml(offset)}</span>` : ''}
+  </section>`;
+};
+
+const renderStructuredOrderConfirmation = (
+  prompt: Extract<AgentControlPendingPrompt, { kind: 'confirmation' }>,
+  csrfToken: string,
+  review: OrderReviewV1,
+): string => {
+  const { request } = prompt;
+  const market = review.marketReference;
+  const observedAt = reviewObservedAt(market?.observedAt ?? null);
+  const technicalRows = request.details?.length
+    ? `<dl class="technical">${request.details
+        .map(
+          ({ label, value }) =>
+            `<div><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd></div>`,
+        )
+        .join('')}</dl>`
+    : '';
+  const technicalSteps = request.technicalDetails?.length
+    ? request.technicalDetails
+        .map(
+          (detail, index) =>
+            `<div class="technical-step">
+              <strong>Transaction ${index + 1}: ${escapeHtml(detail.kind)}</strong>
+              <dl class="technical">
+                <div><dt>Step</dt><dd>${escapeHtml(detail.stepId)}</dd></div>
+                <div><dt>Contract</dt><dd>${escapeHtml(detail.contract)}</dd></div>
+                <div><dt>Selector</dt><dd>${escapeHtml(detail.selector)}</dd></div>
+                <div><dt>Calldata digest</dt><dd>${escapeHtml(detail.calldataDigest)}</dd></div>
+                <div><dt>Gas limit</dt><dd>${escapeHtml(detail.gasCap)}</dd></div>
+                <div><dt>Maximum network fee</dt><dd>${escapeHtml(detail.maximumNetworkFeeWei)} wei</dd></div>
+              </dl>
+            </div>`,
+        )
+        .join('')
+    : '';
+  const acknowledgements = request.acknowledgements?.length
+    ? `<fieldset class="acknowledgements">
+        <legend>Required acknowledgements</legend>
+        ${request.acknowledgements
+          .map(
+            (acknowledgement, index) =>
+              `<label class="ack"><input type="checkbox" name="ack${index}" value="yes" required> ${escapeHtml(acknowledgement)}</label>`,
+          )
+          .join('')}
+      </fieldset>`
+    : '';
+  const counterparty = request.counterparty
+    ? `<div><dt>Full counterparty</dt><dd>${escapeHtml(request.counterparty)}</dd></div>`
+    : '';
+  const spender = request.spender
+    ? `<div><dt>Allowance spender</dt><dd>${escapeHtml(request.spender)}</dd></div>`
+    : '';
+  const source = market?.sourceId
+    ? `<div><dt>Market reference source</dt><dd>${escapeHtml(market.sourceId)}</dd></div>`
+    : '';
+  const timestamp = market?.observedAt
+    ? `<div><dt>Market reference timestamp</dt><dd>${escapeHtml(market.observedAt)}</dd></div>`
+    : '';
+  return `<section class="approval-card order-review-card" aria-labelledby="approval-title">
+    <header class="order-review-header">
+      <div>
+        <span class="kicker">Review order</span>
+        <h1 id="approval-title">${escapeHtml(review.title)}</h1>
+        <strong class="order-pair">${escapeHtml(review.pair)}</strong>
+      </div>
+      <span class="step">Complete action</span>
+    </header>
+    <div class="eyebrow-row order-badges" aria-label="Order classifications">
+      ${review.badges
+        .map(
+          (badge, index) =>
+            `<span class="badge${index === 0 ? ' badge-purple' : ''}">${escapeHtml(badge)}</span>`,
+        )
+        .join('')}
+    </div>
+    <div class="order-sides" aria-label="Recurring order liquidity and prices">
+      ${renderOrderReviewSide(
+        review.sellSide,
+        market?.venue ?? 'market',
+      )}
+      ${renderOrderReviewSide(
+        review.buySide,
+        market?.venue ?? 'market',
+      )}
+    </div>
+    ${
+      market
+        ? `<section class="market-reference" aria-label="Market reference">
+            <div>
+              <span>Market reference</span>
+              <strong>${escapeHtml(market.venue)}</strong>
+            </div>
+            ${
+              market.price
+                ? `<div>
+                    <span>Reference price</span>
+                    <strong>${escapeHtml(market.price)} <small>${escapeHtml(market.priceUnit)}</small></strong>
+                  </div>`
+                : ''
+            }
+            ${
+              observedAt
+                ? `<div>
+                    <span>Observed</span>
+                    <strong>${escapeHtml(observedAt)}</strong>
+                  </div>`
+                : ''
+            }
+          </section>`
+        : ''
+    }
+    <section class="order-costs" aria-label="Order costs">
+      <div>
+        <span>Protocol fee</span>
+        <strong>${escapeHtml(review.protocolFeeCoti)}</strong>
+      </div>
+      <div>
+        <span>Maximum network cost</span>
+        <strong>${escapeHtml(review.maximumNetworkFeeCoti ?? 'Calculated before signing')}</strong>
+      </div>
+    </section>
+    <div class="order-explanations">
+      <p>${escapeHtml(review.recurringExplanation)}</p>
+      <p>${escapeHtml(review.privacyExplanation)}</p>
+      <p class="confirmation-scope">${escapeHtml(review.confirmationExplanation)}</p>
+    </div>
+    <details class="technical-disclosure">
+      <summary>Technical and security details</summary>
+      <dl class="technical">
+        <div><dt>Wallet</dt><dd>${escapeHtml(request.wallet)}</dd></div>
+        <div><dt>Contract</dt><dd>${escapeHtml(request.contract)}</dd></div>
+        ${counterparty}
+        ${spender}
+        <div><dt>Protocol fee (exact)</dt><dd>${escapeHtml(request.fee)}</dd></div>
+        <div><dt>Native value</dt><dd>${escapeHtml(request.nativeValue)}</dd></div>
+        <div><dt>Gas limit</dt><dd>${escapeHtml(request.gasCap)}</dd></div>
+        <div><dt>Operation hash</dt><dd>${escapeHtml(request.operationHash)}</dd></div>
+        <div><dt>Step identifier</dt><dd>${escapeHtml(request.stepId)}</dd></div>
+        ${source}
+        ${timestamp}
+      </dl>
+      ${technicalRows}
+      ${technicalSteps}
+    </details>
+    <form method="post" action="/action">
+      <input type="hidden" name="csrf" value="${escapeHtml(csrfToken)}">
+      <input type="hidden" name="promptId" value="${escapeHtml(prompt.id)}">
+      <input type="hidden" name="intent" value="prompt">
+      ${renderAutonomyEditor(request)}
+      ${acknowledgements}
+      <div class="actions">
+        <button class="button button-secondary" name="action" value="decline" formnovalidate>Decline</button>
+        <button class="button button-primary" name="action" value="confirm">${escapeHtml(review.confirmLabel)}</button>
+      </div>
+    </form>
+  </section>`;
+};
+
 const renderConfirmation = (
   prompt: Extract<AgentControlPendingPrompt, { kind: 'confirmation' }>,
   csrfToken: string,
 ): string => {
   const { request } = prompt;
+  const structuredRequest =
+    request as ConfirmationRequestWithOrderReview;
+  if (structuredRequest.orderReview) {
+    return renderStructuredOrderConfirmation(
+      prompt,
+      csrfToken,
+      structuredRequest.orderReview,
+    );
+  }
   const basePresentation = actionPresentation(request.action);
   const isRecurring = request.action === 'create_recurring';
   const isPrivateRecurring =
@@ -693,6 +920,199 @@ const redactDiagnostic = (value: string): string => {
     return '[redacted]';
   }
   return value.replace(/\b0x[0-9a-f]{64}\b/giu, '[redacted]');
+};
+
+const activitySourceLabel = (
+  entry: ActivityEntryV1,
+): string =>
+  entry.source === 'on-chain'
+    ? 'Wallet activity'
+    : entry.source === 'merged'
+      ? 'Signer + on-chain'
+      : 'This signer';
+
+const activityStatusLabel = (status: string): string =>
+  ({
+    queued: 'Queued',
+    needs_setup: 'Setup required',
+    needs_reprepare: 'Review again',
+    needs_private_input: 'Private input required',
+    needs_confirmation: 'Waiting for approval',
+    signing: 'Signing',
+    broadcasting: 'Broadcasting',
+    confirming: 'Confirming on-chain',
+    uncertain: 'Checking on-chain',
+    completed: 'Completed',
+    declined: 'Declined',
+    failed: 'Failed',
+  })[status] ?? humanize(status);
+
+const activityTerms = (entry: ActivityEntryV1): string => {
+  const rows = [
+    ...(entry.amounts ?? []),
+    ...(entry.prices ?? []),
+    ...(entry.fee ? [`Fees: ${entry.fee}`] : []),
+  ];
+  return rows.length
+    ? `<ul class="activity-terms">${rows
+        .map((value) => `<li>${escapeHtml(value)}</li>`)
+        .join('')}</ul>`
+    : '';
+};
+
+const renderActivityEntry = (
+  entry: ActivityEntryV1,
+  expanded = false,
+): string => {
+  const orderUrl = safeTransactionUrl(entry.orderUrl);
+  const transactionUrls = entry.transactionUrls
+    .map((value) => safeTransactionUrl(value))
+    .filter((value): value is string => Boolean(value));
+  const updated = Number.isNaN(Date.parse(entry.updatedAt))
+    ? entry.updatedAt
+    : new Date(entry.updatedAt).toLocaleString('en', {
+        dateStyle: 'medium',
+        timeStyle: 'short',
+      });
+  const links = [
+    ...(orderUrl
+      ? [
+          `<a href="${escapeHtml(orderUrl)}" target="_blank" rel="noreferrer noopener">View order</a>`,
+        ]
+      : []),
+    ...(transactionUrls.length
+      ? [
+          `<a href="${escapeHtml(transactionUrls.at(-1)!)}" target="_blank" rel="noreferrer noopener">View transaction</a>`,
+        ]
+      : []),
+  ].join('');
+  const details =
+    expanded ||
+    entry.amounts?.length ||
+    entry.prices?.length ||
+    entry.fee ||
+    entry.operationId
+      ? `<details class="activity-details"${expanded ? ' open' : ''}>
+          <summary>Trade details</summary>
+          ${activityTerms(entry)}
+          <dl class="technical">
+            ${entry.orderTypeLabel ? `<div><dt>Order type</dt><dd>${escapeHtml(entry.orderTypeLabel)}</dd></div>` : ''}
+            ${entry.access ? `<div><dt>Access</dt><dd>${escapeHtml(humanize(entry.access))}</dd></div>` : ''}
+            ${entry.privacy ? `<div><dt>Privacy</dt><dd>${escapeHtml(humanize(entry.privacy))}</dd></div>` : ''}
+            ${entry.operationId ? `<div><dt>Local operation</dt><dd>${escapeHtml(entry.operationId)}</dd></div>` : ''}
+            ${entry.orderHandle ? `<div><dt>Order handle</dt><dd>${escapeHtml(entry.orderHandle)}</dd></div>` : ''}
+          </dl>
+        </details>`
+      : '';
+  return `<li class="activity-entry">
+    <div class="activity-main">
+      <div class="activity-title">
+        <span class="activity-kind">${escapeHtml(humanize(entry.activityType))} · ${escapeHtml(activitySourceLabel(entry))}</span>
+        <strong>${escapeHtml(entry.pair ?? entry.label)}</strong>
+        ${entry.pair && entry.label !== entry.pair ? `<small>${escapeHtml(entry.label)}</small>` : ''}
+      </div>
+      <div class="activity-state">
+        <span class="status-pill status-${escapeHtml(entry.status)}">${escapeHtml(activityStatusLabel(entry.status))}</span>
+        <small>${escapeHtml(updated)}</small>
+      </div>
+    </div>
+    ${details}
+    ${links ? `<div class="activity-links">${links}</div>` : ''}
+  </li>`;
+};
+
+const renderActivity = (
+  summary: AgentControlSummary,
+  csrfToken: string,
+): string => {
+  const activity = summary.activity;
+  if (!activity) return '';
+  const recent = activity.recentEntries;
+  const recentRows = recent.length
+    ? recent.map((entry) => renderActivityEntry(entry)).join('')
+    : '<li class="empty">No ChainWhisper activity for this wallet yet.</li>';
+  const historyRows = activity.entries.length
+    ? activity.entries
+        .map((entry) => renderActivityEntry(entry, true))
+        .join('')
+    : '<li class="empty">No activity on this page.</li>';
+  const pageControls =
+    activity.hasPrevious || activity.hasNext
+      ? `<form method="post" action="/action" class="history-pagination">
+          <input type="hidden" name="csrf" value="${escapeHtml(csrfToken)}">
+          <input type="hidden" name="intent" value="control">
+          <button class="button button-secondary button-small" name="action" value="history-previous"${activity.hasPrevious ? '' : ' disabled'}>Previous</button>
+          <span>Page ${activity.page + 1}</span>
+          <button class="button button-secondary button-small" name="action" value="history-next"${activity.hasNext ? '' : ' disabled'}>Next</button>
+        </form>`
+      : '';
+  return `<section class="dashboard-card activity-card" aria-labelledby="activity-title">
+    <div class="card-heading">
+      <div><span class="kicker">Activity</span><h2 id="activity-title">Recent activity</h2></div>
+      <small>Signer actions and wallet-wide ChainWhisper trades</small>
+    </div>
+    <ul class="activity-list">${recentRows}</ul>
+    <details class="history-view">
+      <summary>Full history</summary>
+      <div class="history-body">
+        <ul class="activity-list activity-list-full">${historyRows}</ul>
+        ${pageControls}
+      </div>
+    </details>
+  </section>`;
+};
+
+const renderFocusedOperation = (
+  summary: AgentControlSummary,
+  csrfToken: string,
+): string | null => {
+  const operationId = summary.focusedOperationId;
+  if (!operationId) return null;
+  const entry = [
+    ...(summary.activity?.recentEntries ?? []),
+    ...(summary.activity?.entries ?? []),
+  ].find((candidate) => candidate.operationId === operationId);
+  const fallback = summary.recentOperations?.find(
+    (candidate) => candidate.operationId === operationId,
+  );
+  if (!entry && !fallback) return null;
+  const status = entry?.status ?? fallback?.status ?? 'queued';
+  const sent = entry?.transactionUrls.length ?? 0;
+  const total = entry?.networkTransactionCount;
+  const progress =
+    total && total > 1
+      ? `${Math.min(sent, total)} of ${total} network transactions submitted`
+      : sent
+        ? `${sent} network transaction${sent === 1 ? '' : 's'} submitted`
+        : 'Preparing the authorized transactions';
+  const transactionLinks = entry?.transactionUrls
+    .map((url, index) => {
+      const safe = safeTransactionUrl(url);
+      return safe
+        ? `<a href="${escapeHtml(safe)}" target="_blank" rel="noreferrer noopener">Transaction ${index + 1}</a>`
+        : '';
+    })
+    .join('');
+  const orderUrl = safeTransactionUrl(entry?.orderUrl);
+  return `<section class="approval-card focused-operation" aria-labelledby="focused-operation-title">
+    <div class="order-review-header">
+      <div>
+        <span class="kicker">Order progress</span>
+        <h1 id="focused-operation-title">${escapeHtml(entry?.pair ?? entry?.label ?? fallback?.label ?? 'ChainWhisper action')}</h1>
+        <span class="status-pill status-${escapeHtml(status)}">${escapeHtml(activityStatusLabel(status))}</span>
+      </div>
+    </div>
+    <progress class="progress-track"${total ? ` value="${Math.min(sent, total)}" max="${total}"` : ''} aria-label="${escapeHtml(progress)}"></progress>
+    <p class="lead">${escapeHtml(progress)}. One approval authorizes the complete order, even when the network requires several transactions.</p>
+    ${entry ? activityTerms(entry) : ''}
+    ${orderUrl ? `<a class="button button-secondary" href="${escapeHtml(orderUrl)}" target="_blank" rel="noreferrer noopener">View order</a>` : ''}
+    ${transactionLinks ? `<div class="activity-links">${transactionLinks}</div>` : ''}
+    <form method="post" action="/action" class="actions">
+      <input type="hidden" name="csrf" value="${escapeHtml(csrfToken)}">
+      <input type="hidden" name="intent" value="control">
+      <button class="button button-primary" name="action" value="dismiss-focused-operation">Back to dashboard</button>
+    </form>
+  </section>`;
 };
 
 const renderWalletSetup = (
@@ -1055,6 +1475,15 @@ const renderControlSummary = (
   const configuredState = renderConfiguredWalletState(summary, csrfToken);
   const walletSettings = renderWalletSettings(summary, csrfToken);
   const balances = renderBalances(summary, csrfToken);
+  const activity = renderActivity(summary, csrfToken);
+  const hasRecoveryControls = Boolean(
+    summary.recentOperations?.some(
+      (operation) =>
+        operation.recoverable ||
+        operation.discardable ||
+        operation.setupAssets?.length,
+    ),
+  );
   const walletInputId = 'agent-wallet-address';
   return `${configuredState}<section class="control-overview" aria-labelledby="control-title">
     <header class="dashboard-header">
@@ -1086,13 +1515,17 @@ const renderControlSummary = (
         ${budgetRows}
         ${autonomyControls}
       </section>
-      <section class="dashboard-card" aria-labelledby="operations-title">
-        <div class="card-heading">
-          <div><span class="kicker">Activity</span><h2 id="operations-title">Recent operations</h2></div>
-          <span class="badge">${escapeHtml(String(summary.pendingOperations ?? 0))} pending</span>
-        </div>
-        <ul class="operation-list">${operations}</ul>
-      </section>
+      ${activity || `<section class="dashboard-card" aria-labelledby="operations-title">
+          <div class="card-heading">
+            <div><span class="kicker">Activity</span><h2 id="operations-title">Recent operations</h2></div>
+            <span class="badge">${escapeHtml(String(summary.pendingOperations ?? 0))} pending</span>
+          </div>
+          <ul class="operation-list">${operations}</ul>
+        </section>`}
+      ${hasRecoveryControls ? `<details class="settings-section">
+        <summary><span><strong>Recovery controls</strong><small>${escapeHtml(String(summary.pendingOperations ?? 0))} pending local operations</small></span></summary>
+        <div class="settings-body"><ul class="operation-list">${operations}</ul></div>
+      </details>` : ''}
       ${walletSettings}
       <details class="settings-section diagnostics-section">
         <summary><span><strong>Diagnostics</strong><small>Redacted local signer details</small></span></summary>
@@ -1109,7 +1542,12 @@ button,input{font:inherit}a{color:#cbb4ff}a:hover{color:#fff}.shell{width:min(10
 .approval-card,.control-overview{border:1px solid var(--line);border-radius:24px;background:linear-gradient(145deg,rgba(23,18,33,.98),rgba(12,10,18,.98));box-shadow:var(--shadow);padding:clamp(22px,5vw,46px)}.approval-card{max-width:840px;margin:2vh auto 88px}.eyebrow-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.badge{display:inline-flex;align-items:center;min-height:26px;padding:3px 9px;border:1px solid var(--line);border-radius:999px;color:#cfc4dd;background:#14101d;font-size:12px;font-weight:650}.badge-purple{border-color:#633fa0;color:#e5d8ff;background:var(--purple-soft)}.step{margin-left:auto;color:var(--muted);font-size:13px}h1{font-size:clamp(28px,5vw,44px);line-height:1.08;letter-spacing:-.045em;margin:20px 0 12px}h2{margin:12px 0 4px;font-size:22px;letter-spacing:-.025em}.lead{max-width:680px;margin:0 0 20px;color:#c8bfd3;font-size:16px}.order-type{margin:16px 0;padding:14px 16px;border:1px solid #4e3575;border-radius:14px;background:linear-gradient(90deg,rgba(70,41,108,.42),rgba(30,19,44,.52))}.order-type span,.result span,.wallet-card span,.stats span,.summary-row span,.panel-heading,.kicker{display:block;color:var(--muted);font-size:12px;font-weight:650;letter-spacing:.045em;text-transform:uppercase}.order-type strong{display:block;margin-top:5px;font-size:17px}.recurring-note{margin:10px 0;color:#d7cae8}.exposure{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));overflow:hidden;margin:14px 0;border:1px solid #4a3963;border-radius:16px;background:#0c0911}.exposure .summary-row{min-height:82px;padding:15px 18px;border-right:1px solid #332641}.exposure .summary-row:last-child{border-right:0}.exposure strong{display:block;margin-top:8px;font-size:20px;line-height:1.25}.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:1px;overflow:hidden;margin:14px 0;border:1px solid var(--line-soft);border-radius:14px;background:var(--line-soft)}.stats>div{min-height:70px;padding:13px;background:#100d18}.stats strong{display:block;margin-top:5px;overflow-wrap:anywhere}.details-grid{margin:14px 0}.details-grid .summary-row{display:flex;justify-content:space-between;gap:24px;padding:9px 0;border-bottom:1px solid var(--line-soft)}.details-grid .summary-row strong{text-align:right;overflow-wrap:anywhere}.result,.privacy-note{margin:16px 0;padding:14px 16px;border-left:3px solid var(--purple);border-radius:4px 12px 12px 4px;background:#110d19}.result p{margin:4px 0 0}.privacy-note{color:#d7cae8;border-left-color:var(--amber)}details{margin:16px 0;border:1px solid var(--line-soft);border-radius:12px;background:#0d0a12}summary{cursor:pointer;padding:14px 16px;color:#c9bdd7;font-weight:650}.technical{margin:0;padding:0 16px 14px}.technical>div{display:grid;grid-template-columns:150px minmax(0,1fr);gap:14px;padding:8px 0;border-top:1px solid var(--line-soft)}dt{color:var(--muted)}dd{margin:0;overflow-wrap:anywhere;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12px}.actions{position:fixed;z-index:5;left:50%;bottom:0;transform:translateX(-50%);display:flex;justify-content:flex-end;gap:10px;width:min(840px,calc(100% - 24px));padding:12px 0 max(12px,env(safe-area-inset-bottom));border-top:1px solid var(--line);background:rgba(7,6,11,.96);box-shadow:0 -18px 38px rgba(0,0,0,.35)}.control-actions{display:flex;justify-content:flex-end;gap:10px;margin-top:24px}.button{min-height:46px;padding:10px 17px;border:1px solid transparent;border-radius:11px;font-weight:740;cursor:pointer}.button:disabled{cursor:wait;opacity:.7}.button:focus-visible,input:focus-visible,summary:focus-visible,a:focus-visible{outline:3px solid #c6a7ff;outline-offset:3px}.button-primary{color:#0d0618;background:linear-gradient(135deg,#bb94ff,#8c54ef);box-shadow:0 8px 30px rgba(139,83,239,.25)}.button-primary:hover{filter:brightness(1.08)}.button-secondary{color:var(--text);border-color:#493b5d;background:#1b1624}.button-warning{color:#201400;border-color:#a66d13;background:var(--amber)}.button-danger{color:#23030a;border-color:#a8334c;background:var(--red)}.field{margin:22px 0}.field label{display:block;margin-bottom:5px;font-weight:720;font-size:16px}.field p{margin:0 0 9px;color:var(--muted)}.field input{width:100%;min-height:48px;padding:10px 13px;border:1px solid #4b3b60;border-radius:11px;background:#09070d;color:var(--text)}.notice{max-width:840px;margin:0 auto 16px;padding:12px 15px;border:1px solid #3b6d59;border-radius:12px;background:#10231c;color:#b9f3d9}.notice-error{border-color:#773447;background:#291018;color:#ffc1ce}
 .section-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:20px;margin-bottom:24px}.section-heading h1,.section-heading h2{margin:4px 0 0}.status-dot{display:flex;align-items:center;gap:8px;color:#d9d0e5;font-size:13px}.status-dot i{width:8px;height:8px;border-radius:50%;background:var(--green);box-shadow:0 0 12px rgba(84,223,165,.65)}.wallet-card{display:grid;grid-template-columns:2fr repeat(3,1fr);gap:1px;overflow:hidden;border:1px solid var(--line);border-radius:16px;background:var(--line)}.wallet-card>div{padding:16px 18px;background:#100d18}.wallet-card strong{display:block;margin-top:6px}.wallet-address{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}.panel-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-top:14px}.panel{min-height:190px;padding:20px;border:1px solid var(--line-soft);border-radius:16px;background:rgba(12,10,18,.72)}.panel-wide{grid-column:1/-1}.panel-heading{display:flex;justify-content:space-between;gap:16px;align-items:center}.muted{color:var(--muted)}.compact{margin-top:24px}.operation-list{list-style:none;margin:12px 0 0;padding:0}.operation-list li{display:flex;align-items:center;justify-content:space-between;gap:20px;padding:12px 0;border-top:1px solid var(--line-soft)}.operation-list li span{display:flex;flex-direction:column}.operation-list small{color:var(--muted)}.operation-list .empty{color:var(--muted)}.operation-actions{display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap}.operation-actions form{margin:0}.operation-actions .button{min-height:36px;padding:6px 10px}.diagnostics{margin:12px 0 0}.diagnostics>div{display:grid;grid-template-columns:minmax(120px,1fr) 2fr;gap:18px;padding:9px 0;border-top:1px solid var(--line-soft)}.diagnostics dd{font-family:inherit;font-size:13px}.footer{max-width:760px;margin:22px auto 0;color:#7e738d;text-align:center;font-size:12px}.mono{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}.wallet-setup{margin-bottom:14px;border:1px solid #4e3575;border-radius:24px;background:linear-gradient(145deg,rgba(31,21,46,.98),rgba(12,10,18,.98));box-shadow:var(--shadow);padding:clamp(22px,5vw,40px)}.setup-grid{display:grid;grid-template-columns:1.15fr .85fr;gap:14px}.setup-card,.wallet-backup{padding:20px;border:1px solid var(--line);border-radius:16px;background:#0d0a13}.setup-card{display:flex;flex-direction:column;gap:10px}.setup-card h3,.wallet-backup h2{margin:4px 0 0}.setup-card label,.copy-field label{font-weight:700}.setup-card>input,.copy-field input{width:100%;min-height:46px;padding:10px 12px;border:1px solid #4b3b60;border-radius:10px;background:#09070d;color:var(--text)}.setup-card .button{margin-top:auto}.ack{display:flex;align-items:flex-start;gap:8px;color:#d7cae8;font-weight:500!important}.ack input{margin-top:5px}.acknowledgements{display:grid;gap:12px;margin:20px 0;padding:16px 18px;border:1px solid #7251a1;border-radius:12px}.acknowledgements legend{padding:0 8px;color:#e3d5f8;font-weight:750}.wallet-backup{margin:16px 0;border-color:#7354a2}.copy-field{margin-top:14px}.copy-field>div{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;margin-top:6px}.copy-field input{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}.copy-field .button{min-height:46px}.policy-editor{margin:22px 0;padding:18px;border:1px solid #5d4381;border-radius:14px;background:#0b0810}.policy-editor h2{margin:0}.policy-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin-top:16px}.policy-grid label{display:flex;flex-direction:column;gap:6px;color:#d8cde5;font-size:13px;font-weight:650}.policy-grid input{min-height:42px;padding:8px 10px;border:1px solid #4b3b60;border-radius:9px;background:#09070d;color:var(--text)}.policy-grid .ack{flex-direction:row}.policy-fields{display:grid;gap:10px;margin:0;padding:12px;border:1px solid var(--line-soft);border-radius:10px}.policy-fields legend{padding:0 6px;color:var(--muted)}.policy-wide{grid-column:1/-1}.price-band{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;padding-top:10px;border-top:1px solid var(--line-soft)}.price-band>strong{grid-column:1/-1}
 .sr-only{position:absolute!important;width:1px!important;height:1px!important;padding:0!important;margin:-1px!important;overflow:hidden!important;clip:rect(0,0,0,0)!important;white-space:nowrap!important;border:0!important}.control-overview{padding:0;border:0;border-radius:0;background:none;box-shadow:none}.dashboard-header{display:flex;align-items:flex-start;justify-content:space-between;gap:24px;margin-bottom:18px;padding:2px 2px 0}.dashboard-title h1{margin:2px 0 0;font-size:clamp(26px,4vw,34px);font-family:ui-monospace,SFMono-Regular,Consolas,monospace;letter-spacing:-.04em}.address-line{display:flex;align-items:center;gap:10px}.copy-icon{min-height:34px;padding:6px 10px;border:1px solid var(--line);border-radius:9px;color:#d9cdee;background:#15111d;font:inherit;font-size:12px;font-weight:700;cursor:pointer}.status-chips{display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap}.dashboard-stack{display:grid;gap:12px}.dashboard-card,.settings-section{margin:0;border:1px solid var(--line-soft);border-radius:16px;background:rgba(16,13,24,.84);box-shadow:0 10px 32px rgba(0,0,0,.16)}.dashboard-card{padding:20px}.card-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:20px}.card-heading h2{margin:3px 0 0;font-size:20px}.refresh-block{display:flex;align-items:center;justify-content:flex-end;gap:10px;color:var(--muted);text-align:right}.button-small{min-height:36px;width:auto;padding:6px 11px;font-size:13px}.inline-control{margin:0}.balance-list{list-style:none;margin:12px 0 0;padding:0}.balance-row{display:grid;grid-template-columns:minmax(0,1fr) minmax(160px,auto);align-items:center;gap:20px;min-height:62px;padding:10px 2px;border-top:1px solid var(--line-soft)}.asset-identity>span{display:flex;flex-direction:column}.asset-identity small{color:var(--muted)}.asset-value{text-align:right}.asset-value>strong{display:block;font-size:16px}.asset-value .inline-control{margin-top:7px}.exact-balance{display:inline-block;margin:3px 0 0;border:0;background:none;text-align:left}.exact-balance summary{padding:0;color:var(--muted);font-size:11px;font-weight:600}.exact-balance code{display:block;max-width:340px;margin-top:5px;padding:7px;border:1px solid var(--line-soft);border-radius:8px;background:#09070d;color:#dacde8;overflow-wrap:anywhere;white-space:normal}.all-assets{margin:10px 0 0;background:#0c0911}.all-assets>summary{display:flex;align-items:center;justify-content:space-between}.all-assets>summary span{display:grid;place-items:center;min-width:24px;height:24px;border-radius:999px;background:var(--purple-soft);color:#d9c5ff;font-size:12px}.all-assets>.balance-list{margin:0;padding:0 14px 8px}.mode-card .details-grid{max-width:620px}.privacy-banner{display:flex;align-items:center;justify-content:space-between;gap:20px;margin-bottom:12px;padding:14px 16px;border:1px solid #554078;border-radius:14px;background:#171022}.privacy-banner>div{display:flex;flex-direction:column}.privacy-banner span{color:var(--muted)}.privacy-banner .button{min-height:40px}.settings-section>summary{display:flex;align-items:center;justify-content:space-between;margin:0;padding:17px 20px;list-style-position:inside}.settings-section>summary span{display:flex;flex-direction:column;gap:2px}.settings-section>summary small{color:var(--muted);font-weight:500}.settings-body{padding:0 20px 20px}.settings-summary{margin:0}.settings-summary>div{display:grid;grid-template-columns:160px minmax(0,1fr);gap:18px;padding:9px 0;border-top:1px solid var(--line-soft)}.settings-summary dd{font-family:inherit;font-size:13px}.replacement-settings{margin:14px 0 0}.replacement-body{padding:0 14px 14px}.settings-warning{padding:10px 12px;border:1px solid #773447;border-radius:10px;background:#291018;color:#ffc1ce}.priority-state{max-width:none;margin:0 0 12px}.diagnostics-section .diagnostics{margin-top:0}
-@media(max-width:760px){.shell{width:min(100% - 20px,1080px);padding-top:16px}.topbar{margin-bottom:20px}.local-label{display:none}.approval-card,.wallet-setup{border-radius:18px;padding:22px}.control-overview{padding:0}.approval-card{margin-bottom:150px}.step{width:100%;margin:2px 0 0}.exposure,.wallet-card,.panel-grid,.setup-grid,.policy-grid,.price-band{grid-template-columns:1fr}.exposure .summary-row{border-right:0;border-bottom:1px solid #332641}.stats{grid-template-columns:1fr}.wallet-card>div:first-child{grid-column:1}.panel-wide,.policy-wide,.price-band>strong{grid-column:auto}.technical>div{grid-template-columns:1fr;gap:3px}.actions,.control-actions{flex-direction:column-reverse}.button{width:100%}.button-small,.copy-icon{width:auto}.section-heading,.dashboard-header,.card-heading,.privacy-banner{align-items:stretch;flex-direction:column}.status-chips{justify-content:flex-start}.refresh-block{align-items:flex-start;justify-content:flex-start;text-align:left}.details-grid .summary-row{flex-direction:column;gap:4px}.details-grid .summary-row strong{text-align:left}.copy-field>div{grid-template-columns:1fr}.dashboard-card{padding:16px}.balance-row{grid-template-columns:minmax(0,1fr);gap:8px}.asset-value{text-align:left}.settings-summary>div{grid-template-columns:1fr;gap:3px}.operation-list li{align-items:flex-start;flex-direction:column}.operation-actions{justify-content:flex-start}.address-line{align-items:flex-start;flex-wrap:wrap}.dashboard-title h1{font-size:24px}.privacy-banner .button{width:100%}}
+.activity-card>.card-heading>small{max-width:320px;color:var(--muted);text-align:right}.activity-list{list-style:none;margin:12px 0 0;padding:0}.activity-entry{padding:14px 0;border-top:1px solid var(--line-soft)}.activity-main{display:flex;align-items:flex-start;justify-content:space-between;gap:18px}.activity-title,.activity-state{display:flex;min-width:0;flex-direction:column}.activity-title strong{font-size:16px;overflow-wrap:anywhere}.activity-title small,.activity-state small,.activity-kind{color:var(--muted);font-size:11px}.activity-kind{font-weight:700;letter-spacing:.045em;text-transform:uppercase}.activity-state{align-items:flex-end;text-align:right}.status-pill{display:inline-flex;align-items:center;min-height:26px;padding:3px 9px;border:1px solid #493b5d;border-radius:999px;background:#171221;color:#d9cdee;font-size:12px;font-weight:700}.status-completed{border-color:#286d52;background:#102a20;color:#a7f1d2}.status-failed,.status-declined{border-color:#773447;background:#291018;color:#ffc1ce}.status-signing,.status-broadcasting,.status-confirming{border-color:#654698;background:#24183a;color:#e2d1ff}.activity-details{margin:10px 0 0;background:#0b0910}.activity-details>summary{padding:9px 11px;font-size:12px}.activity-terms{display:grid;gap:4px;margin:0;padding:0 14px 12px;list-style:none;color:#d8cede}.activity-terms li{overflow-wrap:anywhere}.activity-links{display:flex;gap:12px;flex-wrap:wrap;margin-top:8px;font-size:13px}.history-view{margin:12px 0 0;background:#0b0910}.history-view>summary{display:flex;justify-content:space-between}.history-body{padding:0 14px 14px}.activity-list-full{margin-top:0}.history-pagination{display:flex;align-items:center;justify-content:center;gap:12px;margin-top:14px}.focused-operation .progress-track{height:8px;margin:18px 0 12px;overflow:hidden;border-radius:999px;background:#241c30}.progress-track span{display:block;width:64%;height:100%;border-radius:inherit;background:linear-gradient(90deg,var(--purple),#c3a2ff)}.focused-operation .activity-terms{padding:12px 0}.focused-operation>.button{width:100%;margin-top:8px}
+.shell-wide{width:min(1460px,calc(100% - 32px))}.agent-workspace{display:grid;grid-template-columns:minmax(0,1fr) minmax(390px,520px);align-items:start;gap:16px}.agent-workspace-single{display:block}.dashboard-surface[inert]{opacity:.64;filter:saturate(.72)}.review-panel[hidden]{display:none!important}.review-panel{position:sticky;top:16px;max-height:calc(100vh - 32px);overflow:auto;overscroll-behavior:contain;border:1px solid #493464;border-radius:20px;background:#0d0a13;box-shadow:0 28px 90px rgba(0,0,0,.55)}.review-panel .approval-card{max-width:none;margin:0;padding:20px;border:0;border-radius:20px;background:linear-gradient(155deg,rgba(27,19,40,.98),rgba(10,8,15,.99));box-shadow:none}.review-panel .actions{position:sticky;left:auto;bottom:0;transform:none;width:auto;margin:18px -20px -20px;padding:12px 20px max(12px,env(safe-area-inset-bottom));background:rgba(10,8,15,.97)}.order-review-header{display:flex;align-items:flex-start;justify-content:space-between;gap:16px}.order-review-header h1{margin:4px 0 2px;font-size:clamp(25px,3vw,34px)}.order-pair{display:block;font-size:18px}.order-badges{margin:14px 0}.order-sides{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));overflow:hidden;border:1px solid #493464;border-radius:16px;background:#0a080e}.order-side{display:flex;min-width:0;flex-direction:column;padding:16px}.order-side+ .order-side{border-left:1px solid #352741}.order-side-label,.market-reference span,.order-costs span{color:var(--muted);font-size:11px;font-weight:700;letter-spacing:.045em;text-transform:uppercase}.order-amount{margin:4px 0 13px;font-size:20px;line-height:1.2}.order-price{display:flex;flex-direction:column;margin-top:auto}.order-price>span{font-size:17px;font-weight:760;overflow-wrap:anywhere}.order-price small{color:var(--muted);font-size:11px}.price-offset{align-self:flex-start;margin-top:8px;padding:3px 8px;border-radius:999px;background:#1f1830;color:#d7c4fa;font-size:11px;font-weight:720}.market-reference{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:1px;overflow:hidden;margin-top:10px;border:1px solid var(--line-soft);border-radius:12px;background:var(--line-soft)}.market-reference>div{padding:10px 12px;background:#100d18}.market-reference strong{display:block;margin-top:3px;font-size:12px;overflow-wrap:anywhere}.market-reference strong small{color:var(--muted);font-weight:500}.order-costs{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1px;overflow:hidden;margin-top:10px;border:1px solid var(--line-soft);border-radius:12px;background:var(--line-soft)}.order-costs>div{padding:11px 12px;background:#100d18}.order-costs strong{display:block;margin-top:3px}.order-explanations{margin:12px 0;color:#c9bfd5;font-size:13px}.order-explanations p{margin:6px 0}.confirmation-scope{padding:10px 12px;border-left:3px solid var(--purple);border-radius:4px 10px 10px 4px;background:#151020}.technical-disclosure{margin-bottom:0}.technical-step{padding:0 16px 14px}.technical-step>strong{display:block;margin-bottom:7px}.review-panel .result{margin:12px 0}.review-panel .lead{font-size:14px}.review-panel .policy-editor{margin:16px 0}
+.focused-operation progress.progress-track{display:block;width:100%;border:0;appearance:none}.focused-operation progress.progress-track::-webkit-progress-bar{border-radius:999px;background:#241c30}.focused-operation progress.progress-track::-webkit-progress-value{border-radius:999px;background:linear-gradient(90deg,var(--purple),#c3a2ff)}.focused-operation progress.progress-track::-moz-progress-bar{border-radius:999px;background:linear-gradient(90deg,var(--purple),#c3a2ff)}
+@media(max-width:960px){.agent-workspace{grid-template-columns:minmax(0,1fr) minmax(360px,46vw)}.market-reference{grid-template-columns:1fr}}
+@media(max-width:760px){.shell,.shell-wide{width:min(100% - 20px,1080px);padding-top:16px}.topbar{margin-bottom:20px}.local-label{display:none}.agent-workspace{display:block}.dashboard-surface[inert]{display:none}.review-panel{position:static;max-height:none;overflow:visible;border-radius:18px}.approval-card,.wallet-setup{border-radius:18px;padding:22px}.review-panel .approval-card{padding:18px}.review-panel .actions{margin:18px -18px -18px;padding-inline:18px}.control-overview{padding:0}.approval-card{margin-bottom:150px}.review-panel .approval-card{margin-bottom:0}.step{width:100%;margin:2px 0 0}.order-review-header{flex-direction:column}.order-sides,.exposure,.wallet-card,.panel-grid,.setup-grid,.policy-grid,.price-band{grid-template-columns:1fr}.order-side+ .order-side{border-top:1px solid #352741;border-left:0}.exposure .summary-row{border-right:0;border-bottom:1px solid #332641}.stats,.order-costs{grid-template-columns:1fr}.wallet-card>div:first-child{grid-column:1}.panel-wide,.policy-wide,.price-band>strong{grid-column:auto}.technical>div{grid-template-columns:1fr;gap:3px}.actions,.control-actions{flex-direction:column-reverse}.button{width:100%}.button-small,.copy-icon{width:auto}.section-heading,.dashboard-header,.card-heading,.privacy-banner{align-items:stretch;flex-direction:column}.status-chips{justify-content:flex-start}.refresh-block{align-items:flex-start;justify-content:flex-start;text-align:left}.details-grid .summary-row{flex-direction:column;gap:4px}.details-grid .summary-row strong{text-align:left}.copy-field>div{grid-template-columns:1fr}.dashboard-card{padding:16px}.balance-row{grid-template-columns:minmax(0,1fr);gap:8px}.asset-value{text-align:left}.settings-summary>div{grid-template-columns:1fr;gap:3px}.operation-list li,.activity-main{align-items:flex-start;flex-direction:column}.operation-actions{justify-content:flex-start}.activity-state{align-items:flex-start;text-align:left}.activity-card>.card-heading>small{text-align:left}.history-pagination{justify-content:space-between}.address-line{align-items:flex-start;flex-wrap:wrap}.dashboard-title h1{font-size:24px}.privacy-banner .button{width:100%}}
+@media(max-width:760px){.agent-workspace{display:flex;flex-direction:column}.review-panel{order:-1}.review-panel .approval-card{padding-bottom:104px}.review-panel .actions{position:fixed;z-index:10;left:0;right:0;bottom:0;width:100%;margin:0;padding:10px max(10px,env(safe-area-inset-left)) max(10px,env(safe-area-inset-bottom));flex-direction:row;background:rgba(10,8,15,.98)}.review-panel .actions .button{width:auto;min-width:0;flex:1}}
 @media(prefers-reduced-motion:no-preference){.control-overview{animation:enter .22s ease-out both}@keyframes enter{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}}
 `;
 
@@ -1117,11 +1555,33 @@ export const renderAgentControlPage = (
   model: AgentControlPageModel,
   cspNonce: string,
 ): string => {
-  const main = model.pending
+  const dashboard = renderControlSummary(
+    model.summary,
+    model.csrfToken,
+  );
+  const prompt = model.pending
     ? model.pending.kind === 'confirmation'
       ? renderConfirmation(model.pending, model.csrfToken)
       : renderPrivateValues(model.pending, model.csrfToken)
-    : renderControlSummary(model.summary, model.csrfToken);
+    : null;
+  const focused = prompt
+    ? null
+    : renderFocusedOperation(model.summary, model.csrfToken);
+  const sidePanel = prompt ?? focused;
+  const dashboardKey = [
+    model.summary.wallet ?? 'no-wallet',
+    model.summary.walletSetup?.required ? 'setup' : 'configured',
+    model.summary.walletSetup?.restartRequired ? 'restart' : 'running',
+  ].join(':');
+  const reviewKey = model.pending
+    ? `prompt:${model.pending.kind}:${model.pending.id}`
+    : model.summary.focusedOperationId
+      ? `operation:${model.summary.focusedOperationId}`
+      : 'none';
+  const main = `<div class="agent-workspace${sidePanel ? '' : ' agent-workspace-single'}" data-agent-workspace>
+      <div class="dashboard-surface" data-dashboard-region data-region-key="${escapeHtml(dashboardKey)}"${prompt ? ' inert aria-hidden="true"' : ''}>${dashboard}</div>
+      <aside class="review-panel" data-review-region data-region-key="${escapeHtml(reviewKey)}" aria-label="${prompt ? 'Pending Agent Control action' : 'Agent Control operation progress'}"${sidePanel ? '' : ' hidden aria-hidden="true"'}>${sidePanel ?? ''}</aside>
+    </div>`;
   const notice = model.error
     ? `<div class="notice notice-error" role="alert">${escapeHtml(model.error)}</div>`
     : model.flash
@@ -1137,17 +1597,198 @@ export const renderAgentControlPage = (
   <style nonce="${escapeHtml(cspNonce)}">${styles}</style>
 </head>
 <body>
-  <div class="shell">
+  <div class="shell${sidePanel ? ' shell-wide' : ''}">
     <header class="topbar">
       <div class="brand"><span>ChainWhisper</span></div>
       <span class="local-label">Agent Control · This device</span>
     </header>
-    ${notice}
+    <div data-notice-region>${notice}</div>
     <main>${main}</main>
     <footer class="footer">Served by the local ChainWhisper signer at 127.0.0.1. Signing credentials never enter the agent conversation.</footer>
   </div>
   <script nonce="${escapeHtml(cspNonce)}">
+    const captureRegionState = (region) => {
+      const controls = Array.from(
+        region.querySelectorAll('input:not([type="hidden"]), textarea, select'),
+      );
+      const focusables = Array.from(
+        region.querySelectorAll('button, input, textarea, select, summary, a[href]'),
+      );
+      const active = region.contains(document.activeElement)
+        ? document.activeElement
+        : null;
+      return {
+        key: region.dataset.regionKey || '',
+        values: controls.map((control) => ({
+          name: control.name || '',
+          type: control.type || control.tagName,
+          value: control.value,
+          checked: 'checked' in control ? control.checked : false,
+        })),
+        disclosures: Array.from(region.querySelectorAll('details')).map(
+          (details) => details.open,
+        ),
+        focusIndex: active ? focusables.indexOf(active) : -1,
+        selection:
+          active instanceof HTMLInputElement &&
+          typeof active.selectionStart === 'number'
+            ? [active.selectionStart, active.selectionEnd]
+            : null,
+        scrollTop: region.scrollTop,
+      };
+    };
+    const restoreRegionState = (region, state) => {
+      if (!state || state.key !== (region.dataset.regionKey || '')) return;
+      const controls = Array.from(
+        region.querySelectorAll('input:not([type="hidden"]), textarea, select'),
+      );
+      controls.forEach((control, index) => {
+        const saved = state.values[index];
+        if (
+          !saved ||
+          saved.name !== (control.name || '') ||
+          saved.type !== (control.type || control.tagName)
+        ) return;
+        if ('checked' in control) control.checked = saved.checked;
+        if (!(control instanceof HTMLInputElement) || control.type !== 'file') {
+          control.value = saved.value;
+        }
+      });
+      Array.from(region.querySelectorAll('details')).forEach(
+        (details, index) => {
+          details.open = Boolean(state.disclosures[index]);
+        },
+      );
+      const focusables = Array.from(
+        region.querySelectorAll('button, input, textarea, select, summary, a[href]'),
+      );
+      const focusTarget = focusables[state.focusIndex];
+      if (focusTarget instanceof HTMLElement) {
+        focusTarget.focus({ preventScroll: true });
+        if (
+          state.selection &&
+          focusTarget instanceof HTMLInputElement
+        ) {
+          focusTarget.setSelectionRange(
+            state.selection[0],
+            state.selection[1],
+          );
+        }
+      }
+      region.scrollTop = state.scrollTop;
+    };
+    const replaceChildrenFrom = (current, next) => {
+      current.replaceChildren(
+        ...Array.from(next.childNodes).map((node) =>
+          document.importNode(node, true),
+        ),
+      );
+    };
+    const syncRegion = (current, next) => {
+      const state = captureRegionState(current);
+      if (state.key === (next.dataset.regionKey || '')) {
+        for (const element of next.querySelectorAll('[autofocus]')) {
+          element.removeAttribute('autofocus');
+        }
+      }
+      current.className = next.className;
+      for (const attribute of [
+        'hidden',
+        'inert',
+        'aria-hidden',
+        'aria-label',
+        'data-region-key',
+      ]) {
+        if (next.hasAttribute(attribute)) {
+          current.setAttribute(attribute, next.getAttribute(attribute) || '');
+        } else {
+          current.removeAttribute(attribute);
+        }
+      }
+      replaceChildrenFrom(current, next);
+      restoreRegionState(current, state);
+    };
+    const patchSurface = (source, expectedStateKey = '') => {
+      const next = new DOMParser().parseFromString(source, 'text/html');
+      const nextDashboard = next.querySelector('[data-dashboard-region]');
+      const currentDashboard = document.querySelector('[data-dashboard-region]');
+      const nextReview = next.querySelector('[data-review-region]');
+      const currentReview = document.querySelector('[data-review-region]');
+      const nextWorkspace = next.querySelector('[data-agent-workspace]');
+      const currentWorkspace = document.querySelector('[data-agent-workspace]');
+      const nextNotice = next.querySelector('[data-notice-region]');
+      const currentNotice = document.querySelector('[data-notice-region]');
+      const nextShell = next.querySelector('.shell');
+      const currentShell = document.querySelector('.shell');
+      if (
+        !nextDashboard ||
+        !currentDashboard ||
+        !nextReview ||
+        !currentReview ||
+        !nextWorkspace ||
+        !currentWorkspace ||
+        !nextShell ||
+        !currentShell
+      ) {
+        throw new Error('control-surface-missing');
+      }
+      const scrollX = window.scrollX;
+      const scrollY = window.scrollY;
+      syncRegion(currentDashboard, nextDashboard);
+      syncRegion(currentReview, nextReview);
+      currentWorkspace.className = nextWorkspace.className;
+      if (nextNotice && currentNotice) {
+        replaceChildrenFrom(currentNotice, nextNotice);
+      }
+      currentShell.className = nextShell.className;
+      document.documentElement.dataset.stateKey =
+        next.documentElement.dataset.stateKey ||
+        expectedStateKey ||
+        '';
+      window.scrollTo(scrollX, scrollY);
+    };
+    let refreshInFlight = null;
+    let queuedRefreshKey = null;
+    const refreshSurface = async (expectedStateKey) => {
+      if (
+        expectedStateKey &&
+        expectedStateKey === document.documentElement.dataset.stateKey
+      ) return;
+      if (refreshInFlight) {
+        queuedRefreshKey = expectedStateKey || queuedRefreshKey;
+        return refreshInFlight;
+      }
+      refreshInFlight = (async () => {
+        let requestedKey = expectedStateKey;
+        do {
+          queuedRefreshKey = null;
+          if (
+            requestedKey &&
+            requestedKey === document.documentElement.dataset.stateKey
+          ) break;
+          const response = await fetch('/control', {
+            cache: 'no-store',
+            credentials: 'same-origin',
+            headers: { Accept: 'text/html' },
+          });
+          if (!response.ok) throw new Error('control-refresh-failed');
+          patchSurface(await response.text(), requestedKey);
+          requestedKey = queuedRefreshKey;
+        } while (requestedKey);
+      })().finally(() => {
+        refreshInFlight = null;
+      });
+      return refreshInFlight;
+    };
+    let sseHealthy = false;
+    let fallbackTimer = null;
+    const scheduleFallbackPoll = (delay = 1500) => {
+      if (fallbackTimer !== null) return;
+      fallbackTimer = setTimeout(poll, delay);
+    };
     const poll = async () => {
+      fallbackTimer = null;
+      if (sseHealthy) return;
       try {
         const response = await fetch('/snapshot', {
           cache: 'no-store',
@@ -1159,32 +1800,127 @@ export const renderAgentControlPage = (
             snapshot.stateKey &&
             snapshot.stateKey !== document.documentElement.dataset.stateKey
           ) {
-            location.reload();
-            return;
+            await refreshSurface(snapshot.stateKey);
           }
         }
       } catch {}
-      setTimeout(poll, document.hidden ? 2000 : 750);
+      if (!sseHealthy) {
+        scheduleFallbackPoll(document.hidden ? 3000 : 1250);
+      }
     };
-    setTimeout(poll, 750);
-    document.addEventListener('submit', (event) => {
+    const events = new EventSource('/events', {
+      withCredentials: true,
+    });
+    const receiveState = async (event) => {
+      try {
+        const payload = JSON.parse(event.data);
+        if (payload && typeof payload.stateKey === 'string') {
+          await refreshSurface(payload.stateKey);
+        }
+      } catch {}
+    };
+    events.addEventListener('open', () => {
+      sseHealthy = true;
+      if (fallbackTimer !== null) {
+        clearTimeout(fallbackTimer);
+        fallbackTimer = null;
+      }
+    });
+    events.addEventListener('state', receiveState);
+    events.addEventListener('message', receiveState);
+    events.addEventListener('error', () => {
+      sseHealthy = false;
+      scheduleFallbackPoll();
+    });
+    scheduleFallbackPoll();
+    const showClientError = () => {
+      const region = document.querySelector('[data-notice-region]');
+      if (!region) return;
+      const notice = document.createElement('div');
+      notice.className = 'notice notice-error';
+      notice.setAttribute('role', 'alert');
+      notice.textContent =
+        'Agent Control could not update this page. Your request was not retried. Check the signer and try again.';
+      region.replaceChildren(notice);
+    };
+    document.addEventListener('submit', async (event) => {
       const form = event.target;
       if (!(form instanceof HTMLFormElement)) return;
-      const submitter = event.submitter;
       if (
-        submitter instanceof HTMLButtonElement &&
-        submitter.name
-      ) {
-        const submittedAction = document.createElement('input');
-        submittedAction.type = 'hidden';
-        submittedAction.name = submitter.name;
-        submittedAction.value = submitter.value;
-        form.appendChild(submittedAction);
+        typeof fetch !== 'function' ||
+        typeof FormData !== 'function' ||
+        typeof URLSearchParams !== 'function'
+      ) return;
+      const actionUrl = new URL(form.action, document.baseURI);
+      if (
+        actionUrl.origin !== window.location.origin ||
+        actionUrl.pathname !== '/action' ||
+        form.method.toLowerCase() !== 'post'
+      ) return;
+      if (form.dataset.submitting === 'true') {
+        event.preventDefault();
+        return;
       }
+      const submitter = event.submitter;
+      let body;
+      try {
+        const formData = new FormData(form);
+        if (
+          (submitter instanceof HTMLButtonElement ||
+            submitter instanceof HTMLInputElement) &&
+          submitter.name
+        ) {
+          formData.append(submitter.name, submitter.value);
+        }
+        body = new URLSearchParams();
+        for (const [name, value] of formData.entries()) {
+          if (typeof value === 'string') body.append(name, value);
+        }
+      } catch {
+        return;
+      }
+      event.preventDefault();
+      form.dataset.submitting = 'true';
       form.setAttribute('aria-busy', 'true');
-      for (const button of form.querySelectorAll('button')) {
+      const buttons = Array.from(form.querySelectorAll('button'));
+      const buttonState = buttons.map((button) => ({
+        button,
+        disabled: button.disabled,
+        label: button.textContent,
+      }));
+      for (const button of buttons) {
         button.disabled = true;
         if (button.value === 'confirm') button.textContent = 'Submitting...';
+      }
+      try {
+        const response = await fetch(actionUrl, {
+          method: 'POST',
+          cache: 'no-store',
+          credentials: 'same-origin',
+          headers: {
+            Accept: 'text/html',
+            'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
+          },
+          body,
+        });
+        const contentType = response.headers.get('content-type') || '';
+        if (!contentType.toLowerCase().startsWith('text/html')) {
+          throw new Error('control-submit-response-invalid');
+        }
+        const source = await response.text();
+        if (refreshInFlight) await refreshInFlight;
+        patchSurface(source);
+      } catch {
+        showClientError();
+      } finally {
+        if (form.isConnected) {
+          delete form.dataset.submitting;
+          form.removeAttribute('aria-busy');
+          for (const state of buttonState) {
+            state.button.disabled = state.disabled;
+            state.button.textContent = state.label;
+          }
+        }
       }
     });
     document.addEventListener('click', async (event) => {

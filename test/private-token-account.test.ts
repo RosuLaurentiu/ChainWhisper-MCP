@@ -152,7 +152,13 @@ class SuccessfulSimulator implements TransactionSimulator {
   }
 }
 
-const createSetup = async (visibleAfterBroadcast: boolean) => {
+const createSetup = async (
+  visibleAfterBroadcast: boolean,
+  options: {
+    walletCode?: string;
+    initialMapping?: Address;
+  } = {},
+) => {
   const manifest = await loadRuntimeManifest();
   const privateToken = manifest.tokens.find(
     (token) => token.symbol === 'p.WISP',
@@ -163,11 +169,18 @@ const createSetup = async (visibleAfterBroadcast: boolean) => {
     .slice(2, 18)}`;
   const wallet = new SetupWallet(visibleAfterBroadcast);
   const elicitor = new AcceptedElicitor();
+  let attestationCount = 0;
+  let ethGetCodeCount = 0;
   const rpc: JsonRpcReader = {
     request: async <T>(
       method: string,
       params: unknown[],
     ): Promise<T> => {
+      if (method === 'eth_getCode') {
+        ethGetCodeCount += 1;
+        expect(params).toEqual([WALLET, 'latest']);
+        return (options.walletCode ?? '0x6000') as T;
+      }
       expect(method).toBe('eth_call');
       const data = (params[0] as { data: HexString }).data;
       expect(data.slice(0, 10).toLowerCase()).toBe(
@@ -178,7 +191,10 @@ const createSetup = async (visibleAfterBroadcast: boolean) => {
       return encodeFunctionResult({
         abi: ACCOUNT_ABI,
         functionName: 'accountEncryptionAddress',
-        result: wallet.ready ? WALLET : ZERO_ADDRESS,
+        result:
+          wallet.ready
+            ? WALLET
+            : (options.initialMapping ?? ZERO_ADDRESS),
       }) as T;
     },
   };
@@ -197,11 +213,75 @@ const createSetup = async (visibleAfterBroadcast: boolean) => {
     simulator: new SuccessfulSimulator(),
     nonceQueue: new NonceQueue(() => wallet.getPendingNonce()),
     journal,
+    assertRuntimeAttested: async () => {
+      attestationCount += 1;
+    },
   });
-  return { elicitor, journal, operationId, service, wallet };
+  return {
+    attestationCount: () => attestationCount,
+    elicitor,
+    ethGetCodeCount: () => ethGetCodeCount,
+    journal,
+    operationId,
+    service,
+    wallet,
+  };
 };
 
 describe('private-token account setup recovery', () => {
+  it('treats a zero owner mapping as ready for an EOA and skips setup', async () => {
+    const setup = await createSetup(true, { walletCode: '0x' });
+
+    await expect(setup.service.status('p.WISP')).resolves.toMatchObject({
+      accountEncryptionAddress: ZERO_ADDRESS,
+      ready: true,
+      spenders: {
+        standardEscrow: { ready: false },
+        privateEscrow: { ready: false },
+        directEscrow: { ready: false },
+        recurringEscrow: { ready: false },
+      },
+    });
+    await expect(setup.service.enable('p.WISP')).resolves.toMatchObject({
+      accountEncryptionAddress: ZERO_ADDRESS,
+      ready: true,
+      transactionHash: null,
+    });
+
+    expect(setup.ethGetCodeCount()).toBe(2);
+    expect(setup.attestationCount()).toBe(0);
+    expect(setup.wallet.prepareCount).toBe(0);
+    expect(setup.wallet.broadcastCount).toBe(0);
+    expect(setup.elicitor.requests).toHaveLength(0);
+  });
+
+  it('requires setup for a code-bearing wallet with a zero mapping', async () => {
+    const setup = await createSetup(true, {
+      walletCode: '0x6001600055',
+    });
+
+    await expect(setup.service.status('p.WISP')).resolves.toMatchObject({
+      accountEncryptionAddress: ZERO_ADDRESS,
+      ready: false,
+    });
+    expect(setup.ethGetCodeCount()).toBe(1);
+  });
+
+  it('requires setup for a foreign mapping without classifying the wallet', async () => {
+    const foreign =
+      '0x2222222222222222222222222222222222222222' as Address;
+    const setup = await createSetup(true, {
+      walletCode: '0x',
+      initialMapping: foreign,
+    });
+
+    await expect(setup.service.status('p.WISP')).resolves.toMatchObject({
+      accountEncryptionAddress: foreign,
+      ready: false,
+    });
+    expect(setup.ethGetCodeCount()).toBe(0);
+  });
+
   it('reconciles a lost broadcast response against the locally prepared hash', async () => {
     const setup = await createSetup(true);
 

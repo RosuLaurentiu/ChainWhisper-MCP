@@ -73,10 +73,60 @@ const privateAmountLabel = (id: string): string => {
 const formatCotiAtomic = (atomic: string): string =>
   `${formatUnits(BigInt(atomic), 18)} COTI (${atomic} wei)`;
 
+const formatCotiHuman = (atomic: string): string =>
+  `${formatUnits(BigInt(atomic), 18)} COTI`;
+
 const formatBasisPointDeviation = (basisPoints: number): string => {
   const sign = basisPoints > 0 ? '+' : '';
   return `${sign}${basisPoints / 100}% (${sign}${basisPoints} bps)`;
 };
+
+export type OrderReviewV1 = {
+  version: 'cw.order-review/1';
+  kind: 'recurring-create';
+  title: string;
+  pair: string;
+  badges: string[];
+  sellSide: {
+    label: 'Sell inventory';
+    asset: string;
+    amount: string | null;
+    price: string | null;
+    priceUnit: string;
+    offsetBps: number | null;
+  };
+  buySide: {
+    label: 'Buy budget';
+    asset: string;
+    amount: string | null;
+    price: string | null;
+    priceUnit: string;
+    offsetBps: number | null;
+  };
+  marketReference: {
+    venue: string;
+    price: string | null;
+    priceUnit: string;
+    observedAt: string | null;
+    sourceId: string | null;
+  } | null;
+  protocolFeeCoti: string;
+  maximumNetworkFeeCoti: string | null;
+  networkTransactionCount: number;
+  recurringExplanation: string;
+  privacyExplanation: string;
+  confirmationExplanation: string;
+  confirmLabel: string;
+};
+
+export type ConfirmationRequestWithOrderReview =
+  ConfirmationRequest & {
+    /**
+     * Local presentation data only. It is derived from the signed envelope and
+     * exact materialized steps, and is never part of a planner/MCP schema.
+     */
+    orderReview?: OrderReviewV1;
+  };
 
 const LEGACY_STANDARD_ORDER_TYPE_LABEL =
   'Legacy one-off / fixed recipient / public terms';
@@ -86,8 +136,9 @@ const completeActionButtonLabel = (
 ): string => {
   switch (action) {
     case 'create_trade':
+      return 'Confirm order';
     case 'create_recurring':
-      return 'Confirm complete order creation';
+      return 'Confirm recurring order';
     case 'fill':
       return 'Confirm complete order fill';
     case 'counter':
@@ -122,7 +173,7 @@ export const buildActionConfirmation = (
   stepOrSteps: MaterializedActionStep | MaterializedActionStep[],
   stepIndex: number,
   feeQuoteOrQuotes?: TransactionFeeQuote | Array<TransactionFeeQuote | undefined>,
-): ConfirmationRequest => {
+): ConfirmationRequestWithOrderReview => {
   const steps = Array.isArray(stepOrSteps)
     ? stepOrSteps
     : [stepOrSteps];
@@ -342,6 +393,131 @@ export const buildActionConfirmation = (
       : null;
   const standaloneApproval =
     steps.length === 1 && protocolStep.kind === 'approval';
+  const recurringOrderReview = (() => {
+    if (
+      envelope.intent.action !== 'create_recurring' ||
+      envelope.intent.orderType?.cadence !== 'recurring'
+    ) {
+      return undefined;
+    }
+    const metadata = envelope.intent.metadata;
+    const priceUnit =
+      sellAsset && buyAsset ? `${buyAsset} per ${sellAsset}` : 'quote per base';
+    const privateAmounts = steps.flatMap(
+      (step) => step.privateDisplayAmounts ?? [],
+    );
+    const privateAmount = (
+      pattern: RegExp,
+    ): string | null =>
+      privateAmounts.find(({ id }) => pattern.test(id))?.amount ?? null;
+    const metadataString = (key: string): string | null => {
+      const value = metadata?.[key];
+      return typeof value === 'string' && value.length > 0 ? value : null;
+    };
+    const metadataInteger = (key: string): number | null => {
+      const value = metadata?.[key];
+      return typeof value === 'number' && Number.isInteger(value)
+        ? value
+        : null;
+    };
+    const sellAmount =
+      metadataString('sellBaseLiquidity') ??
+      privateAmount(/(?:recurring-base-inventory|recurring-sell-base-liquidity)/iu);
+    const buyAmount =
+      metadataString('buyQuoteLiquidity') ??
+      privateAmount(/(?:recurring-quote-inventory|recurring-buy-quote-liquidity)/iu);
+    const accessBadge =
+      envelope.intent.orderType.access === 'public'
+        ? 'Public access'
+        : envelope.intent.orderType.access === 'direct'
+          ? 'Direct recipient'
+          : 'Unlisted access';
+    const liquidityBadge =
+      envelope.intent.orderType.termsVisibility === 'hidden-liquidity'
+        ? 'Private liquidity'
+        : 'Visible liquidity';
+    const assetsBadge =
+      envelope.intent.orderType.assetPrivacy === 'fully-private'
+        ? 'Private assets'
+        : envelope.intent.orderType.assetPrivacy === 'hybrid-private'
+          ? 'Public/private assets'
+          : null;
+    const marketVenue =
+      metadataString('marketReferenceVenue') ?? 'Market reference';
+    const marketPrice = metadataString('marketReferencePrice');
+    const marketObservedAt = metadataString(
+      'marketReferenceObservedAt',
+    );
+    const marketSourceId = metadataString('marketReferenceId');
+    const hasMarketReference = Boolean(
+      marketPrice ||
+        marketObservedAt ||
+        marketSourceId ||
+        metadataString('marketReferenceVenue'),
+    );
+    const privateSell =
+      envelope.intent.sellAsset?.kind === 'private-erc20';
+    const privateBuy =
+      envelope.intent.buyAsset?.kind === 'private-erc20';
+    const privacyExplanation =
+      privateSell && privateBuy
+        ? 'Sell inventory and buy budget are encrypted on-chain. Prices, access, addresses, and order activity remain public.'
+        : envelope.intent.orderType.termsVisibility === 'hidden-liquidity'
+          ? 'Hidden liquidity is encrypted on-chain. Prices, access, addresses, and order activity remain public.'
+          : 'Inventory, prices, access, addresses, and order activity are public on-chain.';
+    return {
+      version: 'cw.order-review/1',
+      kind: 'recurring-create',
+      title: 'Create recurring order',
+      pair: `${sellAsset ?? 'Sell asset'} / ${buyAsset ?? 'Buy asset'}`,
+      badges: [
+        'Recurring',
+        liquidityBadge,
+        accessBadge,
+        ...(assetsBadge ? [assetsBadge] : []),
+      ],
+      sellSide: {
+        label: 'Sell inventory',
+        asset: sellAsset ?? 'Sell asset',
+        amount: sellAmount,
+        price: metadataString('sellPrice'),
+        priceUnit,
+        offsetBps: metadataInteger('sellPriceOffsetBps'),
+      },
+      buySide: {
+        label: 'Buy budget',
+        asset: buyAsset ?? 'Buy asset',
+        amount: buyAmount,
+        price: metadataString('buyPrice'),
+        priceUnit,
+        offsetBps: metadataInteger('buyPriceOffsetBps'),
+      },
+      marketReference: hasMarketReference
+        ? {
+            venue: marketVenue,
+            price: marketPrice,
+            priceUnit,
+            observedAt: marketObservedAt,
+            sourceId: marketSourceId,
+          }
+        : null,
+      protocolFeeCoti: standaloneApproval
+        ? '0 COTI'
+        : formatCotiHuman(envelope.fee.amount),
+      maximumNetworkFeeCoti: quotes.some(Boolean)
+        ? `${maximumNetworkFeeCoti} COTI`
+        : null,
+      networkTransactionCount: steps.length,
+      recurringExplanation:
+        'Recurring provides reusable two-sided liquidity. It does not schedule automatic trades.',
+      privacyExplanation,
+      confirmationExplanation:
+        steps.length === 1
+          ? 'This confirmation authorizes the exact order transaction shown here. The signer re-checks it before signing.'
+          : `This one confirmation authorizes ${steps.length} exact network transactions needed for the complete order. The signer re-checks every transaction before signing.`,
+      confirmLabel: 'Confirm recurring order',
+    } satisfies OrderReviewV1;
+  })();
   return {
     operationId: envelope.operationId,
     operationHash: envelope.operationHash,
@@ -388,6 +564,9 @@ export const buildActionConfirmation = (
     maximumNetworkFeeWei: maximumNetworkFeeWei.toString(),
     maximumNetworkFeeCoti,
     stepDigests: steps.map(materializedActionStepDigest),
+    ...(recurringOrderReview
+      ? { orderReview: recurringOrderReview }
+      : {}),
     technicalDetails: steps.map((step, index) => ({
       stepId: step.id,
       kind: step.kind,

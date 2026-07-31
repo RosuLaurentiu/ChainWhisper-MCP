@@ -38,7 +38,9 @@ import type {
   RegistrySnapshot,
   ResolvedAsset,
   SafeOrderSummary,
-  TradeSide
+  TradeSide,
+  WalletOrderActivityPage,
+  WalletOrderActivityRecord
 } from './types.js';
 import { CHAINWHISPER_CHAIN_ID } from './types.js';
 
@@ -107,6 +109,60 @@ type PageItem = {
   historyRoles?: readonly OrderHistoryRole[];
 };
 
+type HistoryPageItem = PageItem & {
+  lastActivityBlock: bigint;
+  sequence: bigint;
+};
+
+type RpcLog = {
+  address: Address;
+  blockNumber: `0x${string}`;
+  transactionHash: `0x${string}`;
+  logIndex: `0x${string}`;
+  topics: `0x${string}`[];
+};
+
+const eventTopic = (signature: string): `0x${string}` =>
+  keccak256(toHex(signature));
+
+const ACTIVITY_EVENT_TOPICS = {
+  standardEscrow: {
+    order: eventTopic(
+      'TradeOpened(uint256,address,address,bool,bytes32,uint256,uint64,uint64,uint256)'
+    ),
+    fills: [
+      eventTopic('TradeAccepted(uint256,address,bool)'),
+      eventTopic(
+        'TradePartiallyFilled(uint256,address,uint256,uint256,uint256,uint256)'
+      )
+    ]
+  },
+  privateEscrow: {
+    order: eventTopic(
+      'PrivateOrderOpened(uint256,address,address,uint8,bool,bool,uint64,uint64,bytes32,uint256)'
+    ),
+    fills: [
+      eventTopic('PrivateOrderFilled(uint256,address,bool,uint256)')
+    ]
+  },
+  directEscrow: {
+    order: eventTopic(
+      'DirectTradeOpened(uint256,address,address,bool,uint256,uint64,uint64,bytes32,uint256)'
+    ),
+    fills: [eventTopic('DirectTradeAccepted(uint256,address)')]
+  },
+  recurringEscrow: {
+    order: eventTopic(
+      'RecurringOrderOpened(uint256,address,address,uint8,bool,bool,uint64,uint256)'
+    ),
+    fills: [
+      eventTopic(
+        'RecurringOrderExecuted(uint256,address,uint8,uint32,uint256,uint256)'
+      )
+    ]
+  }
+} as const;
+
 const field = (value: unknown, name: string, index: number): unknown => {
   if (!value || typeof value !== 'object') return undefined;
   const record = value as Record<string, unknown>;
@@ -141,6 +197,44 @@ const asHash = (value: unknown): `0x${string}` | null => {
   return /^0x[a-f0-9]{64}$/u.test(normalized)
     ? (normalized as `0x${string}`)
     : null;
+};
+
+const asHexQuantity = (value: unknown): `0x${string}` | null => {
+  const normalized = String(value ?? '').trim().toLowerCase();
+  return /^0x(?:0|[1-9a-f][0-9a-f]*)$/u.test(normalized)
+    ? (normalized as `0x${string}`)
+    : null;
+};
+
+const asRpcLog = (value: unknown): RpcLog | null => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return null;
+  }
+  const record = value as Record<string, unknown>;
+  const address = asAddress(record.address);
+  const blockNumber = asHexQuantity(record.blockNumber);
+  const transactionHash = asHash(record.transactionHash);
+  const logIndex = asHexQuantity(record.logIndex);
+  const topics = Array.isArray(record.topics)
+    ? record.topics.map(asHash)
+    : [];
+  if (
+    !address ||
+    !blockNumber ||
+    !transactionHash ||
+    !logIndex ||
+    topics.length < 2 ||
+    topics.some((topic) => topic === null)
+  ) {
+    return null;
+  }
+  return {
+    address,
+    blockNumber,
+    transactionHash,
+    logIndex,
+    topics: topics as `0x${string}`[]
+  };
 };
 
 const toIso = (seconds: unknown): string => {
@@ -395,6 +489,57 @@ export class LiveChainWhisperDomainGateway implements DomainGateway {
     };
   }
 
+  async listWalletActivity(input: {
+    wallet: Address;
+    cursor: string | null;
+    limit: number;
+  }): Promise<WalletOrderActivityPage> {
+    const offset = /^(?:0|[1-9]\d*)$/u.test(input.cursor ?? '')
+      ? BigInt(input.cursor!)
+      : 0n;
+    const page = await this.#readHistoryActivityPage(
+      input.wallet,
+      offset,
+      input.limit
+    );
+    const unique = new Map<string, HistoryPageItem>();
+    for (const item of page.items) {
+      if (!(await this.isTrustedEscrow(item.contractAddress))) continue;
+      const key = `${item.contractAddress}:${item.localId}`;
+      const current = unique.get(key);
+      if (
+        !current ||
+        item.lastActivityBlock > current.lastActivityBlock ||
+        (item.lastActivityBlock === current.lastActivityBlock &&
+          item.sequence > current.sequence)
+      ) {
+        unique.set(key, item);
+      }
+    }
+    const timestampCache = new Map<
+      string,
+      Promise<string | null>
+    >();
+    const records = (
+      await Promise.all(
+        [...unique.values()].map((item) =>
+          this.#activityRecords(item, timestampCache)
+        )
+      )
+    )
+      .flat()
+      .sort((left, right) => {
+        const byTime = right.occurredAt.localeCompare(left.occurredAt);
+        if (byTime !== 0) return byTime;
+        return (right.logIndex ?? -1) - (left.logIndex ?? -1);
+      });
+    return {
+      records,
+      nextCursor: page.hasMore ? page.nextOffset : null,
+      truncated: page.hasMore
+    };
+  }
+
   async getOrder(identity: OrderIdentityInput): Promise<SafeOrderSummary | null> {
     const parsed =
       typeof identity.handle === 'string'
@@ -623,6 +768,215 @@ export class LiveChainWhisperDomainGateway implements DomainGateway {
       BigInt(limit)
     ]);
     return this.#parsePage(raw, limit, true);
+  }
+
+  async #readHistoryActivityPage(
+    wallet: Address,
+    offset: bigint,
+    limit: number
+  ): Promise<{
+    items: HistoryPageItem[];
+    nextOffset: string;
+    hasMore: boolean;
+  }> {
+    const history = this.#contract('historyReader').address as Address;
+    const raw = await this.#read(
+      history,
+      HISTORY_ABI,
+      'getWalletHistoryPage',
+      [
+        wallet,
+        this.#manifest.registry.address,
+        offset,
+        BigInt(limit)
+      ]
+    );
+    const rawItems = field(raw, 'items', 0);
+    const items = Array.isArray(rawItems)
+      ? rawItems
+          .map((item): HistoryPageItem | null => {
+            const contractAddress = asAddress(
+              field(item, 'contractAddress', 0)
+            );
+            const localId = asBigInt(field(item, 'localId', 1));
+            const role = asHistoryRole(field(item, 'role', 3));
+            const lastActivityBlock = asBigInt(
+              field(item, 'lastActivityBlock', 6)
+            );
+            const sequence = asBigInt(field(item, 'sequence', 7));
+            if (!contractAddress || localId <= 0n || !role) return null;
+            return {
+              contractAddress,
+              localId: localId.toString(),
+              historyRoles: [role],
+              lastActivityBlock,
+              sequence
+            };
+          })
+          .filter((item): item is HistoryPageItem => Boolean(item))
+      : [];
+    const nextOffset = asBigInt(field(raw, 'nextOffset', 1));
+    return {
+      items,
+      nextOffset: nextOffset.toString(),
+      hasMore: nextOffset > 0n
+    };
+  }
+
+  #activityTopics(contract: Address): {
+    order: `0x${string}`;
+    fills: readonly `0x${string}`[];
+  } | null {
+    const normalized = contract.toLowerCase();
+    for (const name of [
+      'standardEscrow',
+      'privateEscrow',
+      'directEscrow',
+      'recurringEscrow'
+    ] as const) {
+      if (this.#contract(name).address.toLowerCase() === normalized) {
+        return ACTIVITY_EVENT_TOPICS[name];
+      }
+    }
+    return null;
+  }
+
+  async #activityLogs(
+    item: HistoryPageItem,
+    topics: {
+      order: `0x${string}`;
+      fills: readonly `0x${string}`[];
+    }
+  ): Promise<RpcLog[]> {
+    if (item.lastActivityBlock <= 0n) return [];
+    const idTopic = toHex(BigInt(item.localId), { size: 32 });
+    const filter = {
+      address: item.contractAddress,
+      fromBlock: '0x0',
+      toBlock: toHex(item.lastActivityBlock),
+      topics: [[topics.order, ...topics.fills], idTopic]
+    };
+    let raw: unknown;
+    try {
+      raw = await this.#rpc.request<unknown>('eth_getLogs', [filter]);
+    } catch {
+      try {
+        raw = await this.#rpc.request<unknown>('eth_getLogs', [
+          {
+            ...filter,
+            fromBlock: toHex(item.lastActivityBlock)
+          }
+        ]);
+      } catch {
+        return [];
+      }
+    }
+    if (!Array.isArray(raw)) return [];
+    const topicSet = new Set(
+      [topics.order, ...topics.fills].map((topic) =>
+        topic.toLowerCase()
+      )
+    );
+    return raw
+      .map(asRpcLog)
+      .filter((log): log is RpcLog => Boolean(log))
+      .filter(
+        (log) =>
+          log.address.toLowerCase() ===
+            item.contractAddress.toLowerCase() &&
+          topicSet.has(log.topics[0]!.toLowerCase()) &&
+          log.topics[1]!.toLowerCase() === idTopic.toLowerCase()
+      );
+  }
+
+  #blockTimestamp(
+    blockNumber: `0x${string}`,
+    cache: Map<string, Promise<string | null>>
+  ): Promise<string | null> {
+    const key = blockNumber.toLowerCase();
+    const cached = cache.get(key);
+    if (cached) return cached;
+    const pending = this.#rpc
+      .request<unknown>('eth_getBlockByNumber', [blockNumber, false])
+      .then((block) => {
+        const timestamp = asHexQuantity(
+          field(block, 'timestamp', 0)
+        );
+        if (!timestamp) return null;
+        const seconds = BigInt(timestamp);
+        if (seconds <= 0n || seconds > BigInt(Number.MAX_SAFE_INTEGER)) {
+          return null;
+        }
+        return new Date(Number(seconds) * 1_000).toISOString();
+      })
+      .catch(() => null);
+    cache.set(key, pending);
+    return pending;
+  }
+
+  async #activityRecords(
+    item: HistoryPageItem,
+    timestampCache: Map<string, Promise<string | null>>
+  ): Promise<WalletOrderActivityRecord[]> {
+    const order = await this.getOrder({
+      escrowContract: item.contractAddress,
+      localId: item.localId
+    });
+    if (!order) return [];
+    const topics = this.#activityTopics(item.contractAddress);
+    const logs = topics
+      ? await this.#activityLogs(item, topics)
+      : [];
+    const records = await Promise.all(
+      logs.map(async (log): Promise<WalletOrderActivityRecord> => {
+        const blockNumber = BigInt(log.blockNumber);
+        const rawLogIndex = BigInt(log.logIndex);
+        const logIndex =
+          rawLogIndex <= BigInt(Number.MAX_SAFE_INTEGER)
+            ? Number(rawLogIndex)
+            : null;
+        return {
+          kind:
+            log.topics[0]!.toLowerCase() ===
+            topics!.order.toLowerCase()
+              ? 'order'
+              : 'fill',
+          order,
+          orderHandle: order.identity.handle,
+          transactionHash: log.transactionHash,
+          blockNumber: blockNumber.toString(),
+          logIndex,
+          occurredAt:
+            (await this.#blockTimestamp(
+              log.blockNumber,
+              timestampCache
+            )) ?? order.updatedAt
+        };
+      })
+    );
+    const unique = new Map<string, WalletOrderActivityRecord>();
+    for (const record of records) {
+      const key = `${record.kind}:${record.transactionHash}`;
+      const current = unique.get(key);
+      if (
+        !current ||
+        (record.logIndex ?? -1) > (current.logIndex ?? -1)
+      ) {
+        unique.set(key, record);
+      }
+    }
+    if (![...unique.values()].some(({ kind }) => kind === 'order')) {
+      unique.set(`order:${order.identity.handle}`, {
+        kind: 'order',
+        order,
+        orderHandle: order.identity.handle,
+        transactionHash: null,
+        blockNumber: null,
+        logIndex: null,
+        occurredAt: order.updatedAt
+      });
+    }
+    return [...unique.values()];
   }
 
   #parsePage(

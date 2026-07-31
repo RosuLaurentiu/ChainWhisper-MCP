@@ -237,6 +237,45 @@ export class OperationJournal {
     });
   }
 
+  async recordExternalReceipt(
+    operationId: string,
+    receipt: JournalReceipt,
+  ): Promise<OperationJournalRecord | null> {
+    assertOperationId(operationId);
+    return this.#store.mutate((state) => {
+      const record = ownOperation(state.operations, operationId);
+      if (!record) return null;
+      if (
+        !record.transactionHashes.includes(
+          receipt.transactionHash,
+        )
+      ) {
+        record.transactionHashes.push(receipt.transactionHash);
+      }
+      const index = record.receipts.findIndex(
+        (entry) =>
+          entry.transactionHash === receipt.transactionHash,
+      );
+      const safeReceipt: JournalReceipt = {
+        transactionHash: receipt.transactionHash,
+        status: receipt.status,
+        ...(receipt.blockNumber === undefined
+          ? {}
+          : { blockNumber: receipt.blockNumber }),
+      };
+      if (index >= 0) record.receipts[index] = safeReceipt;
+      else record.receipts.push(safeReceipt);
+      record.stage =
+        receipt.status === 'success'
+          ? 'completed'
+          : receipt.status === 'pending'
+            ? 'broadcast'
+            : 'failed';
+      record.updatedAt = this.#clock().toISOString();
+      return cloneRecord(record);
+    });
+  }
+
   async recordError(
     operationId: string,
     errorCode: string,
