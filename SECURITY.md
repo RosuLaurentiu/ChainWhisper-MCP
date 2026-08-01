@@ -37,6 +37,18 @@ Manual writes require one complete signer-owned local authorization. Autonomous
 writes require an exact active wallet/chain/manifest-bound policy. Both paths
 remain restricted to the audited ChainWhisper economic surface.
 
+Order amounts, prices, budgets, inventory, and participant receipts may be
+shown to the user's chosen agent after an exact local disclosure confirmation
+or an active policy with `agentVisiblePrivateAmounts=true`. These trading terms
+are not wallet credentials. Private keys, recovered privacy/AES material,
+pairing/session tokens, and raw access secrets remain signer-only.
+
+Order-linked private negotiation uses the official COTI private-messaging SDK
+embedded in `chainwhisper-coti-signer`. No ChainWhisper skill, COTI skill, or
+standalone messaging MCP is part of the trusted path. A separate COTI MCP is an
+independent generic companion and must not receive ChainWhisper Agent Wallet
+credentials.
+
 The beta trusts the local host and same signed-in OS user. A dedicated,
 minimally funded Agent Wallet is strongly recommended.
 

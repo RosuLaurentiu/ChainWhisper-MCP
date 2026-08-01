@@ -23,17 +23,30 @@ Initial public beta release candidate.
 - Added a persistent ChainWhisper-branded loopback Agent Control page with
   one rotated session, bounded one-use CSRF tokens across concurrent reloads,
   replay/origin protections, strict CSP, no remote assets, no telemetry,
-  redacted diagnostics, responsive accessible forms, active-tab prompt reuse,
-  stale-tab reopening, and authenticated-page arrival checks.
+  redacted diagnostics, responsive accessible forms, authenticated
+  same-origin event-stream presence, active-tab reuse, one replacement after a
+  closed-tab grace period, and authenticated-page arrival checks.
 - Rebuilt configured-wallet Agent Control as a compact operational dashboard:
   wallet and signer status, verified-asset balances, agent mode, five recent
-  operations, and collapsed wallet settings and diagnostics.
+  activity entries, and collapsed wallet settings and diagnostics.
 - Added cached local balance reads for native COTI, public ERC-20 assets, and
   locally decrypted prepared private tokens, with concurrent refresh
   deduplication, partial-failure stale values, exact-amount disclosure, and
   contextual private-token preparation.
 - Kept decrypted balances local to the authenticated dashboard and out of MCP
   status, prompts, logs, diagnostics, and page refresh keys.
+- Made successful privacy onboarding invalidate and refresh all verified
+  private-token balance rows immediately. Standard EOAs treat a zero
+  encryption-address mapping as wallet-ready; only foreign mappings or
+  unsupported wallet configurations need token-specific recovery.
+- Added merged Agent Control activity from the encrypted local journal and the
+  wallet-wide attested ChainWhisper history reader, with five recent entries,
+  twenty-entry pagination, order/transaction links, deduplication, and local
+  exact-term snapshots.
+- Kept the dashboard mounted while desktop confirmations open in a focused
+  side panel and mobile confirmations use a full-width review sheet. Setup,
+  signing, broadcasting, confirming, completion, and failure update in place
+  without full-page reloads.
 - Added structured allowlisted Agent Control diagnostic codes to signer status
   so agents can distinguish setup progress and safe failures without receiving
   local error text or secrets.
@@ -48,6 +61,10 @@ Initial public beta release candidate.
 ### Signing and autonomy
 
 - Changed multi-step writes to one complete logical-action confirmation.
+- Added structured compact order reviews with pair, action, recurring/private/
+  access badges, sell inventory, buy budget, prices and market offsets, readable
+  reference time, protocol fee, maximum network cost, and closed technical
+  details.
 - Added complete technical step digests, per-step fee ceilings, and fresh
   full-action materialization before autonomous retry or restart signing.
 - Added `AutonomyPolicyV1`, bounded policies up to 30 days, and full audited
@@ -97,6 +114,9 @@ Initial public beta release candidate.
 
 - Added Node.js 22/24/26 CI on Windows, macOS, and Linux.
 - Added CodeQL, dependency review, and Dependabot configuration.
+- Replaced activity formatting and explorer URL regular expressions with
+  linear parsing after CodeQL identified denial-of-service risk, and made
+  concurrent wallet-history coalescing deterministic across slower filesystems.
 - Split unprivileged evidence building from protected publish-only execution.
 - Bound release identity to the exact protected tag, package version, and
   centralized source version.

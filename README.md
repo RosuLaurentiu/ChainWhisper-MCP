@@ -7,15 +7,17 @@ ChainWhisper on COTI Mainnet:
 - `chainwhisper-coti-signer` is the local Agent Wallet, privacy, policy,
   confirmation, signing, messaging, broadcast, and recovery boundary.
 
-No ChainWhisper skill or separate messaging MCP is required. Official COTI
-private messaging is embedded in the signer.
+No ChainWhisper skill, COTI skill, or separate messaging MCP is required for
+order-linked private negotiation. The official COTI private-messaging SDK is
+embedded in the signer.
 
-If an agent also uses a compatible COTI MCP, keep it as an independent companion
-for generic, read-only COTI network and account functions. ChainWhisper does not
-call that MCP, receive credentials from it, or republish its tools. Never share
-the ChainWhisper Agent Wallet private key, wallet privacy/AES material, or
-access secrets with the companion. The ChainWhisper planner and signer expose
-the economic actions a person can perform in the ChainWhisper app.
+If an agent also uses a compatible COTI MCP, keep it as an independent,
+optional companion for generic COTI network and account functions. It is not
+part of ChainWhisper negotiation. ChainWhisper does not call that MCP, receive
+credentials from it, or republish its tools. Never share the ChainWhisper Agent
+Wallet private key, wallet privacy/AES material, or access secrets with the
+companion. The ChainWhisper planner and signer expose the economic actions a
+person can perform in the ChainWhisper app.
 
 ## Security boundary
 
@@ -69,9 +71,9 @@ Register both local commands:
 ```
 
 The signer starts in `wallet-setup-required` mode when no Agent Wallet exists.
-Call `chainwhisper_open_control_panel`. The tool opens signer-owned Agent
-Control without returning its URL, bootstrap token, cookie, or local secrets to
-the agent.
+Call `chainwhisper_open_control_panel`. The tool opens the persistent,
+signer-owned Agent Control tab without returning its URL, bootstrap token,
+cookie, or local secrets to the agent.
 
 Agent Control offers:
 
@@ -144,9 +146,13 @@ After funding the Agent Wallet with COTI for gas:
 2. Review and confirm the exact official COTI onboarding action.
 3. Let the signer recover and encrypt the wallet-specific privacy key
    internally.
-4. When an intended ChainWhisper action first needs a verified private asset,
-   prepare only that missing token account locally.
-5. Prepare a fresh action after setup. An envelope created before setup is
+4. Let Agent Control immediately refresh every verified private-token balance
+   that the wallet can decrypt.
+5. For a standard EOA, a zero encryption-address mapping is wallet-ready and
+   does not require one setup transaction per token. Agent Control requests
+   token-specific recovery only for a foreign mapping or unsupported wallet
+   configuration.
+6. Prepare a fresh action after any required setup. An envelope created before setup is
    never reused.
 
 Users never enter privacy key material. Private state, policies, operation
@@ -163,12 +169,13 @@ The signer keeps one persistent server on `127.0.0.1`. It is a signing and
 policy surface, not a second trading app. It contains only:
 
 - pending confirmation and private-input cards;
-- Agent Wallet address, verified public and prepared private-token balances,
+- Agent Wallet address, verified public and decryptable private-token balances,
   network, privacy readiness, and signer health;
 - current mode and policy, including the manual path for requesting autonomy
   through the user's agent;
 - remaining budgets;
-- up to five recent operations with transaction links;
+- five recent merged local and wallet-wide ChainWhisper activity entries,
+  transaction/order links, and a paginated full history;
 - pause, resume, and revoke controls; and
 - collapsed local wallet settings and redacted diagnostics.
 
@@ -178,6 +185,13 @@ When a wallet is configured, wallet replacement stays collapsed under
 seconds, keeps the last successful value visibly stale on partial RPC failure,
 and never places decrypted amounts in MCP status, prompts, logs, diagnostics,
 or page refresh keys.
+
+The browser keeps one authenticated same-origin event stream open while Agent
+Control is present. Consecutive setup, review, signing, broadcasting,
+confirmation, and completion states update in the same page. A desktop order
+review opens beside the mounted dashboard; mobile uses a full-width review
+sheet. If the tab closes while input is required, the signer waits briefly for
+reconnection and opens at most one replacement.
 
 The page uses package-bundled HTML, CSS, and JavaScript with no remote assets,
 fonts, analytics, telemetry, iframes, or app configuration. It uses a consumed
@@ -197,9 +211,12 @@ scheduled execution. Approvals, resets, native value, gas ceilings, contracts,
 selectors, calldata digests, step hashes, and the operation hash are collapsed
 under technical details.
 
-There is one action-specific button such as **Confirm complete order creation**
-plus **Decline**. After approval, every step is re-attested, revalidated, and
-re-simulated. Changed calldata or a higher fee invalidates authorization.
+There is one action-specific button such as **Confirm recurring order** plus
+**Decline**. That one authorization may cover several exact approval, reset,
+private-input, or protocol transactions. After approval, every remaining step
+is re-attested, revalidated, and re-simulated while progress replaces the
+buttons in the same review panel. Changed calldata or a higher fee invalidates
+authorization.
 
 ## Manual, bounded, and full autonomy
 

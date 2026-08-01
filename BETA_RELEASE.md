@@ -168,6 +168,10 @@ artifact checks. No skipped platform job may be treated as release evidence.
       passphrase.
 - [ ] Privacy onboarding starts from Agent Control and stores recovered
       material internally.
+- [ ] Successful onboarding refreshes every decryptable verified private-token
+      balance without one setup transaction per standard-EOA zero mapping.
+- [ ] Foreign encryption-address mappings and unsupported wallet
+      configurations require explicit token recovery and fail safely.
 - [ ] Private state, policies, recovery, and access secrets are wallet
       namespaced.
 - [ ] One active browser session is enforced and opening another invalidates
@@ -175,6 +179,13 @@ artifact checks. No skipped platform job may be treated as release evidence.
 - [ ] A browser launch counts as opened only after Agent Control receives a
       real local navigation; launch-without-arrival remains retryable and
       preserves the pending card.
+- [ ] One authenticated event-stream presence connection keeps setup, review,
+      progress, completion, balances, mode, and activity in the same tab.
+- [ ] Closing a required-input tab opens no more than one replacement after the
+      reconnect grace period; autonomous activity never steals focus.
+- [ ] Five merged recent entries and twenty-entry paginated history combine
+      encrypted local operations with wallet-wide on-chain ChainWhisper
+      activity and deduplicate matching order handles/transactions.
 - [ ] Bootstrap, cookie, CSRF, Host/Origin, replay, CSP, frame, no-store, body
       limit, and rate-limit tests pass.
 - [ ] There are no remote assets, analytics, telemetry, or app configuration.
@@ -186,12 +197,13 @@ artifact checks. No skipped platform job may be treated as release evidence.
 - [ ] A multi-step approval/reset/protocol operation produces exactly one
       confirmation.
 - [ ] The order/action type is the primary heading.
-- [ ] Send/receive amounts, privacy, price, recurring inventory, recipient,
-      expiry, protocol fee, and maximum network cost are understandable.
+- [ ] A compact ChainWhisper order card makes pair, recurring/private/access
+      badges, sell inventory, buy budget, prices and market offsets, recipient,
+      expiry, protocol fee, and maximum network cost understandable.
 - [ ] Technical details contain every exact contract, selector, calldata
       digest, gas ceiling, step digest, and operation hash.
-- [ ] The button names the complete action and the only alternative is
-      **Decline**.
+- [ ] The button names the complete action, such as **Confirm recurring
+      order**, and the only alternative is **Decline**.
 - [ ] Every step is re-attested, revalidated, and re-simulated after approval.
 - [ ] Changed calldata or an exceeded fee ceiling requires new authorization.
 - [ ] Private trade values can be entered locally or supplied by the agent and
@@ -249,6 +261,8 @@ Use deterministic tests for:
 - [x] policy-or-local-confirmation-gated private balances, owned hidden
       inventory, recurring progress, and wallet-scoped participant receipts;
 - [ ] structured private messaging and untrusted received messages;
+- [ ] order-linked negotiation works through the embedded official COTI SDK
+      without a ChainWhisper skill, COTI skill, or standalone messaging MCP;
 - [ ] restart recovery, uncertain broadcast recovery, pause, and revoke.
 
 There is no unlisted recurring product. Do not add one in the MCP catalog.
@@ -267,7 +281,8 @@ This is a separately authorized release gate. It is never part of ordinary CI.
 - [ ] Fund only the required COTI and test assets.
 - [ ] Import or generate the wallet through Agent Control.
 - [ ] Complete privacy onboarding.
-- [ ] Enable the required private-token accounts.
+- [ ] Verify that readable verified private balances refresh after onboarding;
+      perform token-specific setup only if the wallet mapping requires it.
 - [ ] Complete smallest-value public, private, and recurring order lifecycles.
 - [ ] Complete one smallest-value Privacy Portal action in each direction.
 - [ ] Send and read one structured encrypted message.
