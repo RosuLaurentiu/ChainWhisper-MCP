@@ -90,6 +90,39 @@ jobs:
           node dist/bin/audit-runtime.js > release-artifacts/runtime-audit.json
           cp CHANGELOG.md release-artifacts/RELEASE_NOTES.md
 
+      - name: Validate runtime audit
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --input-type=module - release-artifacts/runtime-audit.json <<'NODE'
+          import { readFileSync } from 'node:fs';
+
+          const audit = JSON.parse(readFileSync(process.argv[2], 'utf8'));
+          const requirements = [
+            ['blockNumber', typeof audit?.blockNumber === 'string' && audit.blockNumber.trim().length > 0],
+            ['ok', audit?.ok === true],
+            ['registryContractsMatch', audit?.registryContractsMatch === true],
+            ['recurringWritesEnabled', audit?.recurringWritesEnabled === true],
+            ['contracts', Array.isArray(audit?.contracts) && audit.contracts.length > 0],
+            [
+              'contract bytecode and selectors',
+              Array.isArray(audit?.contracts) &&
+                audit.contracts.every(
+                  (contract) =>
+                    contract !== null &&
+                    typeof contract === 'object' &&
+                    contract.bytecodeMatches === true &&
+                    contract.selectorsMatch === true
+                )
+            ]
+          ];
+          const failed = requirements.filter(([, passed]) => !passed).map(([name]) => name);
+          if (failed.length > 0) {
+            process.stderr.write(`Runtime audit failed release requirements: ${failed.join(', ')}\n`);
+            process.exit(1);
+          }
+          NODE
+
       - name: Generate production-only SBOM from installed tarball
         shell: bash
         run: |
@@ -157,6 +190,39 @@ jobs:
           test -s contract-standard-input.json
           test -s runtime-audit.json
           test -s sbom.cdx.json
+
+      - name: Revalidate runtime audit
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --input-type=module - release-artifacts/runtime-audit.json <<'NODE'
+          import { readFileSync } from 'node:fs';
+
+          const audit = JSON.parse(readFileSync(process.argv[2], 'utf8'));
+          const requirements = [
+            ['blockNumber', typeof audit?.blockNumber === 'string' && audit.blockNumber.trim().length > 0],
+            ['ok', audit?.ok === true],
+            ['registryContractsMatch', audit?.registryContractsMatch === true],
+            ['recurringWritesEnabled', audit?.recurringWritesEnabled === true],
+            ['contracts', Array.isArray(audit?.contracts) && audit.contracts.length > 0],
+            [
+              'contract bytecode and selectors',
+              Array.isArray(audit?.contracts) &&
+                audit.contracts.every(
+                  (contract) =>
+                    contract !== null &&
+                    typeof contract === 'object' &&
+                    contract.bytecodeMatches === true &&
+                    contract.selectorsMatch === true
+                )
+            ]
+          ];
+          const failed = requirements.filter(([, passed]) => !passed).map(([name]) => name);
+          if (failed.length > 0) {
+            process.stderr.write(`Runtime audit failed release requirements: ${failed.join(', ')}\n`);
+            process.exit(1);
+          }
+          NODE
 
       - name: Inspect existing registry version
         id: registry

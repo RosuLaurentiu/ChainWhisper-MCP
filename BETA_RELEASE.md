@@ -32,18 +32,18 @@ authorize a funded Mainnet transaction.
 
 ## Repository settings required before tagging
 
-- [ ] Confirm the repository is the standalone ChainWhisper MCP repository.
-- [ ] Enable private vulnerability reporting.
-- [ ] Enable Dependabot security updates.
-- [ ] Enable CodeQL default or the committed CodeQL workflow.
-- [ ] Require dependency review on pull requests.
-- [ ] Protect `main` and require the complete CI matrix.
-- [ ] Protect `v*` tags against deletion and unauthorized creation.
+- [x] Confirm the repository is the standalone ChainWhisper MCP repository.
+- [x] Enable private vulnerability reporting.
+- [x] Enable Dependabot security updates.
+- [x] Enable CodeQL default or the committed CodeQL workflow.
+- [x] Require dependency review on pull requests.
+- [x] Protect `main` and require the complete CI matrix.
+- [x] Protect `v*` tags against deletion and unauthorized creation.
 - [ ] Require signed or otherwise reviewed release tags according to the
       organization policy.
-- [ ] Create the protected `npm-beta` environment.
-- [ ] Require an environment reviewer.
-- [ ] Limit deployment branches/tags to protected release tags.
+- [x] Create the protected `npm-beta` environment.
+- [x] Require an environment reviewer.
+- [x] Limit deployment branches/tags to protected release tags.
 
 The committed workflows do not replace repository branch, tag, environment, or
 vulnerability-reporting settings.
@@ -53,9 +53,11 @@ vulnerability-reporting settings.
 - [ ] Verify the maintainer can publish the exact
       `@chainwhisper/agent-tools` package.
 - [ ] Do not use an alternate package name or scope.
-- [ ] For the first publish only, create a short-lived granular npm token
-      restricted to this package and store it as the protected environment
-      secret `NPM_TOKEN`.
+- [ ] For the first publish only, create the shortest-lived granular npm token
+      with read/write access restricted to the `@chainwhisper` scope and
+      **Bypass 2FA** enabled, then store it as the protected environment secret
+      `NPM_TOKEN`. The package does not exist yet, so package-specific token
+      restriction is not available for the bootstrap publish.
 - [ ] Never place an npm token in source, workflow inputs, issues, logs, or a
       conversation.
 - [ ] After the first publish, configure npm trusted publishing for this exact
@@ -67,12 +69,16 @@ publishing.
 
 ## Source identity
 
-- [ ] `package.json` is `0.1.0-beta.0`.
-- [ ] `src/shared/version.ts` is the same version.
-- [ ] `CHANGELOG.md` contains the exact version and date.
+- [x] `package.json` is `0.1.0-beta.0`.
+- [x] `src/shared/version.ts` is the same version.
+- [x] `CHANGELOG.md` contains the exact version and date.
 - [ ] The release commit is reviewed and contained in protected `main`.
 - [ ] The exact protected tag is `v0.1.0-beta.0`.
-- [ ] No conflicting package with that immutable version exists on npm.
+- [x] No conflicting package with that immutable version exists on npm.
+
+The public npm registry returned `E404` for the package and version on
+2026-08-08. Recheck immediately before tagging because registry state can
+change independently of this repository.
 
 The release workflow rejects a tag/package/source mismatch, a non-beta
 version, a tag outside `main`, and a conflicting already-published artifact. If
@@ -122,15 +128,15 @@ npm run audit:contract-provenance
 
 Confirm:
 
-- [ ] No test, smoke, or audit signed or broadcast a transaction.
-- [ ] The unconfigured signer started in `wallet-setup-required`.
-- [ ] `chainwhisper_open_control_panel` returned no URL or token.
-- [ ] The exact tarball installed and both npm-created shims started in a clean
+- [x] No test, smoke, or audit signed or broadcast a transaction.
+- [x] The unconfigured signer started in `wallet-setup-required`.
+- [x] `chainwhisper_open_control_panel` returned no URL or token.
+- [x] The exact tarball installed and both npm-created shims started in a clean
       consumer.
-- [ ] The production dependency audit reports no advisory.
-- [ ] Every ChainWhisper, onboarding, private-token, Privacy Portal, and
+- [x] The production dependency audit reports no advisory.
+- [x] Every ChainWhisper, onboarding, private-token, Privacy Portal, and
       messaging bytecode attestation passed.
-- [ ] Planner, configured-signer, and wallet-setup `tools/list` names and input
+- [x] Planner, configured-signer, and wallet-setup `tools/list` names and input
       schemas exactly match the README allowlists and the locked domain,
       signer-tool, and package-smoke expectations; no extra SDK, setup,
       recovery, credential, or arbitrary-transaction tool is public.
@@ -275,9 +281,15 @@ only in wallet-scoped local signer state.
 ## Disposable Mainnet canary
 
 This is a separately authorized release gate. It is never part of ordinary CI.
+Push the protected tag and let the unprivileged `build-evidence` job upload the
+immutable release artifact first, but do not approve the `npm-beta`
+environment. Download and verify that exact Ubuntu-built tarball and its
+`SHA256SUMS`, then run the canary from those bytes while publication remains
+paused. A Windows checkout can use different line endings and is not a
+byte-identical substitute.
 
 - [ ] Use a new disposable Agent Wallet with the smallest useful amounts.
-- [ ] Record the exact release tarball checksum.
+- [ ] Record the exact workflow-built release tarball checksum.
 - [ ] Fund only the required COTI and test assets.
 - [ ] Import or generate the wallet through Agent Control.
 - [ ] Complete privacy onboarding.
@@ -290,6 +302,9 @@ This is a separately authorized release gate. It is never part of ordinary CI.
 - [ ] Exercise pause and revoke.
 - [ ] Remove remaining funds after the canary.
 - [ ] Record only public transaction links and secret-safe diagnostics.
+
+If the canary fails, leave `npm-beta` unapproved, fix the defect, and prepare
+`0.1.0-beta.1`. Never move, delete, or reuse the protected beta.0 tag.
 
 ## Immutable evidence and publish
 
