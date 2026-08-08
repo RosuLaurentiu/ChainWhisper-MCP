@@ -1,10 +1,15 @@
-import { canonicalize, sha256Hex } from '../shared/index.js';
-import type {
-  ActivationApprovalRequestV1,
-  ActivationApprovalResultV1,
-  ActiveAutonomyPolicyV1,
-  AutonomyLocalApprovalHooks,
-  AutonomyPolicyProposalV1,
+import {
+  canonicalize,
+  sha256Hex,
+  type HexString,
+} from '../shared/index.js';
+import {
+  autonomyResumeBinding,
+  type ActivationApprovalRequestV1,
+  type ActivationApprovalResultV1,
+  type ActiveAutonomyPolicyV1,
+  type AutonomyLocalApprovalHooks,
+  type AutonomyPolicyProposalV1,
 } from './autonomy.js';
 import { ConfirmationGate } from './confirmation.js';
 import { SignerError } from './errors.js';
@@ -29,7 +34,12 @@ const privateAmountAuthority = (
     ? 'The agent may both choose private amounts and view policy-scoped private balances, hidden order inventory/progress, and participant receipts.'
     : 'The agent may neither choose private amounts nor view policy-scoped private balances, hidden order inventory/progress, or participant receipts under this policy.';
 
-type PolicyDetail = { label: string; value: string };
+export type AutonomyPolicyResumeDetail = {
+  label: string;
+  value: string;
+};
+
+type PolicyDetail = AutonomyPolicyResumeDetail;
 
 const localTime = (iso: string): string =>
   `${new Date(iso).toLocaleString()} (local time)`;
@@ -429,6 +439,33 @@ const editedProposal = (
   return candidate;
 };
 
+export const autonomyPolicyResumeDetails = (
+  policy: ActiveAutonomyPolicyV1,
+): AutonomyPolicyResumeDetail[] => [
+  { label: 'Policy id', value: policy.id },
+  { label: 'Policy mode', value: policy.mode },
+  { label: 'Expires', value: localTime(policy.expiresAt) },
+  {
+    label: 'Private amount choice and policy-scoped state viewing',
+    value: privateAmountAuthority(policy.agentVisiblePrivateAmounts),
+  },
+  ...(policy.mode === 'bounded'
+    ? boundedScopeDetails(policy)
+    : [
+        {
+          label: 'Allowed surface',
+          value:
+            'Audited ChainWhisper orders, recurring actions, Privacy Portal transactions, and private messaging only',
+        },
+        {
+          label: 'Still forbidden',
+          value:
+            'Arbitrary calldata/transfers, unknown contracts, administration, wallet replacement, onboarding, token setup, policy changes, and secret deletion',
+        },
+      ]),
+  { label: 'Exact terms digest', value: policy.termsDigest },
+];
+
 const lifecycleConfirmation = (
   action: 'resume' | 'revoke',
   policy: ActiveAutonomyPolicyV1,
@@ -453,32 +490,7 @@ const lifecycleConfirmation = (
     orderTypeLabel: `${policy.mode} autonomy policy`,
     assets: [],
     amounts: [],
-    details: [
-      { label: 'Policy id', value: policy.id },
-      { label: 'Policy mode', value: policy.mode },
-      { label: 'Expires', value: localTime(policy.expiresAt) },
-      {
-        label: 'Private amount choice and policy-scoped state viewing',
-        value: privateAmountAuthority(
-          policy.agentVisiblePrivateAmounts,
-        ),
-      },
-      ...(policy.mode === 'bounded'
-        ? boundedScopeDetails(policy)
-        : [
-            {
-              label: 'Allowed surface',
-              value:
-                'Audited ChainWhisper orders, recurring actions, Privacy Portal transactions, and private messaging only',
-            },
-            {
-              label: 'Still forbidden',
-              value:
-                'Arbitrary calldata/transfers, unknown contracts, administration, wallet replacement, onboarding, token setup, policy changes, and secret deletion',
-            },
-          ]),
-      { label: 'Exact terms digest', value: policy.termsDigest },
-    ],
+    details: autonomyPolicyResumeDetails(policy),
     counterparty: null,
     spender: null,
     fee: 'No transaction or protocol fee',
@@ -508,6 +520,43 @@ const lifecycleConfirmation = (
   };
 };
 
+const resumeConfirmation = (
+  policies: readonly ActiveAutonomyPolicyV1[],
+): ConfirmationRequest | null => {
+  const first = policies[0];
+  if (!first) return null;
+  const operationHash = autonomyResumeBinding(policies);
+  if (policies.length === 1) {
+    return {
+      ...lifecycleConfirmation('resume', first),
+      operationId: safeId('autonomy-resume', operationHash),
+      operationHash,
+    };
+  }
+  const count = policies.length;
+  return {
+    ...lifecycleConfirmation('resume', first),
+    operationId: safeId('autonomy-resume', operationHash),
+    operationHash,
+    stepId: 'resume-autonomy-policies',
+    orderTypeLabel: `${count} autonomy policies`,
+    details: [
+      { label: 'Policies affected', value: String(count) },
+      ...policies.flatMap((policy, index) =>
+        autonomyPolicyResumeDetails(policy).map(({ label, value }) => ({
+          label: `Policy ${index + 1} · ${label}`,
+          value,
+        })),
+      ),
+    ],
+    expectedResult:
+      `Matching autonomous actions may continue under all ${count} displayed unchanged policies. Private amount choice and policy-scoped state viewing authority is disclosed separately for every policy.`,
+    summary:
+      `Resume ${count} policies under their unchanged terms. Every affected policy is identified by its exact policy id and terms digest below.`,
+    actionButtonLabel: `Resume ${count} policies`,
+  };
+};
+
 const declined = (error: unknown): boolean =>
   error instanceof SignerError &&
   ['CONFIRMATION_DECLINED', 'CONFIRMATION_TIMEOUT'].includes(error.code);
@@ -516,15 +565,24 @@ export class ControlPageAutonomyApprovals
   implements AutonomyLocalApprovalHooks
 {
   readonly #confirmation: ConfirmationGate;
-  #resumePreapproved = false;
+  #resumePreapprovedBinding: HexString | null = null;
   #revocationPreapprovedPolicyId: string | null = null;
 
   constructor(confirmation: ConfirmationGate) {
     this.#confirmation = confirmation;
   }
 
-  preapproveNextResumeFromControlPage(): void {
-    this.#resumePreapproved = true;
+  preapproveNextResumeFromControlPage(binding?: HexString): () => void {
+    if (!binding) {
+      this.#resumePreapprovedBinding = null;
+      return () => undefined;
+    }
+    this.#resumePreapprovedBinding = binding;
+    return () => {
+      if (this.#resumePreapprovedBinding === binding) {
+        this.#resumePreapprovedBinding = null;
+      }
+    };
   }
 
   preapproveNextRevocationFromControlPage(policyId: string): void {
@@ -551,16 +609,15 @@ export class ControlPageAutonomyApprovals
   async approveResume(request: {
     policies: ActiveAutonomyPolicyV1[];
   }): Promise<boolean> {
-    if (this.#resumePreapproved) {
-      this.#resumePreapproved = false;
-      return true;
+    if (this.#resumePreapprovedBinding !== null) {
+      const preapprovedBinding = this.#resumePreapprovedBinding;
+      this.#resumePreapprovedBinding = null;
+      return preapprovedBinding === autonomyResumeBinding(request.policies);
     }
-    const policy = request.policies.at(-1);
-    if (!policy) return false;
+    const confirmation = resumeConfirmation(request.policies);
+    if (!confirmation) return false;
     try {
-      await this.#confirmation.confirm(
-        lifecycleConfirmation('resume', policy),
-      );
+      await this.#confirmation.confirm(confirmation);
       return true;
     } catch (error) {
       if (declined(error)) return false;

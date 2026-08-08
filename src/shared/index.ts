@@ -1,4 +1,5 @@
 export * from './canonical.js';
+export * from './marketReference.js';
 export * from './orderClassification.js';
 export * from './pairing.js';
 export * from './privacyBridge.js';

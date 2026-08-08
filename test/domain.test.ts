@@ -241,7 +241,7 @@ const makeService = (
 };
 
 describe('ChainWhisperDomainService price references', () => {
-  it('does not require an amount and keeps market-only venues out of execution ranking', async () => {
+  it('keeps timestamp-less market quotes visible but out of execution ranking', async () => {
     const { gateway, service } = makeService();
     gateway.references = [
       {
@@ -252,7 +252,7 @@ describe('ChainWhisperDomainService price references', () => {
         quoteAsset,
         price: '2.5',
         basis: 'quote_per_base',
-        observedAt: '2026-07-27T00:00:00.000Z',
+        observedAt: null,
         executable: false,
         liquidityChecked: false
       }
@@ -271,7 +271,7 @@ describe('ChainWhisperDomainService price references', () => {
         ranking: null,
         rankingUnavailableReason: 'amount_not_supplied',
         executableReferences: [],
-        referenceOnly: [{ id: 'carbon', price: '2.5' }]
+        referenceOnly: [{ id: 'carbon', price: '2.5', observedAt: null }]
       }
     });
   });
@@ -1506,6 +1506,95 @@ describe('ChainWhisperDomainService preparation', () => {
         code: 'provider_error',
         message: expect.stringContaining('No compatible live market reference')
       }
+    });
+    expect(gateway.buildExecutionPlan).not.toHaveBeenCalled();
+  });
+
+  it('rejects timestamp-less market quotes for recurring market-offset planning', async () => {
+    const { gateway, service } = makeService();
+    gateway.references = [
+      {
+        id: 'carbon-without-provider-time',
+        venue: 'carbon',
+        source: 'market',
+        baseAsset,
+        quoteAsset,
+        price: '2',
+        basis: 'quote_per_base',
+        observedAt: null,
+        executable: false,
+        liquidityChecked: false
+      }
+    ];
+
+    await expect(
+      service.prepareCreateRecurring({
+        wallet: addresses.wallet,
+        baseAsset: 'BASE',
+        quoteAsset: 'QUOTE',
+        buyPrice: { reference: 'market', offsetBps: -1000 },
+        sellPrice: { reference: 'market', offsetBps: 1000 },
+        buyQuoteLiquidity: '10'
+      })
+    ).resolves.toMatchObject({
+      ok: false,
+      error: {
+        code: 'provider_error',
+        message: expect.stringContaining('No compatible live market reference')
+      }
+    });
+    expect(gateway.buildExecutionPlan).not.toHaveBeenCalled();
+
+    await expect(
+      service.prepareCreateRecurring({
+        wallet: addresses.wallet,
+        baseAsset: 'BASE',
+        quoteAsset: 'QUOTE',
+        buyPrice: '1.8',
+        sellPrice: '2.2',
+        buyQuoteLiquidity: '10'
+      })
+    ).resolves.toMatchObject({
+      ok: true,
+      data: {
+        status: 'ready',
+        intent: { buyPrice: '1.8', sellPrice: '2.2' }
+      }
+    });
+    expect(gateway.buildExecutionPlan).toHaveBeenCalledOnce();
+  });
+
+  it('rejects an expired authoritative market timestamp despite a fresh observation time', async () => {
+    const now = Date.parse('2026-07-27T00:10:00.000Z');
+    const { gateway, service } = makeService(() => now);
+    gateway.references = [
+      {
+        id: 'carbon-expired-authoritative-time',
+        venue: 'carbon',
+        source: 'market',
+        baseAsset,
+        quoteAsset,
+        price: '2',
+        basis: 'quote_per_base',
+        observedAt: '2026-07-27T00:09:30.000Z',
+        expiresAt: '2026-07-27T00:09:59.999Z',
+        executable: false,
+        liquidityChecked: false
+      }
+    ];
+
+    await expect(
+      service.prepareCreateRecurring({
+        wallet: addresses.wallet,
+        baseAsset: 'BASE',
+        quoteAsset: 'QUOTE',
+        buyPrice: { reference: 'market', offsetBps: -1000 },
+        sellPrice: { reference: 'market', offsetBps: 1000 },
+        buyQuoteLiquidity: '10'
+      })
+    ).resolves.toMatchObject({
+      ok: false,
+      error: { code: 'provider_error' }
     });
     expect(gateway.buildExecutionPlan).not.toHaveBeenCalled();
   });

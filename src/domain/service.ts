@@ -8,6 +8,10 @@ import {
   parseDecimal
 } from './decimal.js';
 import { DomainInputError, toolFailure } from './errors.js';
+import {
+  MARKET_REFERENCE_MAX_AGE_MS,
+  MARKET_REFERENCE_MAX_FUTURE_SKEW_MS
+} from '../shared/marketReference.js';
 import { deriveOrderClassificationV1 } from '../shared/orderClassification.js';
 import type {
   Address,
@@ -71,9 +75,6 @@ import {
 import { CHAINWHISPER_CHAIN_ID, MAX_ORDER_PAGE_SIZE } from './types.js';
 
 const safeString = (value: unknown, fallback = ''): string => (typeof value === 'string' ? value : fallback);
-const MAX_MARKET_REFERENCE_AGE_MS = 5 * 60 * 1_000;
-const MAX_MARKET_REFERENCE_FUTURE_SKEW_MS = 30 * 1_000;
-
 const resolveCreateAxes = (
   input: {
     access?: unknown;
@@ -443,13 +444,18 @@ const normalizeReference = (
     reference.baseAsset.id === quoteAsset.id && reference.quoteAsset.id === baseAsset.id;
   if (!direct && !reversed) return null;
   if (!isPositiveDecimal(reference.price)) return null;
-  const observedAt = Date.parse(reference.observedAt);
+  const observedAt =
+    typeof reference.observedAt === 'string'
+      ? Date.parse(reference.observedAt)
+      : reference.observedAt === null
+        ? null
+        : Number.NaN;
   const expiresAt =
     reference.expiresAt === undefined || reference.expiresAt === null
       ? null
       : Date.parse(reference.expiresAt);
   if (
-    !Number.isFinite(observedAt) ||
+    (observedAt !== null && !Number.isFinite(observedAt)) ||
     (expiresAt !== null && !Number.isFinite(expiresAt))
   ) {
     return null;
@@ -492,6 +498,13 @@ const normalizeReference = (
 const rankingPrice = (reference: NormalizedPriceReference): string =>
   reference.executionPrice ?? reference.price;
 
+const referenceObservationTime = (
+  reference: NormalizedPriceReference
+): number =>
+  reference.observedAt === null
+    ? Number.NEGATIVE_INFINITY
+    : Date.parse(reference.observedAt);
+
 const sortExecutableReferences = (
   references: NormalizedPriceReference[],
   side: ComparePriceReferencesInput['side']
@@ -499,7 +512,8 @@ const sortExecutableReferences = (
   [...references].sort((left, right) => {
     const priceOrder = compareDecimals(rankingPrice(left), rankingPrice(right));
     if (priceOrder !== 0) return side === 'buy' ? priceOrder : -priceOrder;
-    const timeOrder = Date.parse(right.observedAt) - Date.parse(left.observedAt);
+    const timeOrder =
+      referenceObservationTime(right) - referenceObservationTime(left);
     return timeOrder || left.id.localeCompare(right.id);
   });
 
@@ -511,18 +525,23 @@ const decimalToAtomic = (value: string, decimals: number): bigint | null => {
   return parsed.coefficient * 10n ** BigInt(decimals - parsed.scale);
 };
 
+type TimestampedPriceReference = NormalizedPriceReference & {
+  observedAt: string;
+};
+
 const isFreshMarketReference = (
   reference: NormalizedPriceReference,
   now: number
-): boolean => {
+): reference is TimestampedPriceReference => {
+  if (reference.observedAt === null) return false;
   const observedAt = Date.parse(reference.observedAt);
   const expiresAt = reference.expiresAt
     ? Date.parse(reference.expiresAt)
     : null;
   return (
     Number.isFinite(observedAt) &&
-    observedAt <= now + MAX_MARKET_REFERENCE_FUTURE_SKEW_MS &&
-    now - observedAt <= MAX_MARKET_REFERENCE_AGE_MS &&
+    observedAt <= now + MARKET_REFERENCE_MAX_FUTURE_SKEW_MS &&
+    now - observedAt <= MARKET_REFERENCE_MAX_AGE_MS &&
     (expiresAt === null || (Number.isFinite(expiresAt) && expiresAt > now))
   );
 };
@@ -1542,7 +1561,7 @@ export class ChainWhisperDomainService {
       const needsMarketReference =
         buyPriceInput?.kind === 'market' ||
         sellPriceInput?.kind === 'market';
-      let marketReference: NormalizedPriceReference | null = null;
+      let marketReference: TimestampedPriceReference | null = null;
       if (needsMarketReference && baseAsset && quoteAsset) {
         const references = (
           await this.#gateway.getPriceReferences({
@@ -1556,15 +1575,15 @@ export class ChainWhisperDomainService {
             normalizeReference(reference, baseAsset, quoteAsset)
           )
           .filter(
-            (reference): reference is NormalizedPriceReference =>
-              Boolean(
-                reference?.source === 'market' &&
-                isFreshMarketReference(reference, this.#now())
-              )
+            (reference): reference is TimestampedPriceReference =>
+              reference !== null &&
+              reference.source === 'market' &&
+              isFreshMarketReference(reference, this.#now())
           )
           .sort((left, right) => {
             const time =
-              Date.parse(right.observedAt) - Date.parse(left.observedAt);
+              referenceObservationTime(right) -
+              referenceObservationTime(left);
             return time || left.id.localeCompare(right.id);
           });
         marketReference = references[0] ?? null;
@@ -1683,6 +1702,7 @@ export class ChainWhisperDomainService {
                 venue: marketReference.venue,
                 price: marketReference.price,
                 observedAt: marketReference.observedAt,
+                expiresAt: marketReference.expiresAt,
                 buyOffsetBps:
                   buyPriceInput?.kind === 'market'
                     ? buyPriceInput.offsetBps

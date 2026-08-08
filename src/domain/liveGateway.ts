@@ -1426,13 +1426,13 @@ export class LiveChainWhisperDomainGateway implements DomainGateway {
         quoteAsset,
         price,
         basis: 'quote_per_base',
-        observedAt: new Date(this.#now()).toISOString(),
+        observedAt: null,
         executable: false,
         liquidityChecked: false,
         note:
           baseAsset.kind === 'private-erc20' || quoteAsset.kind === 'private-erc20'
-            ? 'Public-token counterparts were used for this reference.'
-            : 'Reference price only; executable liquidity was not checked.'
+            ? 'Public-token counterparts were used. Provider observation time is unavailable and freshness is unknown; executable liquidity was not checked.'
+            : 'Reference price only; provider observation time is unavailable, freshness is unknown, and executable liquidity was not checked.'
       };
     } catch {
       return null;

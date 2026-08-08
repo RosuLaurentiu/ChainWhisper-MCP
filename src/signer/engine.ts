@@ -1,5 +1,6 @@
 import {
   canonicalize,
+  type HexString,
   type SignedActionEnvelopeV1,
 } from '../shared/index.js';
 
@@ -21,7 +22,11 @@ import {
   type PolicyExposureV1,
 } from './autonomy.js';
 import { buildPolicyExposure } from './policyExposure.js';
-import { decodeCreatedOrderResult } from './orderResult.js';
+import {
+  decodeCreatedOrderReceipt,
+  expectsCreatedOrderReceipt,
+} from './orderResult.js';
+import { bindGeneratedAccessSecretToOrder } from './privateInputs.js';
 import {
   activitySnapshotReference,
   buildLocalActivitySnapshot,
@@ -36,6 +41,7 @@ import type {
   OperationStatusV2,
   PrivateInputMaterializer,
   RecoverOperationResult,
+  TransactionReceipt,
   TransactionSimulator,
   TransactionFeeQuote,
   WalletTransport,
@@ -426,14 +432,7 @@ const semanticResult = (
 
 const expectsCreatedOrderResult = (
   envelope: SignedActionEnvelopeV1 | null,
-): boolean =>
-  Boolean(
-    envelope?.intent.orderType?.relation === 'primary' &&
-      (
-        envelope.intent.action === 'create_trade' ||
-        envelope.intent.action === 'create_recurring'
-      ),
-  );
+): boolean => Boolean(envelope && expectsCreatedOrderReceipt(envelope));
 
 const redactedSummary = (envelope: SignedActionEnvelopeV1): string =>
   `ChainWhisper ${envelope.intent.action.replaceAll('_', ' ')} completed.`;
@@ -535,6 +534,20 @@ export class SignerEngine {
       options.nonceQueue ??
       new NonceQueue(() => this.#wallet.getPendingNonce());
     this.#autonomy = options.autonomy ?? null;
+  }
+
+  async #receiptSemanticResult(
+    envelope: SignedActionEnvelopeV1,
+    receipt: TransactionReceipt,
+  ): Promise<OperationSemanticResultV2 | undefined> {
+    const decoded = decodeCreatedOrderReceipt(envelope, receipt);
+    if (!decoded) return undefined;
+    await bindGeneratedAccessSecretToOrder(this.#vault, {
+      operationHash: envelope.operationHash,
+      escrowContract: decoded.orderBinding.escrowContract,
+      localId: decoded.orderBinding.localId,
+    });
+    return decoded.result;
   }
 
   get nonceQueue(): NonceQueue {
@@ -1473,42 +1486,49 @@ export class SignerEngine {
         }
         const broadcast = await this.#nonceQueue.runTransaction(
           async (nonce) => {
+            let prepared: {
+              hash: HexString;
+              signedTransaction: HexString;
+            };
             if (autonomyReservation && this.#autonomy) {
-              const authorized =
-                await this.#autonomy.authorizeReservedWrite(
-                  autonomyReservation.id,
-                );
-              if (!authorized.allowed) {
-                throw new SignerError(
-                  'WRITE_UNAVAILABLE',
-                  `Autonomy write authorization is no longer active: ${authorized.denial.code}.`,
-                );
-              }
-              autonomyReservation = authorized.value;
-            }
-            const prepared = await this.#wallet.prepareTransaction({
-              ...requestWithoutNonce,
-              nonce,
-            });
-            await this.#journal.recordPreparedTransaction(
-              envelope.operationId,
-              nonce,
-              prepared.hash,
-              stepIndex,
-            );
-            if (autonomyReservation && this.#autonomy) {
-              const marked = await this.#autonomy.markSigned(
+              const signed = await this.#autonomy.executeAuthorizedWrite(
                 autonomyReservation.id,
-                prepared.hash,
+                async () => {
+                  this.#verifier.assertFreshness(envelope);
+                  const value = await this.#wallet.prepareTransaction({
+                    ...requestWithoutNonce,
+                    nonce,
+                  });
+                  await this.#journal.recordPreparedTransaction(
+                    envelope.operationId,
+                    nonce,
+                    value.hash,
+                    stepIndex,
+                  );
+                  return { transactionHash: value.hash, value };
+                },
               );
-              if (!marked.allowed) {
+              if (!signed.allowed) {
                 throw new SignerError(
                   'WRITE_UNAVAILABLE',
-                  `Autonomy reservation could not record the signed transaction: ${marked.denial.code}.`,
+                  `Autonomy write authorization is no longer active: ${signed.denial.code}.`,
                 );
               }
               autonomySigned = true;
-              autonomyReservation = marked.value;
+              autonomyReservation = signed.value.reservation;
+              prepared = signed.value.value;
+            } else {
+              this.#verifier.assertFreshness(envelope);
+              prepared = await this.#wallet.prepareTransaction({
+                ...requestWithoutNonce,
+                nonce,
+              });
+              await this.#journal.recordPreparedTransaction(
+                envelope.operationId,
+                nonce,
+                prepared.hash,
+                stepIndex,
+              );
             }
             let observed = true;
             try {
@@ -1560,11 +1580,15 @@ export class SignerEngine {
             'Transaction receipt does not match the locally signed transaction.',
           );
         }
+        const semanticResult = await this.#receiptSemanticResult(
+          envelope,
+          receipt,
+        );
         record =
           (await this.#journal.recordReceipt(
             envelope.operationId,
             receipt,
-            decodeCreatedOrderResult(envelope, receipt) ?? undefined,
+            semanticResult,
           )) ?? record;
         if (receipt.status === 'pending') {
           if (autonomyReservation && this.#autonomy) {
@@ -1775,7 +1799,10 @@ export class SignerEngine {
         ) {
           continue;
         }
-        const semantic = decodeCreatedOrderResult(envelope, receipt);
+        const semantic = await this.#receiptSemanticResult(
+          envelope,
+          receipt,
+        );
         if (!semantic) continue;
         const updated =
           (await this.#journal.recordReceipt(
@@ -2029,14 +2056,14 @@ export class SignerEngine {
           errorCodes: [...record.errorCodes],
         };
       }
+      const recoveredSemantic = recoveryEnvelope
+        ? await this.#receiptSemanticResult(recoveryEnvelope, receipt)
+        : undefined;
       record =
         (await this.#journal.recordReceipt(
           operationId,
           receipt,
-          recoveryEnvelope
-            ? decodeCreatedOrderResult(recoveryEnvelope, receipt) ??
-                undefined
-            : undefined,
+          recoveredSemantic,
         )) ??
         record;
       receiptStatus = receipt.status;

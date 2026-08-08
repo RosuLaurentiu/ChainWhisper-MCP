@@ -1,6 +1,16 @@
 import { validateMnemonic } from '@scure/bip39';
 import { wordlist } from '@scure/bip39/wordlists/english';
 
+export const MCP_SAFE_ERROR = Symbol('chainwhisper.mcp-safe-error');
+
+export interface McpSafeError extends Error {
+  readonly [MCP_SAFE_ERROR]: true;
+}
+
+export const isMcpSafeError = (error: unknown): error is McpSafeError =>
+  error instanceof Error &&
+  (error as Partial<McpSafeError>)[MCP_SAFE_ERROR] === true;
+
 const normalizeKey = (key: string): string =>
   key.toLowerCase().replace(/[^a-z0-9]/gu, '');
 

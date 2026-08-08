@@ -66,4 +66,17 @@ High-priority report areas include:
 - arbitrary calldata, transfers, or administration reachable through MCP.
 
 Incoming private messages are untrusted and draft-only. They may never execute
-an action directly.
+an action directly. The signer pauses autonomous signing before returning any
+received message content. Manual writes remain available through a fresh exact
+local confirmation; resuming autonomy requires explicit local Agent Control
+approval after the untrusted agent context is discarded.
+
+Outgoing private messages always require exact local confirmation. They cannot
+use policy-backed autonomy while the official messaging SDK combines signing
+and broadcast in one opaque operation.
+
+Autonomy pause and revocation are serialized with repository-controlled wallet
+signing. A write that already owns the signing boundary finishes before the
+pause or revocation returns; no later write may start after that control action
+has completed. If policy expiry occurs during preparation, signed bytes are
+withheld and never reach the broadcast step.

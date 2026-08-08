@@ -450,6 +450,90 @@ describe('audited private transaction routes', () => {
     ).toEqual(['0', '0']);
   });
 
+  it('enforces the signed market-reference deadline while preserving exact-price plans', async () => {
+    const manifest = await loadRuntimeManifest();
+    const marketIntent: CreateRecurringIntent = {
+      action: 'create_recurring',
+      wallet: WALLET,
+      baseAsset: asset(manifest, 'p.WISP'),
+      quoteAsset: asset(manifest, 'p.USDT'),
+      buyPrice: '2',
+      sellPrice: '2.1',
+      buyQuoteLiquidity: '4',
+      sellBaseLiquidity: '3',
+      access: 'public',
+      recipient: null,
+      amountVisibility: 'visible',
+      priceReference: {
+        id: 'market-reference-test',
+        venue: 'trusted-test-market',
+        price: '2.05',
+        observedAt: '2026-07-27T11:59:30.000Z',
+        expiresAt: null,
+        buyOffsetBps: -244,
+        sellOffsetBps: 244,
+      },
+      secretPolicy: { kind: 'none' },
+    };
+    const planner = new ManifestExecutionPlanner({
+      manifest,
+      rpc: new FakePlannerRpc(),
+      now: () => NOW,
+    });
+    const execution = await planner.plan(marketIntent, status(manifest));
+    const marketEnvelope = (
+      await new SignedDomainEnvelopeFactory({
+        manifest,
+        pairingSecret: PAIRING,
+        now: () => NOW,
+      }).create(marketIntent, execution)
+    ).payload as SignedActionEnvelopeV1;
+    let now = NOW;
+    const verifier = new ActionEnvelopeVerifier(
+      config(manifest),
+      runtimeState(manifest, marketEnvelope),
+      () => now,
+    );
+
+    expect(marketEnvelope.expiresAt).toBe(
+      '2026-07-27T12:04:30.000Z',
+    );
+    expect(() => verifier.assertFreshness(marketEnvelope)).not.toThrow();
+    expect(() =>
+      verifier.assertFreshness({
+        ...marketEnvelope,
+        expiresAt: '2026-07-27T12:15:00.000Z',
+      }),
+    ).toThrowError(
+      expect.objectContaining({ code: 'ENVELOPE_INVALID' }),
+    );
+
+    now = new Date('2026-07-27T12:04:30.000Z');
+    expect(() => verifier.assertFreshness(marketEnvelope)).toThrowError(
+      expect.objectContaining({ code: 'STALE_STATE' }),
+    );
+
+    const exactIntent: CreateRecurringIntent = {
+      ...marketIntent,
+      priceReference: undefined,
+    };
+    const exactExecution = await planner.plan(
+      exactIntent,
+      status(manifest),
+    );
+    const exactEnvelope = (
+      await new SignedDomainEnvelopeFactory({
+        manifest,
+        pairingSecret: PAIRING,
+        now: () => NOW,
+      }).create(exactIntent, exactExecution)
+    ).payload as SignedActionEnvelopeV1;
+    expect(exactEnvelope.expiresAt).toBe(
+      '2026-07-27T12:15:00.000Z',
+    );
+    expect(() => verifier.assertFreshness(exactEnvelope)).not.toThrow();
+  });
+
   it('blocks an unconfigured private-token escrow before any approval and accepts a funded configured route', async () => {
     const manifest = await loadRuntimeManifest();
     const privateToken = asset(manifest, 'p.WISP').address!;

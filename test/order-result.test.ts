@@ -16,6 +16,7 @@ import {
   type SignedActionEnvelopeV1,
 } from '../src/shared/index.js';
 import {
+  decodeCreatedOrderReceipt,
   decodeCreatedOrderResult,
   OperationJournal,
   type Address,
@@ -30,6 +31,8 @@ const OTHER =
   '0x2222222222222222222222222222222222222222' as Address;
 const TAKER =
   '0x3333333333333333333333333333333333333333' as Address;
+const ZERO_ADDRESS =
+  '0x0000000000000000000000000000000000000000' as Address;
 const CONTRACTS = {
   standardEscrow:
     '0x4444444444444444444444444444444444444444' as Address,
@@ -60,16 +63,16 @@ const EVENT_ABIS = {
 
 const classification = (
   route: OrderClassificationV1['route'],
+  relation: OrderClassificationV1['relation'] = 'primary',
+  access: OrderClassificationV1['access'] =
+    route === 'direct-escrow' ? 'direct' : 'public',
 ): OrderClassificationV1 =>
   deriveOrderClassificationV1({
     route,
-    access:
-      route === 'direct-escrow'
-        ? 'direct'
-        : 'public',
+    access,
     privateLiquidity: route === 'private-liquidity-escrow',
     assets: [{ kind: 'erc20' }, { kind: 'erc20' }],
-    relation: 'primary',
+    relation,
   });
 
 const contractKey = (
@@ -110,6 +113,7 @@ const envelopeFor = (
     intent: {
       action: recurring ? 'create_recurring' : 'create_trade',
       orderType: classification(route),
+      ...(route === 'direct-escrow' ? { recipient: TAKER } : {}),
     },
     steps: [
       {
@@ -146,6 +150,7 @@ const openedLog = (
   orderId: bigint,
   maker: Address = WALLET,
   address = CONTRACTS[contractKey(route)],
+  taker: Address = route === 'direct-escrow' ? TAKER : ZERO_ADDRESS,
 ): TransactionLog => {
   if (route === 'standard-escrow') {
     return {
@@ -153,7 +158,7 @@ const openedLog = (
       topics: encodeEventTopics({
         abi: EVENT_ABIS[route],
         eventName: 'TradeOpened',
-        args: { tradeId: orderId, maker, taker: TAKER },
+        args: { tradeId: orderId, maker, taker },
       }),
       data: encodeAbiParameters(
         parseAbiParameters(
@@ -169,7 +174,7 @@ const openedLog = (
       topics: encodeEventTopics({
         abi: EVENT_ABIS[route],
         eventName: 'PrivateOrderOpened',
-        args: { tradeId: orderId, maker, taker: TAKER },
+        args: { tradeId: orderId, maker, taker },
       }),
       data: encodeAbiParameters(
         parseAbiParameters(
@@ -185,7 +190,7 @@ const openedLog = (
       topics: encodeEventTopics({
         abi: EVENT_ABIS[route],
         eventName: 'DirectTradeOpened',
-        args: { tradeId: orderId, maker, taker: TAKER },
+        args: { tradeId: orderId, maker, taker },
       }),
       data: encodeAbiParameters(
         parseAbiParameters(
@@ -200,7 +205,7 @@ const openedLog = (
     topics: encodeEventTopics({
       abi: EVENT_ABIS[route],
       eventName: 'RecurringOrderOpened',
-      args: { orderId, maker, taker: TAKER },
+      args: { orderId, maker, taker },
     }),
     data: encodeAbiParameters(
       parseAbiParameters('uint8, bool, bool, uint64, uint256'),
@@ -238,6 +243,17 @@ describe('created order semantic results', () => {
     'decodes the exact deployed %s create event',
     (route, appLink) => {
       const envelope = envelopeFor(route);
+      expect(
+        decodeCreatedOrderReceipt(
+          envelope,
+          receipt(openedLog(route, 42n)),
+        ),
+      ).toMatchObject({
+        orderBinding: {
+          escrowContract: CONTRACTS[contractKey(route)],
+          localId: '42',
+        },
+      });
       expect(
         decodeCreatedOrderResult(
           envelope,
@@ -279,6 +295,20 @@ describe('created order semantic results', () => {
     expect(
       decodeCreatedOrderResult(
         envelope,
+        receipt(
+          openedLog(
+            route,
+            7n,
+            WALLET,
+            CONTRACTS.standardEscrow,
+            OTHER,
+          ),
+        ),
+      ),
+    ).toBeNull();
+    expect(
+      decodeCreatedOrderResult(
+        envelope,
         receipt(openedLog(route, 7n), openedLog(route, 8n)),
       ),
     ).toBeNull();
@@ -287,6 +317,22 @@ describe('created order semantic results', () => {
         ...receipt(openedLog(route, 7n)),
         status: 'reverted',
       }),
+    ).toBeNull();
+
+    const directEnvelope = envelopeFor('direct-escrow');
+    expect(
+      decodeCreatedOrderResult(
+        directEnvelope,
+        receipt(
+          openedLog(
+            'direct-escrow',
+            7n,
+            WALLET,
+            CONTRACTS.directEscrow,
+            OTHER,
+          ),
+        ),
+      ),
     ).toBeNull();
   });
 
@@ -321,6 +367,55 @@ describe('created order semantic results', () => {
       },
     });
   });
+
+  it.each([
+    ['counter', 'direct-escrow', 'counter', 'direct'],
+    ['edit', 'direct-escrow', 'replacement', 'direct'],
+    [
+      'edit',
+      'private-liquidity-escrow',
+      'replacement',
+      'unlisted',
+    ],
+  ] as const)(
+    'decodes the receipt-created identity for a generated-secret %s flow',
+    (action, route, relation, access) => {
+      const envelope = envelopeFor(route);
+      envelope.intent.action = action;
+      envelope.intent.orderType = classification(
+        route,
+        relation,
+        access,
+      );
+      envelope.intent.accessMode = access;
+      const decoded = decodeCreatedOrderReceipt(
+        envelope,
+        receipt(openedLog(route, 57n)),
+      );
+
+      expect(decoded).toMatchObject({
+        result: {
+          action,
+          canonicalType: { relation, route, access },
+          order: {
+            handle: `cw_${CONTRACTS[contractKey(route)]
+              .slice(2)
+              .toLowerCase()}_57`,
+          },
+        },
+        orderBinding: {
+          escrowContract: CONTRACTS[contractKey(route)],
+          localId: '57',
+        },
+      });
+      expect(
+        decodeCreatedOrderResult(
+          envelope,
+          receipt(openedLog(route, 57n)),
+        ),
+      ).toEqual(decoded?.result);
+    },
+  );
 
   it('persists the decoded identity atomically with its receipt', async () => {
     const stateDirectory = await mkdtemp(

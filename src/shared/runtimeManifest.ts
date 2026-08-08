@@ -308,14 +308,14 @@ export const auditRuntimeManifest = async (
                 entry.bytecodeHash.toLowerCase()
               : selectorSetMatches(code, entry.selectors)
         };
-      } catch (error) {
+      } catch {
         return {
           name,
           address: entry.address,
           expectedBytecodeHash: entry.bytecodeHash,
           bytecodeMatches: false,
           selectorsMatch: false,
-          error: error instanceof Error ? error.message : 'runtime-audit-failed'
+          error: 'runtime-audit-failed'
         };
       }
     }
@@ -361,8 +361,8 @@ export const auditRuntimeManifest = async (
     if (!registryContractsMatch) {
       registryContractsError = 'registry-contract-address-mismatch';
     }
-  } catch (error) {
-    registryContractsError = error instanceof Error ? error.message : 'registry-read-failed';
+  } catch {
+    registryContractsError = 'registry-read-failed';
   }
   const recurring = contracts.find((contract) => contract.name === 'recurringEscrow');
   return {
@@ -414,25 +414,49 @@ export class HttpJsonRpcReader implements JsonRpcReader {
   }
 
   async request<T>(method: string, params: unknown[]): Promise<T> {
-    const response = await fetch(this.#url, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ jsonrpc: '2.0', id: this.#nextId++, method, params }),
-      signal: AbortSignal.timeout(20_000)
-    });
+    let response: Response;
+    try {
+      response = await fetch(this.#url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: this.#nextId++, method, params }),
+        signal: AbortSignal.timeout(20_000)
+      });
+    } catch (error) {
+      // The caught provider error can contain credentials or arbitrary remote prose,
+      // so it must not be retained as this stable boundary error's cause.
+      // eslint-disable-next-line preserve-caught-error
+      throw new Error(
+        error instanceof DOMException && error.name === 'TimeoutError'
+          ? 'rpc-timeout'
+          : 'rpc-transport-failed'
+      );
+    }
     if (!response.ok) {
       throw new Error(`rpc-http-${response.status}`);
     }
-    const payload = (await response.json()) as {
-      result?: T;
-      error?: { code?: number; message?: string };
-    };
-    if (payload.error) {
-      throw new Error(`rpc-${payload.error.code ?? 'error'}:${payload.error.message ?? 'unknown'}`);
+    let payload: unknown;
+    try {
+      payload = await response.json();
+    } catch {
+      throw new Error('rpc-invalid-response');
     }
-    if (payload.result === undefined) {
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+      throw new Error('rpc-invalid-response');
+    }
+    const record = payload as Record<string, unknown>;
+    if (record.error !== undefined && record.error !== null) {
+      const remoteCode =
+        typeof record.error === 'object' &&
+        !Array.isArray(record.error) &&
+        Number.isSafeInteger((record.error as Record<string, unknown>).code)
+          ? String((record.error as Record<string, unknown>).code)
+          : 'unknown';
+      throw new Error(`rpc-json-error:${remoteCode}`);
+    }
+    if (record.result === undefined) {
       throw new Error('rpc-missing-result');
     }
-    return payload.result;
+    return record.result as T;
   }
 }

@@ -3,8 +3,11 @@ import { describe, expect, it } from 'vitest';
 import {
   AUTONOMY_POLICY_VERSION,
   AutonomyPolicyManager,
+  autonomyResumeBinding,
+  isExactAutonomyResumeBinding,
   type AutonomyLocalApprovalHooks,
   type AutonomyPolicyProposalV1,
+  type ActiveAutonomyPolicyV1,
   type PolicyExposureV1,
   validateAutonomyPolicyProposal,
 } from '../src/signer/autonomy.js';
@@ -75,6 +78,7 @@ class TestApprovals implements AutonomyLocalApprovalHooks {
     | null = null;
   resume = true;
   revocation = true;
+  readonly resumeRequests: ActiveAutonomyPolicyV1[][] = [];
 
   async approveActivation(request: {
     proposal: AutonomyPolicyProposalV1;
@@ -85,7 +89,10 @@ class TestApprovals implements AutonomyLocalApprovalHooks {
     return this.activation ?? { approved: true, proposal: request.proposal };
   }
 
-  async approveResume(): Promise<boolean> {
+  async approveResume(request: {
+    policies: ActiveAutonomyPolicyV1[];
+  }): Promise<boolean> {
+    this.resumeRequests.push(structuredClone(request.policies));
     return this.resume;
   }
 
@@ -451,6 +458,228 @@ describe('autonomy policy core', () => {
     }
   });
 
+  it('discloses and hash-binds every policy affected by a global resume', async () => {
+    const { manager } = setup();
+    const first = await manager.activate(boundedProposal());
+    const second = await manager.activate(
+      boundedProposal({
+        expiresAt: new Date(
+          NOW.getTime() + 8 * 24 * 60 * 60 * 1_000,
+        ).toISOString(),
+        agentVisiblePrivateAmounts: false,
+      }),
+    );
+    if (!first.allowed) throw new Error(first.denial.code);
+    if (!second.allowed) throw new Error(second.denial.code);
+
+    const aggregateElicitor = new ValuesElicitor({});
+    const aggregateApprovals = new ControlPageAutonomyApprovals(
+      new ConfirmationGate(aggregateElicitor, 5_000),
+    );
+    await expect(
+      aggregateApprovals.approveResume({
+        policies: [first.value, second.value],
+      }),
+    ).resolves.toBe(true);
+
+    const singleElicitor = new ValuesElicitor({});
+    const singleApprovals = new ControlPageAutonomyApprovals(
+      new ConfirmationGate(singleElicitor, 5_000),
+    );
+    await expect(
+      singleApprovals.approveResume({ policies: [second.value] }),
+    ).resolves.toBe(true);
+
+    const aggregateRequest = aggregateElicitor.requests[0]!;
+    expect(aggregateRequest.details.map(({ value }) => value)).toEqual(
+      expect.arrayContaining([
+        first.value.id,
+        first.value.termsDigest,
+        second.value.id,
+        second.value.termsDigest,
+      ]),
+    );
+    expect(aggregateRequest.summary).toContain('2 policies');
+    expect(aggregateRequest.operationHash).not.toBe(
+      singleElicitor.requests[0]!.operationHash,
+    );
+  });
+
+  it('scopes a control-page resume preapproval to one exact policy set and attempt', async () => {
+    const { manager } = setup();
+    const first = await manager.activate(boundedProposal());
+    const second = await manager.activate(
+      boundedProposal({
+        expiresAt: new Date(
+          NOW.getTime() + 8 * 24 * 60 * 60 * 1_000,
+        ).toISOString(),
+      }),
+    );
+    if (!first.allowed) throw new Error(first.denial.code);
+    if (!second.allowed) throw new Error(second.denial.code);
+
+    const elicitor = new ValuesElicitor({});
+    const approvals = new ControlPageAutonomyApprovals(
+      new ConfirmationGate(elicitor, 5_000),
+    );
+    const policies = [first.value, second.value];
+    const binding = autonomyResumeBinding(policies);
+    expect(isExactAutonomyResumeBinding(policies, undefined)).toBe(false);
+    expect(isExactAutonomyResumeBinding(policies, 'invalid')).toBe(false);
+    expect(
+      isExactAutonomyResumeBinding(
+        policies,
+        autonomyResumeBinding([second.value]),
+      ),
+    ).toBe(false);
+    expect(isExactAutonomyResumeBinding(policies, binding)).toBe(true);
+    const clearPreapproval =
+      approvals.preapproveNextResumeFromControlPage(
+        binding,
+      );
+    clearPreapproval();
+    await expect(approvals.approveResume({ policies })).resolves.toBe(true);
+    expect(elicitor.requests).toHaveLength(1);
+
+    const clearAbandonedPreapproval =
+      approvals.preapproveNextResumeFromControlPage(binding);
+    const clearMissingPreapproval =
+      approvals.preapproveNextResumeFromControlPage();
+    clearMissingPreapproval();
+    clearAbandonedPreapproval();
+    await expect(approvals.approveResume({ policies })).resolves.toBe(true);
+    expect(elicitor.requests).toHaveLength(2);
+
+    approvals.preapproveNextResumeFromControlPage(
+      binding,
+    );
+    await expect(
+      approvals.approveResume({ policies: [second.value] }),
+    ).resolves.toBe(false);
+    expect(elicitor.requests).toHaveLength(2);
+  });
+
+  it('uses one exact control-page binding to resume the unchanged two-policy set', async () => {
+    const store = new MemoryProtectedStore();
+    const elicitor = new ValuesElicitor({});
+    const controlApprovals = new ControlPageAutonomyApprovals(
+      new ConfirmationGate(elicitor, 5_000),
+    );
+    const approvals: AutonomyLocalApprovalHooks = {
+      approveActivation: async ({ proposal }) => ({
+        approved: true,
+        proposal,
+      }),
+      approveResume: (request) => controlApprovals.approveResume(request),
+      approveRevocation: async () => true,
+    };
+    let nextId = 0;
+    const manager = new AutonomyPolicyManager({
+      store,
+      approvals,
+      now: () => NOW,
+      idFactory: () => `control-resume-${++nextId}`,
+    });
+    const first = await manager.activate(boundedProposal());
+    const second = await manager.activate(
+      boundedProposal({
+        expiresAt: new Date(
+          NOW.getTime() + 8 * 24 * 60 * 60 * 1_000,
+        ).toISOString(),
+      }),
+    );
+    if (!first.allowed) throw new Error(first.denial.code);
+    if (!second.allowed) throw new Error(second.denial.code);
+    const paused = await manager.pauseGlobal();
+    if (!paused.allowed) throw new Error(paused.denial.code);
+    const pausedPolicies = paused.value.policies
+      .filter(({ policy }) => policy.lifecycle.state === 'paused')
+      .map(({ policy }) => policy);
+    const clearPreapproval =
+      controlApprovals.preapproveNextResumeFromControlPage(
+        autonomyResumeBinding(pausedPolicies),
+      );
+
+    const resumed = await manager.resumeGlobal();
+    clearPreapproval();
+    expect(resumed).toMatchObject({
+      allowed: true,
+      value: {
+        globalPaused: false,
+        policies: [
+          { policy: { id: first.value.id, lifecycle: { state: 'active' } } },
+          {
+            policy: {
+              id: second.value.id,
+              lifecycle: { state: 'active' },
+            },
+          },
+        ],
+      },
+    });
+    expect(elicitor.requests).toHaveLength(0);
+  });
+
+  it('does not reuse a control preapproval when another resume wins the race', async () => {
+    const store = new MemoryProtectedStore();
+    const elicitor = new ValuesElicitor({});
+    const controlApprovals = new ControlPageAutonomyApprovals(
+      new ConfirmationGate(elicitor, 5_000),
+    );
+    const approvals: AutonomyLocalApprovalHooks = {
+      approveActivation: async ({ proposal }) => ({
+        approved: true,
+        proposal,
+      }),
+      approveResume: (request) => controlApprovals.approveResume(request),
+      approveRevocation: async () => true,
+    };
+    let nextId = 0;
+    const manager = new AutonomyPolicyManager({
+      store,
+      approvals,
+      now: () => NOW,
+      idFactory: () => `raced-resume-${++nextId}`,
+    });
+    const competingManager = new AutonomyPolicyManager({
+      store,
+      approvals: new TestApprovals(),
+      now: () => NOW,
+      idFactory: () => `competing-resume-${++nextId}`,
+    });
+    const activated = await manager.activate(boundedProposal());
+    if (!activated.allowed) throw new Error(activated.denial.code);
+    const paused = await manager.pauseGlobal();
+    if (!paused.allowed) throw new Error(paused.denial.code);
+    const pausedPolicies = paused.value.policies
+      .filter(({ policy }) => policy.lifecycle.state === 'paused')
+      .map(({ policy }) => policy);
+    const clearPreapproval =
+      controlApprovals.preapproveNextResumeFromControlPage(
+        autonomyResumeBinding(pausedPolicies),
+      );
+
+    await expect(competingManager.resumeGlobal()).resolves.toMatchObject({
+      allowed: true,
+      value: { globalPaused: false },
+    });
+    try {
+      await expect(manager.resumeGlobal()).resolves.toMatchObject({
+        allowed: true,
+        value: { globalPaused: false },
+      });
+    } finally {
+      clearPreapproval();
+    }
+
+    await manager.pauseGlobal();
+    await expect(manager.resumeGlobal()).resolves.toMatchObject({
+      allowed: true,
+      value: { globalPaused: false },
+    });
+    expect(elicitor.requests).toHaveLength(1);
+  });
+
   it('spells out the combined private authority in the full-autonomy acknowledgement', async () => {
     const elicitor = new ValuesElicitor({
       'autonomy.agentVisiblePrivateAmounts': 'true',
@@ -755,6 +984,274 @@ describe('autonomy policy core', () => {
     });
   });
 
+  it('atomically authorizes a legitimate write and records its signature', async () => {
+    const { manager } = setup();
+    const activated = await manager.activate(boundedProposal());
+    if (!activated.allowed) throw new Error(activated.denial.code);
+    const reserved = await manager.reserve(
+      activated.value.id,
+      fillExposure('a', '10'),
+    );
+    if (!reserved.allowed) throw new Error(reserved.denial.code);
+
+    const result = await manager.executeAuthorizedWrite(
+      reserved.value.id,
+      async () => ({
+        transactionHash: hash('b'),
+        value: { signedTransaction: 'prepared-transaction' },
+      }),
+    );
+
+    expect(result).toMatchObject({
+      allowed: true,
+      value: {
+        reservation: {
+          id: reserved.value.id,
+          state: 'signed',
+          signedTransactionHashes: [hash('b')],
+        },
+        value: { signedTransaction: 'prepared-transaction' },
+      },
+    });
+  });
+
+  it('withholds prepared bytes when the policy expires inside the signing callback', async () => {
+    let now = NOW;
+    const store = new MemoryProtectedStore();
+    const manager = new AutonomyPolicyManager({
+      store,
+      approvals: new TestApprovals(),
+      now: () => now,
+      idFactory: (() => {
+        let nextId = 0;
+        return () => `inflight-expiry-${++nextId}`;
+      })(),
+    });
+    const activated = await manager.activate(boundedProposal());
+    if (!activated.allowed) throw new Error(activated.denial.code);
+    const reserved = await manager.reserve(
+      activated.value.id,
+      fillExposure('8', '10'),
+    );
+    if (!reserved.allowed) throw new Error(reserved.denial.code);
+
+    const result = await manager.executeAuthorizedWrite(
+      reserved.value.id,
+      async () => {
+        now = new Date(Date.parse(activated.value.expiresAt) + 1);
+        return {
+          transactionHash: hash('8'),
+          value: { signedTransaction: 'must-not-be-returned' },
+        };
+      },
+    );
+
+    expect(result).toMatchObject({
+      allowed: false,
+      denial: { code: 'POLICY_EXPIRED' },
+    });
+    expect(result).not.toHaveProperty('value');
+    expect(store.snapshot.reservations[reserved.value.id]).toMatchObject({
+      state: 'signed',
+      signedTransactionHashes: [hash('8')],
+    });
+    expect(store.snapshot.policies[activated.value.id]).toMatchObject({
+      lifecycle: { state: 'expired', reason: 'time-expired' },
+    });
+  });
+
+  it('does not invoke the signature callback after pause, revocation, or expiry', async () => {
+    const pausedSetup = setup();
+    const pausedPolicy = await pausedSetup.manager.activate(
+      boundedProposal(),
+    );
+    if (!pausedPolicy.allowed) throw new Error(pausedPolicy.denial.code);
+    const pausedReservation = await pausedSetup.manager.reserve(
+      pausedPolicy.value.id,
+      fillExposure('b', '10'),
+    );
+    if (!pausedReservation.allowed) {
+      throw new Error(pausedReservation.denial.code);
+    }
+    await pausedSetup.manager.pauseGlobal();
+
+    const revokedSetup = setup();
+    const revokedPolicy = await revokedSetup.manager.activate(
+      boundedProposal(),
+    );
+    if (!revokedPolicy.allowed) throw new Error(revokedPolicy.denial.code);
+    const revokedReservation = await revokedSetup.manager.reserve(
+      revokedPolicy.value.id,
+      fillExposure('c', '10'),
+    );
+    if (!revokedReservation.allowed) {
+      throw new Error(revokedReservation.denial.code);
+    }
+    await revokedSetup.manager.revoke(revokedPolicy.value.id);
+
+    let now = NOW;
+    const expiringManager = new AutonomyPolicyManager({
+      store: new MemoryProtectedStore(),
+      approvals: new TestApprovals(),
+      now: () => now,
+      idFactory: () => 'expiry-write-policy',
+    });
+    const expiringPolicy = await expiringManager.activate(
+      boundedProposal(),
+    );
+    if (!expiringPolicy.allowed) throw new Error(expiringPolicy.denial.code);
+    const expiringReservation = await expiringManager.reserve(
+      expiringPolicy.value.id,
+      fillExposure('d', '10'),
+    );
+    if (!expiringReservation.allowed) {
+      throw new Error(expiringReservation.denial.code);
+    }
+    now = new Date(Date.parse(expiringPolicy.value.expiresAt) + 1);
+
+    let signatures = 0;
+    const sign = async () => {
+      signatures += 1;
+      return { transactionHash: hash('c'), value: 'signed' };
+    };
+    await expect(
+      pausedSetup.manager.executeAuthorizedWrite(
+        pausedReservation.value.id,
+        sign,
+      ),
+    ).resolves.toMatchObject({
+      allowed: false,
+      denial: { code: 'GLOBAL_PAUSED' },
+    });
+    await expect(
+      revokedSetup.manager.executeAuthorizedWrite(
+        revokedReservation.value.id,
+        sign,
+      ),
+    ).resolves.toMatchObject({
+      allowed: false,
+      denial: { code: 'POLICY_REVOKED' },
+    });
+    await expect(
+      expiringManager.executeAuthorizedWrite(
+        expiringReservation.value.id,
+        sign,
+      ),
+    ).resolves.toMatchObject({
+      allowed: false,
+      denial: { code: 'POLICY_EXPIRED' },
+    });
+    expect(signatures).toBe(0);
+  });
+
+  it('rechecks expiry after waiting for an in-flight signature transaction', async () => {
+    let now = NOW;
+    const manager = new AutonomyPolicyManager({
+      store: new MemoryProtectedStore(),
+      approvals: new TestApprovals(),
+      now: () => now,
+      idFactory: (() => {
+        let nextId = 0;
+        return () => `queued-expiry-${++nextId}`;
+      })(),
+    });
+    const activated = await manager.activate(boundedProposal());
+    if (!activated.allowed) throw new Error(activated.denial.code);
+    const first = await manager.reserve(
+      activated.value.id,
+      fillExposure('e', '10'),
+    );
+    const second = await manager.reserve(
+      activated.value.id,
+      fillExposure('f', '10'),
+    );
+    if (!first.allowed) throw new Error(first.denial.code);
+    if (!second.allowed) throw new Error(second.denial.code);
+
+    let signalStarted = () => undefined;
+    let releaseFirst = () => undefined;
+    const started = new Promise<void>((resolve) => {
+      signalStarted = resolve;
+    });
+    const release = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const firstWrite = manager.executeAuthorizedWrite(
+      first.value.id,
+      async () => {
+        signalStarted();
+        await release;
+        return { transactionHash: hash('d'), value: 'first' };
+      },
+    );
+    await started;
+
+    let secondSignatures = 0;
+    const secondWrite = manager.executeAuthorizedWrite(
+      second.value.id,
+      async () => {
+        secondSignatures += 1;
+        return { transactionHash: hash('e'), value: 'second' };
+      },
+    );
+    now = new Date(Date.parse(activated.value.expiresAt) + 1);
+    releaseFirst();
+
+    await expect(firstWrite).resolves.toMatchObject({
+      allowed: false,
+      denial: { code: 'POLICY_EXPIRED' },
+    });
+    await expect(secondWrite).resolves.toMatchObject({
+      allowed: false,
+      denial: { code: 'POLICY_EXPIRED' },
+    });
+    expect(secondSignatures).toBe(0);
+  });
+
+  it('serializes a committed revocation behind an in-flight signature', async () => {
+    const { manager } = setup();
+    const activated = await manager.activate(boundedProposal());
+    if (!activated.allowed) throw new Error(activated.denial.code);
+    const reserved = await manager.reserve(
+      activated.value.id,
+      fillExposure('9', '10'),
+    );
+    if (!reserved.allowed) throw new Error(reserved.denial.code);
+
+    let signalStarted = () => undefined;
+    let releaseWrite = () => undefined;
+    const started = new Promise<void>((resolve) => {
+      signalStarted = resolve;
+    });
+    const release = new Promise<void>((resolve) => {
+      releaseWrite = resolve;
+    });
+    const signing = manager.executeAuthorizedWrite(
+      reserved.value.id,
+      async () => {
+        signalStarted();
+        await release;
+        return { transactionHash: hash('f'), value: 'signed' };
+      },
+    );
+    await started;
+
+    let revocationFinished = false;
+    const revoking = manager.revoke(activated.value.id).then((result) => {
+      revocationFinished = true;
+      return result;
+    });
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+    expect(revocationFinished).toBe(false);
+
+    releaseWrite();
+    await expect(signing).resolves.toMatchObject({ allowed: true });
+    await expect(revoking).resolves.toMatchObject({
+      allowed: true,
+      value: { lifecycle: { state: 'revoked' } },
+    });
+  });
+
   it('settles a recovered reservation by its exact operation hash', async () => {
     const { manager } = setup();
     const activated = await manager.activate(boundedProposal());
@@ -823,6 +1320,74 @@ describe('autonomy policy core', () => {
     expect(await manager.revoke(activated.value.id)).toMatchObject({
       allowed: true,
       value: { lifecycle: { state: 'revoked' } },
+    });
+  });
+
+  it('fails closed when the paused policy set changes during resume approval', async () => {
+    const store = new MemoryProtectedStore();
+    let nextId = 0;
+    let releaseResume = () => undefined;
+    let markResumeRequested = () => undefined;
+    const resumeRequested = new Promise<void>((resolve) => {
+      markResumeRequested = resolve;
+    });
+    const resumeApproval = new Promise<void>((resolve) => {
+      releaseResume = resolve;
+    });
+    const approvals: AutonomyLocalApprovalHooks = {
+      approveActivation: async ({ proposal }) => ({
+        approved: true,
+        proposal,
+      }),
+      approveResume: async () => {
+        markResumeRequested();
+        await resumeApproval;
+        return true;
+      },
+      approveRevocation: async () => true,
+    };
+    const manager = new AutonomyPolicyManager({
+      store,
+      approvals,
+      now: () => NOW,
+      idFactory: () => `resume-binding-${++nextId}`,
+    });
+    const first = await manager.activate(boundedProposal());
+    if (!first.allowed) throw new Error(first.denial.code);
+    await manager.pauseGlobal();
+
+    const resuming = manager.resumeGlobal();
+    await resumeRequested;
+    const addedWhilePaused = await manager.activate(
+      boundedProposal({
+        expiresAt: new Date(
+          NOW.getTime() + 8 * 24 * 60 * 60 * 1_000,
+        ).toISOString(),
+      }),
+    );
+    if (!addedWhilePaused.allowed) {
+      throw new Error(addedWhilePaused.denial.code);
+    }
+    releaseResume();
+
+    await expect(resuming).resolves.toMatchObject({
+      allowed: false,
+      denial: { code: 'STORE_TAMPERED' },
+    });
+    await expect(manager.status()).resolves.toMatchObject({
+      allowed: true,
+      value: {
+        globalPaused: true,
+        policies: [
+          { policy: { id: first.value.id, lifecycle: { state: 'paused' } } },
+          {
+            policy: {
+              id: addedWhilePaused.value.id,
+              lifecycle: { state: 'paused' },
+            },
+          },
+        ],
+      },
     });
   });
 

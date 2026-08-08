@@ -122,4 +122,70 @@ describe('Agent Control activity dashboard', () => {
       agentControlStateKey(second),
     );
   });
+
+  it('shows and binds every paused policy behind a global resume action', () => {
+    const resumeBinding = `0x${'99'.repeat(32)}`;
+    const firstDigest = `0x${'11'.repeat(32)}`;
+    const secondDigest = `0x${'22'.repeat(32)}`;
+    const controlModel = model({
+      autonomy: {
+        mode: 'full',
+        state: 'paused',
+        globalPaused: true,
+        policies: [
+          {
+            id: 'bounded-policy-first',
+            termsDigest: firstDigest,
+            mode: 'bounded',
+            state: 'paused',
+            expiresAt: '2026-08-05T12:00:00.000Z',
+            agentVisiblePrivateAmounts: false,
+            remainingBudgets: [],
+            details: [
+              { label: 'Policy id', value: 'bounded-policy-first' },
+              { label: 'Exact terms digest', value: firstDigest },
+            ],
+          },
+          {
+            id: 'full-policy-second',
+            termsDigest: secondDigest,
+            mode: 'full',
+            state: 'paused',
+            expiresAt: '2026-08-06T12:00:00.000Z',
+            agentVisiblePrivateAmounts: true,
+            remainingBudgets: [],
+            details: [
+              { label: 'Policy id', value: 'full-policy-second' },
+              { label: 'Exact terms digest', value: secondDigest },
+            ],
+          },
+        ],
+      } as never,
+      controlActions: {
+        resume: true,
+        resumePolicyCount: 2,
+        resumePolicyBinding: resumeBinding,
+      } as never,
+    });
+    const html = renderAgentControlPage(controlModel, 'nonce');
+
+    expect(html).toContain('bounded-policy-first');
+    expect(html).toContain('full-policy-second');
+    expect(html).toContain(firstDigest);
+    expect(html).toContain(secondDigest);
+    expect(html).toContain('Resume 2 policies');
+    expect(html).toContain(
+      `name="resumePolicyBinding" value="${resumeBinding}"`,
+    );
+
+    const changedPolicySet = structuredClone(controlModel);
+    (
+      changedPolicySet.summary.autonomy as unknown as {
+        policies: Array<{ termsDigest: string }>;
+      }
+    ).policies[0]!.termsDigest = `0x${'33'.repeat(32)}`;
+    expect(agentControlStateKey(changedPolicySet)).not.toBe(
+      agentControlStateKey(controlModel),
+    );
+  });
 });

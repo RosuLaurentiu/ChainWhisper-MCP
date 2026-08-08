@@ -1224,6 +1224,7 @@ describe('ManifestExecutionPlanner', () => {
       (10n * 10n ** 18n).toString(),
       '20000000'
     ]);
+    expect(execution.expiresAt).toBe('2026-07-27T12:15:00.000Z');
     const disabled = statusFor(manifest);
     disabled.registry.recurringWritesEnabled = false;
     await expect(planner.plan(intent, disabled)).rejects.toMatchObject({
@@ -1801,6 +1802,8 @@ describe('SignedDomainEnvelopeFactory', () => {
     expect(confirmation.fee).toBe(
       '0.000000000000000123 COTI (123 wei)'
     );
+    expect(execution.expiresAt).toBe('2026-07-27T12:04:30.000Z');
+    expect(signed.expiresAt).toBe(execution.expiresAt);
     expect(signed.intent).toMatchObject({
       amountVisibility: 'private-hidden',
       orderType: {
@@ -1810,6 +1813,9 @@ describe('SignedDomainEnvelopeFactory', () => {
         privateAmountMode: 'agent-provided',
         buyQuoteLiquidity: '10',
         sellBaseLiquidity: '10',
+        marketReferenceObservedAt: '2026-07-27T11:59:30.000Z',
+        marketReferenceExpiresAt: null,
+        marketReferenceMaxAgeMs: 300000,
         buyPriceOffsetBps: -1000,
         sellPriceOffsetBps: 1000
       }

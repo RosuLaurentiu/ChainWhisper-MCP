@@ -22,7 +22,10 @@ import {
   ActionEnvelopeVerifier,
   AutonomyPolicyManager,
   ConfirmationGate,
+  decodeStoredAccessSecret,
+  encodeStoredAccessSecret,
   EncryptedSecretVault,
+  generatedAccessSecretReference,
   LoadedSignerConfig,
   OperationJournal,
   PassthroughPrivateInputMaterializer,
@@ -596,6 +599,36 @@ const createTestAutonomy = () => {
             },
           }
         : { allowed: true as const, value: reservation() },
+    executeAuthorizedWrite: async <T>(
+      _reservationId: string,
+      write: () => Promise<{
+        transactionHash: HexString;
+        value: T;
+      }>,
+    ) => {
+      if (paused) {
+        return {
+          allowed: false as const,
+          denial: {
+            code: 'GLOBAL_PAUSED' as const,
+            message: 'Autonomy is globally paused.',
+            policyId: 'policy-1',
+          },
+        };
+      }
+      const outcome = await write();
+      reservationState = 'signed';
+      return {
+        allowed: true as const,
+        value: {
+          reservation: {
+            ...reservation(),
+            signedTransactionHashes: [outcome.transactionHash],
+          },
+          value: outcome.value,
+        },
+      };
+    },
     markSigned: async () => {
       reservationState = 'signed';
       return { allowed: true as const, value: reservation() };
@@ -637,6 +670,7 @@ const createEngine = async (options: {
   simulator?: TestSimulator;
   intentValidator?: MaterializedIntentValidator;
   autonomy?: AutonomyPolicyManager;
+  now?: () => Date;
 }) => {
   const stateDirectory = await mkdtemp(join(tmpdir(), 'cw-signer-core-'));
   const config = createConfig(stateDirectory);
@@ -644,11 +678,12 @@ const createEngine = async (options: {
   const wallet = options.wallet ?? new TestWallet();
   const elicitor = options.elicitor ?? new TestElicitor();
   const simulator = options.simulator ?? new TestSimulator();
-  const journal = new OperationJournal(stateDirectory, () => NOW);
+  const now = options.now ?? (() => NOW);
+  const journal = new OperationJournal(stateDirectory, now);
   const vault = new EncryptedSecretVault(
     stateDirectory,
     config.credentialMaterial().vaultPassphrase,
-    () => NOW,
+    now,
   );
   return {
     stateDirectory,
@@ -659,7 +694,7 @@ const createEngine = async (options: {
     journal,
     vault,
     engine: new SignerEngine({
-      verifier: new ActionEnvelopeVerifier(config, runtime, () => NOW),
+      verifier: new ActionEnvelopeVerifier(config, runtime, now),
       wallet,
       materializer: new PassthroughPrivateInputMaterializer(),
       confirmation: new ConfirmationGate(elicitor, 5_000),
@@ -1075,6 +1110,31 @@ describe('local ChainWhisper signer core', () => {
     expect(setup.wallet.broadcastCount).toBe(0);
   });
 
+  it('rechecks action freshness immediately before wallet signing', async () => {
+    let now = NOW;
+    const simulator = new DeferredSecondSimulation();
+    const setup = await createEngine({
+      simulator,
+      now: () => now,
+    });
+    const envelope = createEnvelope('stale-before-signing');
+
+    await setup.engine.queueAction(envelope);
+    await simulator.secondCallStarted;
+    now = new Date(Date.parse(envelope.expiresAt) - 500);
+    simulator.release();
+
+    await expect
+      .poll(
+        async () =>
+          (await setup.engine.getOperationStatus(envelope.operationId))
+            ?.errorCode,
+      )
+      .toBe('STALE_STATE');
+    expect(setup.wallet.prepareCount).toBe(0);
+    expect(setup.wallet.broadcastCount).toBe(0);
+  });
+
   it('waits for a write already inside the signing queue before pause returns', async () => {
     const wallet = new DeferredPrepareWallet();
     const autonomy = createTestAutonomy();
@@ -1179,6 +1239,49 @@ describe('local ChainWhisper signer core', () => {
     await expect(
       setup.vault.get(`operation:${envelope.operationId}:request`),
     ).resolves.toBeNull();
+  });
+
+  it('binds a generated access secret to the receipt-decoded order id', async () => {
+    const setup = await createEngine({
+      intentValidator: { validate: async () => undefined },
+    });
+    const { envelope } = createStandardOrderEnvelope(
+      'bind-created-order-secret',
+    );
+    const secret = `0x${'ab'.repeat(32)}` as HexString;
+    const reference = generatedAccessSecretReference(
+      envelope.operationHash,
+    );
+    await setup.vault.put(
+      reference,
+      encodeStoredAccessSecret({
+        version: 1,
+        operationHash: envelope.operationHash,
+        recipient: null,
+        escrowContract: CONTRACT,
+        localId: null,
+        secret,
+      }),
+      {
+        kind: 'access-secret',
+        binding: {
+          operationHash: envelope.operationHash,
+          escrowContract: CONTRACT,
+        },
+      },
+    );
+    setup.wallet.receiptLogs = [tradeOpenedLog(42n)];
+
+    await setup.engine.queueAction(envelope);
+    await setup.engine.executeAction(envelope);
+
+    const stored = await setup.vault.get(reference);
+    expect(stored && decodeStoredAccessSecret(stored)).toMatchObject({
+      operationHash: envelope.operationHash,
+      escrowContract: CONTRACT,
+      localId: '42',
+      secret,
+    });
   });
 
   it('keeps a completed create envelope until its exact order identity is reconciled', async () => {
@@ -1675,6 +1778,26 @@ describe('local ChainWhisper signer core', () => {
         allowed: true as const,
         value: reservation,
       }),
+      executeAuthorizedWrite: async <T>(
+        _id: string,
+        write: () => Promise<{
+          transactionHash: HexString;
+          value: T;
+        }>,
+      ) => {
+        const outcome = await write();
+        return {
+          allowed: true as const,
+          value: {
+            reservation: {
+              ...reservation,
+              state: 'signed' as const,
+              signedTransactionHashes: [outcome.transactionHash],
+            },
+            value: outcome.value,
+          },
+        };
+      },
       markSigned: async (
         _id: string,
         transactionHash: HexString,

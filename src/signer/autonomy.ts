@@ -265,6 +265,11 @@ export type AutonomyDecision<T> =
   | { allowed: true; value: T }
   | { allowed: false; denial: AutonomyDenialV1 };
 
+export type AutonomySignedWriteV1<T> = {
+  reservation: AutonomyReservationV1;
+  value: T;
+};
+
 export type AutonomyRemainingBudgetV1 = {
   spendByAsset: AutonomyAssetAmountV1[];
   nativeValue: string | null;
@@ -392,6 +397,29 @@ const canonicalStringify = (value: unknown): string => {
 
 const digest = (value: unknown): HexString =>
   `0x${createHash('sha256').update(canonicalStringify(value)).digest('hex')}`;
+
+/** Commits a global resume approval to the complete affected policy set. */
+export const autonomyResumeBinding = (
+  policies: readonly ActiveAutonomyPolicyV1[],
+): HexString =>
+  digest({
+    domain: 'chainwhisper/autonomy-resume/2',
+    policies: policies
+      .map(({ id, termsDigest }) => ({ id, termsDigest }))
+      .sort((left, right) =>
+        left.id === right.id
+          ? left.termsDigest.localeCompare(right.termsDigest)
+          : left.id.localeCompare(right.id),
+      ),
+  });
+
+export const isExactAutonomyResumeBinding = (
+  policies: readonly ActiveAutonomyPolicyV1[],
+  candidate: unknown,
+): candidate is HexString =>
+  policies.length > 0 &&
+  typeof candidate === 'string' &&
+  candidate === autonomyResumeBinding(policies);
 
 const integer = (
   value: unknown,
@@ -2409,6 +2437,73 @@ const snapshotResult = <T>(
   decision: AutonomyDecision<T>,
 ): SnapshotOperationResult<T> => ({ snapshot, decision });
 
+const authorizeReservedWriteAgainstSnapshot = (
+  snapshot: AutonomyStoreSnapshotV1,
+  reservationId: string,
+  now: Date,
+): AutonomyDecision<AutonomyReservationV1> => {
+  const reservation = snapshot.reservations[reservationId];
+  if (!reservation) {
+    return denial(
+      'RESERVATION_NOT_FOUND',
+      'Autonomy reservation was not found.',
+    );
+  }
+  if (
+    !['reserved', 'signed', 'pending', 'uncertain'].includes(
+      reservation.state,
+    )
+  ) {
+    return denial(
+      'RESERVATION_STATE_INVALID',
+      'Only an active, unsettled reservation can authorize a write.',
+      { policyId: reservation.policyId },
+    );
+  }
+  if (snapshot.globalPaused) {
+    return denial('GLOBAL_PAUSED', 'Autonomy is globally paused.', {
+      policyId: reservation.policyId,
+    });
+  }
+  const policy = snapshot.policies[reservation.policyId];
+  if (!policy) {
+    return denial('POLICY_NOT_FOUND', 'Autonomy policy was not found.', {
+      policyId: reservation.policyId,
+    });
+  }
+  if (Date.parse(policy.expiresAt) <= now.getTime()) {
+    return denial('POLICY_EXPIRED', 'Autonomy policy has expired.', {
+      policyId: policy.id,
+    });
+  }
+  if (Date.parse(policy.startsAt) > now.getTime()) {
+    return denial(
+      'POLICY_NOT_STARTED',
+      'Autonomy policy has not started.',
+      { policyId: policy.id },
+    );
+  }
+  if (policy.lifecycle.state !== 'active') {
+    const code =
+      policy.lifecycle.state === 'revoked'
+        ? 'POLICY_REVOKED'
+        : policy.lifecycle.state === 'expired'
+          ? 'POLICY_EXPIRED'
+          : 'POLICY_PAUSED';
+    return denial(code, `Autonomy policy is ${policy.lifecycle.state}.`, {
+      policyId: policy.id,
+    });
+  }
+  if (reservation.policyTermsDigest !== policy.termsDigest) {
+    return denial(
+      'STORE_TAMPERED',
+      'Autonomy reservation no longer matches its policy.',
+      { policyId: policy.id },
+    );
+  }
+  return allowed(clone(reservation));
+};
+
 /**
  * Policy and budget authority for autonomous signer execution.
  *
@@ -2444,8 +2539,11 @@ export class AutonomyPolicyManager {
       now: Date,
     ) => SnapshotOperationResult<T>,
   ): Promise<AutonomyDecision<T>> {
-    const now = this.#now();
     return this.#store.transact((current) => {
+      // Capture time only after the serialized store boundary is acquired.
+      // A transaction may have waited behind another signer operation long
+      // enough for its policy to expire.
+      const now = this.#now();
       const validated = validateSnapshot(current, now);
       if (!validated.allowed) {
         return { next: current, result: validated };
@@ -2738,6 +2836,121 @@ export class AutonomyPolicyManager {
   }
 
   /**
+   * Holds the protected store's exclusion boundary across the final lifecycle
+   * check, signature-producing callback, and signed-reservation commit.
+   * Revocation and global pause therefore commit either before this check (and
+   * block the callback) or after the signature has been classified as
+   * authorized. Callback values remain inaccessible to the caller until the
+   * signed-reservation commit succeeds. Policy expiry is evaluated after
+   * acquiring the same boundary and again before prepared bytes can be
+   * returned for broadcast.
+   */
+  async executeAuthorizedWrite<T>(
+    reservationId: string,
+    write: () => Promise<{
+      transactionHash: HexString;
+      value: T;
+    }>,
+  ): Promise<AutonomyDecision<AutonomySignedWriteV1<T>>> {
+    let writeOutcome:
+      | {
+          transactionHash: HexString;
+          value: T;
+        }
+      | undefined;
+    const decision = await this.#store.transact(async (current) => {
+      const now = this.#now();
+      const validated = validateSnapshot(current, now);
+      if (!validated.allowed) {
+        return {
+          next: current,
+          result: {
+            allowed: false as const,
+            denial: validated.denial,
+          },
+        };
+      }
+      const authorized = authorizeReservedWriteAgainstSnapshot(
+        validated.value,
+        reservationId,
+        now,
+      );
+      if (!authorized.allowed) {
+        return {
+          next: {
+            ...validated.value,
+            revision: current.revision + 1,
+          },
+          result: {
+            allowed: false as const,
+            denial: authorized.denial,
+          },
+        };
+      }
+
+      writeOutcome = await write();
+      if (!HASH_PATTERN.test(writeOutcome.transactionHash)) {
+        throw new Error(
+          'An autonomous write returned an invalid transaction hash.',
+        );
+      }
+      const normalizedHash = normalizeHash(
+        writeOutcome.transactionHash,
+      ) as HexString;
+      const finalNow = this.#now();
+      const finalSnapshot = validateSnapshot(validated.value, finalNow);
+      if (!finalSnapshot.allowed) {
+        throw new Error(
+          'Autonomy state became invalid during an authorized write.',
+        );
+      }
+      const next = clone(finalSnapshot.value);
+      const updated = next.reservations[reservationId]!;
+      updated.state = 'signed';
+      updated.updatedAt = finalNow.toISOString();
+      if (!updated.signedTransactionHashes.includes(normalizedHash)) {
+        updated.signedTransactionHashes.push(normalizedHash);
+      }
+      const finalAuthorization = authorizeReservedWriteAgainstSnapshot(
+        finalSnapshot.value,
+        reservationId,
+        finalNow,
+      );
+      if (!finalAuthorization.allowed) {
+        // The callback may already have created a signature. Retain its hash
+        // and consumed budget, but withhold the callback value so the caller
+        // cannot proceed to a separate broadcast step.
+        return {
+          next: {
+            ...next,
+            revision: current.revision + 1,
+          },
+          result: {
+            allowed: false as const,
+            denial: finalAuthorization.denial,
+          },
+        };
+      }
+      return {
+        next: {
+          ...next,
+          revision: current.revision + 1,
+        },
+        result: allowed(clone(updated)),
+      };
+    });
+
+    if (!decision.allowed) return decision;
+    if (!writeOutcome) {
+      throw new Error('An authorized autonomy write did not execute.');
+    }
+    return allowed({
+      reservation: decision.value,
+      value: writeOutcome.value,
+    });
+  }
+
+  /**
    * Rechecks the durable emergency-stop and policy lifecycle inside the shared
    * write queue, immediately before an autonomous signer can create a
    * signature or invoke an SDK write.
@@ -2745,90 +2958,16 @@ export class AutonomyPolicyManager {
   async authorizeReservedWrite(
     reservationId: string,
   ): Promise<AutonomyDecision<AutonomyReservationV1>> {
-    return this.#transact((snapshot, now) => {
-      const reservation = snapshot.reservations[reservationId];
-      if (!reservation) {
-        return snapshotResult(
+    return this.#transact((snapshot, now) =>
+      snapshotResult(
+        snapshot,
+        authorizeReservedWriteAgainstSnapshot(
           snapshot,
-          denial(
-            'RESERVATION_NOT_FOUND',
-            'Autonomy reservation was not found.',
-          ),
-        );
-      }
-      if (
-        !['reserved', 'signed', 'pending', 'uncertain'].includes(
-          reservation.state,
-        )
-      ) {
-        return snapshotResult(
-          snapshot,
-          denial(
-            'RESERVATION_STATE_INVALID',
-            'Only an active, unsettled reservation can authorize a write.',
-            { policyId: reservation.policyId },
-          ),
-        );
-      }
-      if (snapshot.globalPaused) {
-        return snapshotResult(
-          snapshot,
-          denial('GLOBAL_PAUSED', 'Autonomy is globally paused.', {
-            policyId: reservation.policyId,
-          }),
-        );
-      }
-      const policy = snapshot.policies[reservation.policyId];
-      if (!policy) {
-        return snapshotResult(
-          snapshot,
-          denial('POLICY_NOT_FOUND', 'Autonomy policy was not found.', {
-            policyId: reservation.policyId,
-          }),
-        );
-      }
-      if (Date.parse(policy.expiresAt) <= now.getTime()) {
-        return snapshotResult(
-          snapshot,
-          denial('POLICY_EXPIRED', 'Autonomy policy has expired.', {
-            policyId: policy.id,
-          }),
-        );
-      }
-      if (Date.parse(policy.startsAt) > now.getTime()) {
-        return snapshotResult(
-          snapshot,
-          denial('POLICY_NOT_STARTED', 'Autonomy policy has not started.', {
-            policyId: policy.id,
-          }),
-        );
-      }
-      if (policy.lifecycle.state !== 'active') {
-        const code =
-          policy.lifecycle.state === 'revoked'
-            ? 'POLICY_REVOKED'
-            : policy.lifecycle.state === 'expired'
-              ? 'POLICY_EXPIRED'
-              : 'POLICY_PAUSED';
-        return snapshotResult(
-          snapshot,
-          denial(code, `Autonomy policy is ${policy.lifecycle.state}.`, {
-            policyId: policy.id,
-          }),
-        );
-      }
-      if (reservation.policyTermsDigest !== policy.termsDigest) {
-        return snapshotResult(
-          snapshot,
-          denial(
-            'STORE_TAMPERED',
-            'Autonomy reservation no longer matches its policy.',
-            { policyId: policy.id },
-          ),
-        );
-      }
-      return snapshotResult(snapshot, allowed(clone(reservation)));
-    });
+          reservationId,
+          now,
+        ),
+      ),
+    );
   }
 
   async #transitionReservation(
@@ -3025,10 +3164,12 @@ export class AutonomyPolicyManager {
     const before = await this.status();
     if (!before.allowed) return before;
     if (!before.value.globalPaused) return before;
+    const pausedPolicies = before.value.policies
+      .filter((entry) => entry.policy.lifecycle.state === 'paused')
+      .map((entry) => clone(entry.policy));
+    const approvedBinding = autonomyResumeBinding(pausedPolicies);
     const approved = await this.#approvals.approveResume({
-      policies: before.value.policies
-        .filter((entry) => entry.policy.lifecycle.state === 'paused')
-        .map((entry) => clone(entry.policy)),
+      policies: pausedPolicies,
     });
     if (!approved) {
       return denial(
@@ -3037,6 +3178,21 @@ export class AutonomyPolicyManager {
       );
     }
     return this.#transact((snapshot, now) => {
+      const currentPausedPolicies = Object.values(snapshot.policies).filter(
+        (policy) => policy.lifecycle.state === 'paused',
+      );
+      if (
+        !snapshot.globalPaused ||
+        autonomyResumeBinding(currentPausedPolicies) !== approvedBinding
+      ) {
+        return snapshotResult(
+          snapshot,
+          denial(
+            'STORE_TAMPERED',
+            'Paused autonomy policies changed while resume was awaiting approval.',
+          ),
+        );
+      }
       const next = clone(snapshot);
       next.globalPaused = false;
       for (const policy of Object.values(next.policies)) {

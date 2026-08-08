@@ -14,6 +14,8 @@ import type {
 
 const CHAINWHISPER_APP_ORIGIN = 'https://chainwhisper.chat';
 const MAX_APP_LINK_ORDER_ID = BigInt(Number.MAX_SAFE_INTEGER);
+const ZERO_ADDRESS =
+  '0x0000000000000000000000000000000000000000' as Address;
 
 // These exact deployed event ABIs are also mirrored by the ChainWhisper app
 // in src/lib/appShared/contracts.ts. The signer only accepts the event selected
@@ -119,6 +121,7 @@ const decodedIdentity = (
   receipt: TransactionReceipt,
   target: Address,
   maker: Address,
+  taker: Address,
 ): { orderId: bigint; appLink: string } | null => {
   if (receipt.status !== 'success' || !receipt.logs) return null;
   const matches: bigint[] = [];
@@ -139,7 +142,9 @@ const decodedIdentity = (
         typeof orderId === 'bigint' &&
         orderId > 0n &&
         typeof args.maker === 'string' &&
-        sameAddress(args.maker, maker)
+        sameAddress(args.maker, maker) &&
+        typeof args.taker === 'string' &&
+        sameAddress(args.taker, taker)
       ) {
         matches.push(orderId);
       }
@@ -154,18 +159,51 @@ const decodedIdentity = (
   return appLink ? { orderId, appLink } : null;
 };
 
-export const decodeCreatedOrderResult = (
+export type DecodedCreatedOrderReceipt = {
+  result: OperationSemanticResultV2;
+  orderBinding: {
+    escrowContract: Address;
+    localId: string;
+  };
+};
+
+export const expectsCreatedOrderReceipt = (
+  envelope: SignedActionEnvelopeV1,
+): boolean => {
+  const classification = envelope.intent.orderType;
+  if (!classification) return false;
+  if (
+    envelope.intent.action === 'create_trade' ||
+    envelope.intent.action === 'create_recurring'
+  ) {
+    return classification.relation === 'primary';
+  }
+  if (envelope.intent.action === 'counter') {
+    return (
+      classification.relation === 'counter' &&
+      classification.cadence === 'one-off' &&
+      classification.route === 'direct-escrow'
+    );
+  }
+  return (
+    envelope.intent.action === 'edit' &&
+    classification.relation === 'replacement' &&
+    classification.cadence === 'one-off' &&
+    (
+      classification.route === 'direct-escrow' ||
+      classification.route === 'private-liquidity-escrow'
+    )
+  );
+};
+
+export const decodeCreatedOrderReceipt = (
   envelope: SignedActionEnvelopeV1,
   receipt: TransactionReceipt,
-): OperationSemanticResultV2 | null => {
+): DecodedCreatedOrderReceipt | null => {
   const classification = envelope.intent.orderType;
   if (
     !classification ||
-    classification.relation !== 'primary' ||
-    (
-      envelope.intent.action !== 'create_trade' &&
-      envelope.intent.action !== 'create_recurring'
-    ) ||
+    !expectsCreatedOrderReceipt(envelope) ||
     (
       envelope.intent.action === 'create_trade' &&
       classification.cadence !== 'one-off'
@@ -195,17 +233,30 @@ export const decodeCreatedOrderResult = (
     receipt,
     expectedContract,
     envelope.wallet,
+    (envelope.intent.recipient as Address | undefined) ?? ZERO_ADDRESS,
   );
   if (!identity) return null;
   const localId = identity.orderId.toString();
   return {
-    action: envelope.intent.action,
-    status: 'completed',
-    canonicalType: classification,
-    order: {
-      handle: `cw_${expectedContract.slice(2).toLowerCase()}_${localId}`,
-      status: 'open',
-      shareableAppLink: identity.appLink,
+    result: {
+      action: envelope.intent.action,
+      status: 'completed',
+      canonicalType: classification,
+      order: {
+        handle: `cw_${expectedContract.slice(2).toLowerCase()}_${localId}`,
+        status: 'open',
+        shareableAppLink: identity.appLink,
+      },
+    },
+    orderBinding: {
+      escrowContract: expectedContract,
+      localId,
     },
   };
 };
+
+export const decodeCreatedOrderResult = (
+  envelope: SignedActionEnvelopeV1,
+  receipt: TransactionReceipt,
+): OperationSemanticResultV2 | null =>
+  decodeCreatedOrderReceipt(envelope, receipt)?.result ?? null;

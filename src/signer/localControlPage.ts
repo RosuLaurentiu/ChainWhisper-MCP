@@ -27,6 +27,17 @@ export type AgentControlOperation = {
   setupAssets?: string[];
 };
 
+export type AgentControlAutonomyPolicy = {
+  id: string;
+  termsDigest: string;
+  mode: 'bounded' | 'full';
+  state: 'active' | 'paused' | 'expired' | 'revoked';
+  expiresAt: string;
+  agentVisiblePrivateAmounts: boolean;
+  remainingBudgets?: Array<{ label: string; value: string }>;
+  details?: Array<{ label: string; value: string }>;
+};
+
 export type AgentControlSummary = {
   wallet?: string | null;
   network?: string;
@@ -40,6 +51,8 @@ export type AgentControlSummary = {
     expiresAt?: string;
     agentVisiblePrivateAmounts?: boolean;
     remainingBudgets?: Array<{ label: string; value: string }>;
+    globalPaused?: boolean;
+    policies?: AgentControlAutonomyPolicy[];
   };
   pendingOperations?: number;
   recentOperations?: AgentControlOperation[];
@@ -63,6 +76,8 @@ export type AgentControlSummary = {
     onboardPrivacy?: boolean;
     enablePrivateToken?: boolean;
     refreshBalances?: boolean;
+    resumePolicyCount?: number;
+    resumePolicyBinding?: string;
   };
 };
 
@@ -101,6 +116,16 @@ export const agentControlStateKey = (
           model.summary.autonomy.state ?? null,
           model.summary.autonomy.expiresAt ?? null,
           model.summary.autonomy.agentVisiblePrivateAmounts ?? null,
+          Boolean(model.summary.autonomy.globalPaused),
+          (model.summary.autonomy.policies ?? []).map((policy) => [
+            policy.id,
+            policy.termsDigest,
+            policy.mode,
+            policy.state,
+            policy.expiresAt,
+            policy.agentVisiblePrivateAmounts,
+            policy.remainingBudgets ?? [],
+          ]),
         ]
       : null,
     pendingOperations: model.summary.pendingOperations ?? 0,
@@ -137,6 +162,11 @@ export const agentControlStateKey = (
       ? [
           Boolean(model.summary.controlActions.enablePrivateToken),
           Boolean(model.summary.controlActions.refreshBalances),
+          Boolean(model.summary.controlActions.pause),
+          Boolean(model.summary.controlActions.resume),
+          Boolean(model.summary.controlActions.revoke),
+          model.summary.controlActions.resumePolicyCount ?? 0,
+          model.summary.controlActions.resumePolicyBinding ?? null,
         ]
       : null,
     balanceRevision: model.summary.balances?.revision ?? null,
@@ -1378,21 +1408,63 @@ const renderControlSummary = (
   csrfToken: string,
 ): string => {
   const autonomy = summary.autonomy ?? { mode: 'manual' as const };
+  const policies = autonomy.policies ?? [];
+  const displayedMode = policies[0]?.mode ?? autonomy.mode;
   const modeLabel =
-    autonomy.mode === 'full'
+    policies.length > 1
+      ? `${policies.length} autonomy policies`
+      : displayedMode === 'full'
       ? 'Full autonomy'
-      : autonomy.mode === 'bounded'
+      : displayedMode === 'bounded'
         ? 'Bounded autonomy'
         : 'Manual approval';
-  const stateLabel = autonomy.state ? humanize(autonomy.state) : 'Ready';
+  const stateLabel = autonomy.globalPaused
+    ? 'Paused'
+    : autonomy.state
+      ? humanize(autonomy.state)
+      : 'Ready';
   const privateAmountAuthority =
     autonomy.mode === 'manual'
       ? '<p class="muted">Ask your agent for bounded or 24-hour autonomy. The policy review will appear here before anything is enabled.</p>'
+      : policies.length > 1
+        ? `<p class="muted">Global resume affects all ${escapeHtml(String(policies.length))} policies listed below. Each policy separately states whether the agent may choose private amounts and view policy-scoped private state.</p>`
       : autonomy.agentVisiblePrivateAmounts
         ? '<p class="muted">This policy lets the agent both choose private amounts and view policy-scoped private balances, hidden order inventory/progress, and participant receipts.</p>'
         : '<p class="muted">This policy does not let the agent choose private amounts or view policy-scoped private balances, hidden order inventory/progress, or participant receipts.</p>';
-  const budgetRows = autonomy.remainingBudgets?.length
+  const budgetRows = policies.length === 0 && autonomy.remainingBudgets?.length
     ? `<div class="details-grid">${renderSummaryRows(autonomy.remainingBudgets)}</div>`
+    : '';
+  const policySummaries = policies.length
+    ? `<div class="policy-summaries">${policies
+        .map((policy, index) => {
+          const policyMode =
+            policy.mode === 'full' ? 'Full autonomy' : 'Bounded autonomy';
+          const authority = policy.agentVisiblePrivateAmounts
+            ? 'This policy lets the agent both choose private amounts and view policy-scoped private balances, hidden order inventory/progress, and participant receipts.'
+            : 'This policy does not let the agent choose private amounts or view policy-scoped private balances, hidden order inventory/progress, or participant receipts.';
+          const details = policy.details ?? [
+            { label: 'Policy id', value: policy.id },
+            { label: 'Exact terms digest', value: policy.termsDigest },
+          ];
+          const remaining = policy.remainingBudgets?.length
+            ? `<div class="details-grid">${renderSummaryRows(policy.remainingBudgets)}</div>`
+            : '';
+          return `<section class="policy-summary" aria-label="Autonomy policy ${escapeHtml(String(index + 1))}">
+            <div class="card-heading">
+              <div><span class="kicker">Policy ${escapeHtml(String(index + 1))} of ${escapeHtml(String(policies.length))}</span><h3>${escapeHtml(policyMode)}</h3></div>
+              <span class="badge">${escapeHtml(humanize(policy.state))}</span>
+            </div>
+            <p class="mono policy-id">${escapeHtml(policy.id)}</p>
+            <p class="muted">Expires ${escapeHtml(policy.expiresAt)}</p>
+            <p class="muted">${escapeHtml(authority)}</p>
+            ${remaining}
+            <details class="policy-terms" open>
+              <summary>Exact unchanged policy terms</summary>
+              <div class="details-grid">${renderSummaryRows(details)}</div>
+            </details>
+          </section>`;
+        })
+        .join('')}</div>`
     : '';
   const actions = summary.controlActions;
   const operations = summary.recentOperations?.length
@@ -1458,7 +1530,8 @@ const renderControlSummary = (
           <input type="hidden" name="csrf" value="${escapeHtml(csrfToken)}">
           <input type="hidden" name="intent" value="control">
           ${actions.pause ? '<button class="button button-warning" name="action" value="pause-autonomy">Pause autonomy</button>' : ''}
-          ${actions.resume ? '<button class="button button-secondary" name="action" value="resume-autonomy">Resume autonomy</button>' : ''}
+          ${actions.resume && actions.resumePolicyBinding ? `<input type="hidden" name="resumePolicyBinding" value="${escapeHtml(actions.resumePolicyBinding)}">` : ''}
+          ${actions.resume ? `<button class="button button-secondary" name="action" value="resume-autonomy">${actions.resumePolicyCount && actions.resumePolicyCount > 1 ? `Resume ${escapeHtml(String(actions.resumePolicyCount))} policies` : 'Resume autonomy'}</button>` : ''}
           ${actions.revoke ? '<button class="button button-danger" name="action" value="revoke-autonomy">Revoke policy</button>' : ''}
         </form>`
       : '';
@@ -1513,6 +1586,7 @@ const renderControlSummary = (
         ${autonomy.expiresAt ? `<p class="muted">Expires ${escapeHtml(autonomy.expiresAt)}</p>` : ''}
         ${privateAmountAuthority}
         ${budgetRows}
+        ${policySummaries}
         ${autonomyControls}
       </section>
       ${activity || `<section class="dashboard-card" aria-labelledby="operations-title">
@@ -1541,7 +1615,7 @@ const styles = `
 button,input{font:inherit}a{color:#cbb4ff}a:hover{color:#fff}.shell{width:min(1080px,calc(100% - 32px));margin:0 auto;padding:28px 0 42px}.topbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:28px}.brand{display:flex;align-items:center;gap:11px;font-size:17px;font-weight:780;letter-spacing:-.02em}.local-label{color:var(--muted);font-size:12px;letter-spacing:.08em;text-transform:uppercase}
 .approval-card,.control-overview{border:1px solid var(--line);border-radius:24px;background:linear-gradient(145deg,rgba(23,18,33,.98),rgba(12,10,18,.98));box-shadow:var(--shadow);padding:clamp(22px,5vw,46px)}.approval-card{max-width:840px;margin:2vh auto 88px}.eyebrow-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.badge{display:inline-flex;align-items:center;min-height:26px;padding:3px 9px;border:1px solid var(--line);border-radius:999px;color:#cfc4dd;background:#14101d;font-size:12px;font-weight:650}.badge-purple{border-color:#633fa0;color:#e5d8ff;background:var(--purple-soft)}.step{margin-left:auto;color:var(--muted);font-size:13px}h1{font-size:clamp(28px,5vw,44px);line-height:1.08;letter-spacing:-.045em;margin:20px 0 12px}h2{margin:12px 0 4px;font-size:22px;letter-spacing:-.025em}.lead{max-width:680px;margin:0 0 20px;color:#c8bfd3;font-size:16px}.order-type{margin:16px 0;padding:14px 16px;border:1px solid #4e3575;border-radius:14px;background:linear-gradient(90deg,rgba(70,41,108,.42),rgba(30,19,44,.52))}.order-type span,.result span,.wallet-card span,.stats span,.summary-row span,.panel-heading,.kicker{display:block;color:var(--muted);font-size:12px;font-weight:650;letter-spacing:.045em;text-transform:uppercase}.order-type strong{display:block;margin-top:5px;font-size:17px}.recurring-note{margin:10px 0;color:#d7cae8}.exposure{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));overflow:hidden;margin:14px 0;border:1px solid #4a3963;border-radius:16px;background:#0c0911}.exposure .summary-row{min-height:82px;padding:15px 18px;border-right:1px solid #332641}.exposure .summary-row:last-child{border-right:0}.exposure strong{display:block;margin-top:8px;font-size:20px;line-height:1.25}.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:1px;overflow:hidden;margin:14px 0;border:1px solid var(--line-soft);border-radius:14px;background:var(--line-soft)}.stats>div{min-height:70px;padding:13px;background:#100d18}.stats strong{display:block;margin-top:5px;overflow-wrap:anywhere}.details-grid{margin:14px 0}.details-grid .summary-row{display:flex;justify-content:space-between;gap:24px;padding:9px 0;border-bottom:1px solid var(--line-soft)}.details-grid .summary-row strong{text-align:right;overflow-wrap:anywhere}.result,.privacy-note{margin:16px 0;padding:14px 16px;border-left:3px solid var(--purple);border-radius:4px 12px 12px 4px;background:#110d19}.result p{margin:4px 0 0}.privacy-note{color:#d7cae8;border-left-color:var(--amber)}details{margin:16px 0;border:1px solid var(--line-soft);border-radius:12px;background:#0d0a12}summary{cursor:pointer;padding:14px 16px;color:#c9bdd7;font-weight:650}.technical{margin:0;padding:0 16px 14px}.technical>div{display:grid;grid-template-columns:150px minmax(0,1fr);gap:14px;padding:8px 0;border-top:1px solid var(--line-soft)}dt{color:var(--muted)}dd{margin:0;overflow-wrap:anywhere;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12px}.actions{position:fixed;z-index:5;left:50%;bottom:0;transform:translateX(-50%);display:flex;justify-content:flex-end;gap:10px;width:min(840px,calc(100% - 24px));padding:12px 0 max(12px,env(safe-area-inset-bottom));border-top:1px solid var(--line);background:rgba(7,6,11,.96);box-shadow:0 -18px 38px rgba(0,0,0,.35)}.control-actions{display:flex;justify-content:flex-end;gap:10px;margin-top:24px}.button{min-height:46px;padding:10px 17px;border:1px solid transparent;border-radius:11px;font-weight:740;cursor:pointer}.button:disabled{cursor:wait;opacity:.7}.button:focus-visible,input:focus-visible,summary:focus-visible,a:focus-visible{outline:3px solid #c6a7ff;outline-offset:3px}.button-primary{color:#0d0618;background:linear-gradient(135deg,#bb94ff,#8c54ef);box-shadow:0 8px 30px rgba(139,83,239,.25)}.button-primary:hover{filter:brightness(1.08)}.button-secondary{color:var(--text);border-color:#493b5d;background:#1b1624}.button-warning{color:#201400;border-color:#a66d13;background:var(--amber)}.button-danger{color:#23030a;border-color:#a8334c;background:var(--red)}.field{margin:22px 0}.field label{display:block;margin-bottom:5px;font-weight:720;font-size:16px}.field p{margin:0 0 9px;color:var(--muted)}.field input{width:100%;min-height:48px;padding:10px 13px;border:1px solid #4b3b60;border-radius:11px;background:#09070d;color:var(--text)}.notice{max-width:840px;margin:0 auto 16px;padding:12px 15px;border:1px solid #3b6d59;border-radius:12px;background:#10231c;color:#b9f3d9}.notice-error{border-color:#773447;background:#291018;color:#ffc1ce}
 .section-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:20px;margin-bottom:24px}.section-heading h1,.section-heading h2{margin:4px 0 0}.status-dot{display:flex;align-items:center;gap:8px;color:#d9d0e5;font-size:13px}.status-dot i{width:8px;height:8px;border-radius:50%;background:var(--green);box-shadow:0 0 12px rgba(84,223,165,.65)}.wallet-card{display:grid;grid-template-columns:2fr repeat(3,1fr);gap:1px;overflow:hidden;border:1px solid var(--line);border-radius:16px;background:var(--line)}.wallet-card>div{padding:16px 18px;background:#100d18}.wallet-card strong{display:block;margin-top:6px}.wallet-address{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}.panel-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-top:14px}.panel{min-height:190px;padding:20px;border:1px solid var(--line-soft);border-radius:16px;background:rgba(12,10,18,.72)}.panel-wide{grid-column:1/-1}.panel-heading{display:flex;justify-content:space-between;gap:16px;align-items:center}.muted{color:var(--muted)}.compact{margin-top:24px}.operation-list{list-style:none;margin:12px 0 0;padding:0}.operation-list li{display:flex;align-items:center;justify-content:space-between;gap:20px;padding:12px 0;border-top:1px solid var(--line-soft)}.operation-list li span{display:flex;flex-direction:column}.operation-list small{color:var(--muted)}.operation-list .empty{color:var(--muted)}.operation-actions{display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap}.operation-actions form{margin:0}.operation-actions .button{min-height:36px;padding:6px 10px}.diagnostics{margin:12px 0 0}.diagnostics>div{display:grid;grid-template-columns:minmax(120px,1fr) 2fr;gap:18px;padding:9px 0;border-top:1px solid var(--line-soft)}.diagnostics dd{font-family:inherit;font-size:13px}.footer{max-width:760px;margin:22px auto 0;color:#7e738d;text-align:center;font-size:12px}.mono{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}.wallet-setup{margin-bottom:14px;border:1px solid #4e3575;border-radius:24px;background:linear-gradient(145deg,rgba(31,21,46,.98),rgba(12,10,18,.98));box-shadow:var(--shadow);padding:clamp(22px,5vw,40px)}.setup-grid{display:grid;grid-template-columns:1.15fr .85fr;gap:14px}.setup-card,.wallet-backup{padding:20px;border:1px solid var(--line);border-radius:16px;background:#0d0a13}.setup-card{display:flex;flex-direction:column;gap:10px}.setup-card h3,.wallet-backup h2{margin:4px 0 0}.setup-card label,.copy-field label{font-weight:700}.setup-card>input,.copy-field input{width:100%;min-height:46px;padding:10px 12px;border:1px solid #4b3b60;border-radius:10px;background:#09070d;color:var(--text)}.setup-card .button{margin-top:auto}.ack{display:flex;align-items:flex-start;gap:8px;color:#d7cae8;font-weight:500!important}.ack input{margin-top:5px}.acknowledgements{display:grid;gap:12px;margin:20px 0;padding:16px 18px;border:1px solid #7251a1;border-radius:12px}.acknowledgements legend{padding:0 8px;color:#e3d5f8;font-weight:750}.wallet-backup{margin:16px 0;border-color:#7354a2}.copy-field{margin-top:14px}.copy-field>div{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;margin-top:6px}.copy-field input{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}.copy-field .button{min-height:46px}.policy-editor{margin:22px 0;padding:18px;border:1px solid #5d4381;border-radius:14px;background:#0b0810}.policy-editor h2{margin:0}.policy-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin-top:16px}.policy-grid label{display:flex;flex-direction:column;gap:6px;color:#d8cde5;font-size:13px;font-weight:650}.policy-grid input{min-height:42px;padding:8px 10px;border:1px solid #4b3b60;border-radius:9px;background:#09070d;color:var(--text)}.policy-grid .ack{flex-direction:row}.policy-fields{display:grid;gap:10px;margin:0;padding:12px;border:1px solid var(--line-soft);border-radius:10px}.policy-fields legend{padding:0 6px;color:var(--muted)}.policy-wide{grid-column:1/-1}.price-band{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;padding-top:10px;border-top:1px solid var(--line-soft)}.price-band>strong{grid-column:1/-1}
-.sr-only{position:absolute!important;width:1px!important;height:1px!important;padding:0!important;margin:-1px!important;overflow:hidden!important;clip:rect(0,0,0,0)!important;white-space:nowrap!important;border:0!important}.control-overview{padding:0;border:0;border-radius:0;background:none;box-shadow:none}.dashboard-header{display:flex;align-items:flex-start;justify-content:space-between;gap:24px;margin-bottom:18px;padding:2px 2px 0}.dashboard-title h1{margin:2px 0 0;font-size:clamp(26px,4vw,34px);font-family:ui-monospace,SFMono-Regular,Consolas,monospace;letter-spacing:-.04em}.address-line{display:flex;align-items:center;gap:10px}.copy-icon{min-height:34px;padding:6px 10px;border:1px solid var(--line);border-radius:9px;color:#d9cdee;background:#15111d;font:inherit;font-size:12px;font-weight:700;cursor:pointer}.status-chips{display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap}.dashboard-stack{display:grid;gap:12px}.dashboard-card,.settings-section{margin:0;border:1px solid var(--line-soft);border-radius:16px;background:rgba(16,13,24,.84);box-shadow:0 10px 32px rgba(0,0,0,.16)}.dashboard-card{padding:20px}.card-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:20px}.card-heading h2{margin:3px 0 0;font-size:20px}.refresh-block{display:flex;align-items:center;justify-content:flex-end;gap:10px;color:var(--muted);text-align:right}.button-small{min-height:36px;width:auto;padding:6px 11px;font-size:13px}.inline-control{margin:0}.balance-list{list-style:none;margin:12px 0 0;padding:0}.balance-row{display:grid;grid-template-columns:minmax(0,1fr) minmax(160px,auto);align-items:center;gap:20px;min-height:62px;padding:10px 2px;border-top:1px solid var(--line-soft)}.asset-identity>span{display:flex;flex-direction:column}.asset-identity small{color:var(--muted)}.asset-value{text-align:right}.asset-value>strong{display:block;font-size:16px}.asset-value .inline-control{margin-top:7px}.exact-balance{display:inline-block;margin:3px 0 0;border:0;background:none;text-align:left}.exact-balance summary{padding:0;color:var(--muted);font-size:11px;font-weight:600}.exact-balance code{display:block;max-width:340px;margin-top:5px;padding:7px;border:1px solid var(--line-soft);border-radius:8px;background:#09070d;color:#dacde8;overflow-wrap:anywhere;white-space:normal}.all-assets{margin:10px 0 0;background:#0c0911}.all-assets>summary{display:flex;align-items:center;justify-content:space-between}.all-assets>summary span{display:grid;place-items:center;min-width:24px;height:24px;border-radius:999px;background:var(--purple-soft);color:#d9c5ff;font-size:12px}.all-assets>.balance-list{margin:0;padding:0 14px 8px}.mode-card .details-grid{max-width:620px}.privacy-banner{display:flex;align-items:center;justify-content:space-between;gap:20px;margin-bottom:12px;padding:14px 16px;border:1px solid #554078;border-radius:14px;background:#171022}.privacy-banner>div{display:flex;flex-direction:column}.privacy-banner span{color:var(--muted)}.privacy-banner .button{min-height:40px}.settings-section>summary{display:flex;align-items:center;justify-content:space-between;margin:0;padding:17px 20px;list-style-position:inside}.settings-section>summary span{display:flex;flex-direction:column;gap:2px}.settings-section>summary small{color:var(--muted);font-weight:500}.settings-body{padding:0 20px 20px}.settings-summary{margin:0}.settings-summary>div{display:grid;grid-template-columns:160px minmax(0,1fr);gap:18px;padding:9px 0;border-top:1px solid var(--line-soft)}.settings-summary dd{font-family:inherit;font-size:13px}.replacement-settings{margin:14px 0 0}.replacement-body{padding:0 14px 14px}.settings-warning{padding:10px 12px;border:1px solid #773447;border-radius:10px;background:#291018;color:#ffc1ce}.priority-state{max-width:none;margin:0 0 12px}.diagnostics-section .diagnostics{margin-top:0}
+.sr-only{position:absolute!important;width:1px!important;height:1px!important;padding:0!important;margin:-1px!important;overflow:hidden!important;clip:rect(0,0,0,0)!important;white-space:nowrap!important;border:0!important}.control-overview{padding:0;border:0;border-radius:0;background:none;box-shadow:none}.dashboard-header{display:flex;align-items:flex-start;justify-content:space-between;gap:24px;margin-bottom:18px;padding:2px 2px 0}.dashboard-title h1{margin:2px 0 0;font-size:clamp(26px,4vw,34px);font-family:ui-monospace,SFMono-Regular,Consolas,monospace;letter-spacing:-.04em}.address-line{display:flex;align-items:center;gap:10px}.copy-icon{min-height:34px;padding:6px 10px;border:1px solid var(--line);border-radius:9px;color:#d9cdee;background:#15111d;font:inherit;font-size:12px;font-weight:700;cursor:pointer}.status-chips{display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap}.dashboard-stack{display:grid;gap:12px}.dashboard-card,.settings-section{margin:0;border:1px solid var(--line-soft);border-radius:16px;background:rgba(16,13,24,.84);box-shadow:0 10px 32px rgba(0,0,0,.16)}.dashboard-card{padding:20px}.card-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:20px}.card-heading h2{margin:3px 0 0;font-size:20px}.refresh-block{display:flex;align-items:center;justify-content:flex-end;gap:10px;color:var(--muted);text-align:right}.button-small{min-height:36px;width:auto;padding:6px 11px;font-size:13px}.inline-control{margin:0}.balance-list{list-style:none;margin:12px 0 0;padding:0}.balance-row{display:grid;grid-template-columns:minmax(0,1fr) minmax(160px,auto);align-items:center;gap:20px;min-height:62px;padding:10px 2px;border-top:1px solid var(--line-soft)}.asset-identity>span{display:flex;flex-direction:column}.asset-identity small{color:var(--muted)}.asset-value{text-align:right}.asset-value>strong{display:block;font-size:16px}.asset-value .inline-control{margin-top:7px}.exact-balance{display:inline-block;margin:3px 0 0;border:0;background:none;text-align:left}.exact-balance summary{padding:0;color:var(--muted);font-size:11px;font-weight:600}.exact-balance code{display:block;max-width:340px;margin-top:5px;padding:7px;border:1px solid var(--line-soft);border-radius:8px;background:#09070d;color:#dacde8;overflow-wrap:anywhere;white-space:normal}.all-assets{margin:10px 0 0;background:#0c0911}.all-assets>summary{display:flex;align-items:center;justify-content:space-between}.all-assets>summary span{display:grid;place-items:center;min-width:24px;height:24px;border-radius:999px;background:var(--purple-soft);color:#d9c5ff;font-size:12px}.all-assets>.balance-list{margin:0;padding:0 14px 8px}.mode-card .details-grid{max-width:620px}.policy-summaries{display:grid;gap:12px;margin-top:16px}.policy-summary{padding:16px;border:1px solid var(--line);border-radius:13px;background:#0c0911}.policy-summary h3{margin:3px 0 0;font-size:18px}.policy-summary .policy-id{margin:12px 0 0;overflow-wrap:anywhere}.policy-summary .policy-terms{margin-bottom:0}.policy-summary .policy-terms .details-grid{padding:0 14px 12px}.privacy-banner{display:flex;align-items:center;justify-content:space-between;gap:20px;margin-bottom:12px;padding:14px 16px;border:1px solid #554078;border-radius:14px;background:#171022}.privacy-banner>div{display:flex;flex-direction:column}.privacy-banner span{color:var(--muted)}.privacy-banner .button{min-height:40px}.settings-section>summary{display:flex;align-items:center;justify-content:space-between;margin:0;padding:17px 20px;list-style-position:inside}.settings-section>summary span{display:flex;flex-direction:column;gap:2px}.settings-section>summary small{color:var(--muted);font-weight:500}.settings-body{padding:0 20px 20px}.settings-summary{margin:0}.settings-summary>div{display:grid;grid-template-columns:160px minmax(0,1fr);gap:18px;padding:9px 0;border-top:1px solid var(--line-soft)}.settings-summary dd{font-family:inherit;font-size:13px}.replacement-settings{margin:14px 0 0}.replacement-body{padding:0 14px 14px}.settings-warning{padding:10px 12px;border:1px solid #773447;border-radius:10px;background:#291018;color:#ffc1ce}.priority-state{max-width:none;margin:0 0 12px}.diagnostics-section .diagnostics{margin-top:0}
 .activity-card>.card-heading>small{max-width:320px;color:var(--muted);text-align:right}.activity-list{list-style:none;margin:12px 0 0;padding:0}.activity-entry{padding:14px 0;border-top:1px solid var(--line-soft)}.activity-main{display:flex;align-items:flex-start;justify-content:space-between;gap:18px}.activity-title,.activity-state{display:flex;min-width:0;flex-direction:column}.activity-title strong{font-size:16px;overflow-wrap:anywhere}.activity-title small,.activity-state small,.activity-kind{color:var(--muted);font-size:11px}.activity-kind{font-weight:700;letter-spacing:.045em;text-transform:uppercase}.activity-state{align-items:flex-end;text-align:right}.status-pill{display:inline-flex;align-items:center;min-height:26px;padding:3px 9px;border:1px solid #493b5d;border-radius:999px;background:#171221;color:#d9cdee;font-size:12px;font-weight:700}.status-completed{border-color:#286d52;background:#102a20;color:#a7f1d2}.status-failed,.status-declined{border-color:#773447;background:#291018;color:#ffc1ce}.status-signing,.status-broadcasting,.status-confirming{border-color:#654698;background:#24183a;color:#e2d1ff}.activity-details{margin:10px 0 0;background:#0b0910}.activity-details>summary{padding:9px 11px;font-size:12px}.activity-terms{display:grid;gap:4px;margin:0;padding:0 14px 12px;list-style:none;color:#d8cede}.activity-terms li{overflow-wrap:anywhere}.activity-links{display:flex;gap:12px;flex-wrap:wrap;margin-top:8px;font-size:13px}.history-view{margin:12px 0 0;background:#0b0910}.history-view>summary{display:flex;justify-content:space-between}.history-body{padding:0 14px 14px}.activity-list-full{margin-top:0}.history-pagination{display:flex;align-items:center;justify-content:center;gap:12px;margin-top:14px}.focused-operation .progress-track{height:8px;margin:18px 0 12px;overflow:hidden;border-radius:999px;background:#241c30}.progress-track span{display:block;width:64%;height:100%;border-radius:inherit;background:linear-gradient(90deg,var(--purple),#c3a2ff)}.focused-operation .activity-terms{padding:12px 0}.focused-operation>.button{width:100%;margin-top:8px}
 .shell-wide{width:min(1460px,calc(100% - 32px))}.agent-workspace{display:grid;grid-template-columns:minmax(0,1fr) minmax(390px,520px);align-items:start;gap:16px}.agent-workspace-single{display:block}.dashboard-surface[inert]{opacity:.64;filter:saturate(.72)}.review-panel[hidden]{display:none!important}.review-panel{position:sticky;top:16px;max-height:calc(100vh - 32px);overflow:auto;overscroll-behavior:contain;border:1px solid #493464;border-radius:20px;background:#0d0a13;box-shadow:0 28px 90px rgba(0,0,0,.55)}.review-panel .approval-card{max-width:none;margin:0;padding:20px;border:0;border-radius:20px;background:linear-gradient(155deg,rgba(27,19,40,.98),rgba(10,8,15,.99));box-shadow:none}.review-panel .actions{position:sticky;left:auto;bottom:0;transform:none;width:auto;margin:18px -20px -20px;padding:12px 20px max(12px,env(safe-area-inset-bottom));background:rgba(10,8,15,.97)}.order-review-header{display:flex;align-items:flex-start;justify-content:space-between;gap:16px}.order-review-header h1{margin:4px 0 2px;font-size:clamp(25px,3vw,34px)}.order-pair{display:block;font-size:18px}.order-badges{margin:14px 0}.order-sides{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));overflow:hidden;border:1px solid #493464;border-radius:16px;background:#0a080e}.order-side{display:flex;min-width:0;flex-direction:column;padding:16px}.order-side+ .order-side{border-left:1px solid #352741}.order-side-label,.market-reference span,.order-costs span{color:var(--muted);font-size:11px;font-weight:700;letter-spacing:.045em;text-transform:uppercase}.order-amount{margin:4px 0 13px;font-size:20px;line-height:1.2}.order-price{display:flex;flex-direction:column;margin-top:auto}.order-price>span{font-size:17px;font-weight:760;overflow-wrap:anywhere}.order-price small{color:var(--muted);font-size:11px}.price-offset{align-self:flex-start;margin-top:8px;padding:3px 8px;border-radius:999px;background:#1f1830;color:#d7c4fa;font-size:11px;font-weight:720}.market-reference{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:1px;overflow:hidden;margin-top:10px;border:1px solid var(--line-soft);border-radius:12px;background:var(--line-soft)}.market-reference>div{padding:10px 12px;background:#100d18}.market-reference strong{display:block;margin-top:3px;font-size:12px;overflow-wrap:anywhere}.market-reference strong small{color:var(--muted);font-weight:500}.order-costs{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1px;overflow:hidden;margin-top:10px;border:1px solid var(--line-soft);border-radius:12px;background:var(--line-soft)}.order-costs>div{padding:11px 12px;background:#100d18}.order-costs strong{display:block;margin-top:3px}.order-explanations{margin:12px 0;color:#c9bfd5;font-size:13px}.order-explanations p{margin:6px 0}.confirmation-scope{padding:10px 12px;border-left:3px solid var(--purple);border-radius:4px 10px 10px 4px;background:#151020}.technical-disclosure{margin-bottom:0}.technical-step{padding:0 16px 14px}.technical-step>strong{display:block;margin-bottom:7px}.review-panel .result{margin:12px 0}.review-panel .lead{font-size:14px}.review-panel .policy-editor{margin:16px 0}
 .focused-operation progress.progress-track{display:block;width:100%;border:0;appearance:none}.focused-operation progress.progress-track::-webkit-progress-bar{border-radius:999px;background:#241c30}.focused-operation progress.progress-track::-webkit-progress-value{border-radius:999px;background:linear-gradient(90deg,var(--purple),#c3a2ff)}.focused-operation progress.progress-track::-moz-progress-bar{border-radius:999px;background:linear-gradient(90deg,var(--purple),#c3a2ff)}

@@ -11,6 +11,7 @@ import {
   hmacSha256Hex,
   signActionEnvelope
 } from '../shared/canonical.js';
+import { MARKET_REFERENCE_MAX_AGE_MS } from '../shared/marketReference.js';
 import type {
   ActionStepV1,
   ChainWhisperAccessMode,
@@ -197,6 +198,10 @@ const normalizedIntent = (
             marketReferencePrice: intent.priceReference.price,
             marketReferenceObservedAt:
               intent.priceReference.observedAt,
+            marketReferenceExpiresAt:
+              intent.priceReference.expiresAt ?? null,
+            marketReferenceMaxAgeMs:
+              MARKET_REFERENCE_MAX_AGE_MS,
             buyPriceOffsetBps:
               intent.priceReference.buyOffsetBps,
             sellPriceOffsetBps:

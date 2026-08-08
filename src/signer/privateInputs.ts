@@ -481,6 +481,64 @@ export const decodeStoredAccessSecret = (
   }
 };
 
+export const bindGeneratedAccessSecretToOrder = async (
+  vault: EncryptedSecretVault,
+  input: {
+    operationHash: HexString;
+    escrowContract: Address;
+    localId: string;
+  },
+): Promise<boolean> => {
+  let numericLocalId: bigint;
+  try {
+    numericLocalId = BigInt(input.localId);
+  } catch {
+    numericLocalId = 0n;
+  }
+  if (
+    !isHexData(input.operationHash) ||
+    input.operationHash.length !== 66 ||
+    !isHexAddress(input.escrowContract) ||
+    !/^[1-9][0-9]*$/u.test(input.localId) ||
+    numericLocalId > MAX_UINT256
+  ) {
+    throw new SignerError(
+      'ENVELOPE_TAMPERED',
+      'The receipt-derived order access-secret binding is invalid.',
+    );
+  }
+  const reference = generatedAccessSecretReference(input.operationHash);
+  const stored = await vault.get(reference);
+  if (!stored) return false;
+  const decoded = decodeStoredAccessSecret(stored);
+  if (
+    !decoded ||
+    decoded.operationHash !== input.operationHash.toLowerCase() ||
+    decoded.escrowContract !== input.escrowContract.toLowerCase() ||
+    (decoded.localId !== null && decoded.localId !== input.localId)
+  ) {
+    throw new SignerError(
+      'ENVELOPE_TAMPERED',
+      'The generated access-secret receipt binding changed.',
+    );
+  }
+  if (decoded.localId === input.localId) return true;
+  const bound: StoredAccessSecretV1 = {
+    ...decoded,
+    localId: input.localId,
+  };
+  await vault.put(reference, encodeStoredAccessSecret(bound), {
+    kind: 'access-secret',
+    binding: {
+      operationHash: bound.operationHash,
+      ...(bound.recipient ? { recipient: bound.recipient } : {}),
+      escrowContract: bound.escrowContract,
+      localId: input.localId,
+    },
+  });
+  return true;
+};
+
 const encryptAesGcm = (
   plaintext: string,
   key: Buffer,
@@ -1139,7 +1197,6 @@ export class VaultBackedPrivateInputMaterializer
               record.recipient?.toLowerCase() ||
             decoded.escrowContract.toLowerCase() !==
               record.escrowContract.toLowerCase() ||
-            decoded.localId !== null ||
             decoded.secret !== record.secret
           ) {
             throw new SignerError(

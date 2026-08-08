@@ -10,7 +10,11 @@ import {
   type ToolAnnotations
 } from '@modelcontextprotocol/sdk/types.js';
 
-import { assertNoSensitiveMaterial, redactError } from '../shared/index.js';
+import {
+  assertNoSensitiveMaterial,
+  isMcpSafeError,
+  redactError
+} from '../shared/index.js';
 
 export interface JsonMcpTool {
   name: string;
@@ -58,6 +62,8 @@ const jsonText = (value: unknown): string =>
     (_key, entry) => (typeof entry === 'bigint' ? entry.toString() : entry),
     2
   );
+
+const MCP_TOOL_FAILURE_MESSAGE = 'chainwhisper-tool-failed';
 
 export const createJsonMcpServer = (definition: JsonMcpServerDefinition): Server => {
   const server = new Server(
@@ -111,7 +117,14 @@ export const createJsonMcpServer = (definition: JsonMcpServerDefinition): Server
     } catch (error) {
       return {
         isError: true,
-        content: [{ type: 'text', text: redactError(error) }]
+        content: [
+          {
+            type: 'text',
+            text: isMcpSafeError(error)
+              ? redactError(error)
+              : MCP_TOOL_FAILURE_MESSAGE
+          }
+        ]
       };
     }
   });

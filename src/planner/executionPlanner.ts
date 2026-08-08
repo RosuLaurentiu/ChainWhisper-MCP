@@ -23,6 +23,7 @@ import type {
   ChainWhisperRuntimeManifestV1,
   RuntimeContractManifestEntry
 } from '../shared/runtimeManifest.js';
+import { marketReferenceDeadlineMs } from '../shared/marketReference.js';
 import {
   privacyBridgePair,
   type PrivacyBridgePairV1
@@ -319,6 +320,24 @@ export class ManifestExecutionPlanner {
         'provider_error'
       );
     }
+    const now = this.#now();
+    const genericExpiresAt = now.getTime() + this.#ttlMs;
+    const marketExpiresAt =
+      intent.action === 'create_recurring' && intent.priceReference
+        ? marketReferenceDeadlineMs(
+            intent.priceReference.observedAt,
+            intent.priceReference.expiresAt,
+          )
+        : null;
+    if (intent.action === 'create_recurring' && intent.priceReference) {
+      if (marketExpiresAt === null || marketExpiresAt <= now.getTime()) {
+        throw new DomainInputError(
+          'The market reference expired before the action could be prepared.',
+          [],
+          'provider_error'
+        );
+      }
+    }
     return {
       wallet: intent.wallet,
       registry: status.registry,
@@ -339,7 +358,11 @@ export class ManifestExecutionPlanner {
         warnings: simulation.warnings,
         ...(simulation.errorCode ? { errorCode: simulation.errorCode } : {})
       },
-      expiresAt: new Date(this.#now().getTime() + this.#ttlMs).toISOString(),
+      expiresAt: new Date(
+        marketExpiresAt === null
+          ? genericExpiresAt
+          : Math.min(genericExpiresAt, marketExpiresAt)
+      ).toISOString(),
       ...(built.intentMetadata ? { intentMetadata: built.intentMetadata } : {})
     };
   };

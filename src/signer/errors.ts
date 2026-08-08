@@ -1,3 +1,5 @@
+import { MCP_SAFE_ERROR } from '../shared/redaction.js';
+
 export type SignerErrorCode =
   | 'CONFIGURATION_REQUIRED'
   | 'CONFIRMATION_DECLINED'
@@ -27,6 +29,7 @@ export type SignerErrorCode =
   | 'WRITE_UNAVAILABLE';
 
 export class SignerError extends Error {
+  readonly [MCP_SAFE_ERROR] = true as const;
   readonly code: SignerErrorCode;
 
   constructor(code: SignerErrorCode, message: string) {

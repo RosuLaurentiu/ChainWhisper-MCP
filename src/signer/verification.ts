@@ -5,6 +5,9 @@ import {
   isHexData,
   isSafeOperationId,
   isUnsignedIntegerString,
+  MARKET_REFERENCE_MAX_AGE_MS,
+  MARKET_REFERENCE_MAX_FUTURE_SKEW_MS,
+  marketReferenceDeadlineMs,
   verifySignedActionEnvelope,
   type ActionStepV1,
   type SignedActionEnvelopeV1,
@@ -34,6 +37,70 @@ const LEGACY_STANDARD_COUNTER_REPLACEMENT_SIGNATURE =
   'counterTradeAndCloseCounteredTrade(uint256,(uint8,address,uint256),(uint8,address,uint256),uint64)';
 const LEGACY_STANDARD_EDIT_SIGNATURE =
   'editTrade(uint256,(uint8,address,uint256),(uint8,address,uint256),address,uint64,bool,bytes32)';
+
+const MARKET_REFERENCE_METADATA_KEYS = [
+  'marketReferenceId',
+  'marketReferenceVenue',
+  'marketReferencePrice',
+  'marketReferenceObservedAt',
+  'marketReferenceExpiresAt',
+  'marketReferenceMaxAgeMs',
+] as const;
+
+const assertMarketReferenceFreshness = (
+  envelope: SignedActionEnvelopeV1,
+  now: Date,
+): void => {
+  const metadata = envelope.intent.metadata;
+  if (
+    !metadata ||
+    !MARKET_REFERENCE_METADATA_KEYS.some((key) => key in metadata)
+  ) {
+    return;
+  }
+  const observedAt = metadata.marketReferenceObservedAt;
+  const providerExpiresAt = metadata.marketReferenceExpiresAt;
+  if (
+    envelope.intent.action !== 'create_recurring' ||
+    typeof metadata.marketReferenceId !== 'string' ||
+    typeof metadata.marketReferenceVenue !== 'string' ||
+    typeof metadata.marketReferencePrice !== 'string' ||
+    typeof observedAt !== 'string' ||
+    (
+      providerExpiresAt !== null &&
+      typeof providerExpiresAt !== 'string'
+    ) ||
+    metadata.marketReferenceMaxAgeMs !==
+      MARKET_REFERENCE_MAX_AGE_MS
+  ) {
+    throw new SignerError(
+      'ENVELOPE_INVALID',
+      'The signed market-reference freshness policy is invalid.',
+    );
+  }
+  const observedAtMs = Date.parse(observedAt);
+  const deadline = marketReferenceDeadlineMs(
+    observedAt,
+    providerExpiresAt,
+  );
+  if (
+    deadline === null ||
+    observedAtMs >
+      now.getTime() + MARKET_REFERENCE_MAX_FUTURE_SKEW_MS ||
+    now.getTime() >= deadline
+  ) {
+    throw new SignerError(
+      'STALE_STATE',
+      'The signed market reference is no longer fresh.',
+    );
+  }
+  if (Date.parse(envelope.expiresAt) > deadline) {
+    throw new SignerError(
+      'ENVELOPE_INVALID',
+      'The action plan exceeds its signed market-reference deadline.',
+    );
+  }
+};
 const LEGACY_STANDARD_UPDATE_SIGNATURES: Readonly<
   Record<string, string>
 > = {
@@ -1105,6 +1172,22 @@ export class ActionEnvelopeVerifier {
     this.#clock = clock;
   }
 
+  assertFreshness(signedEnvelope: SignedActionEnvelopeV1): void {
+    const now = this.#clock();
+    const issuedAt = Date.parse(signedEnvelope.issuedAt);
+    const expiresAt = Date.parse(signedEnvelope.expiresAt);
+    if (
+      issuedAt > now.getTime() + this.#config.operationExpirySkewMs ||
+      expiresAt - now.getTime() <= this.#config.operationExpirySkewMs
+    ) {
+      throw new SignerError(
+        'STALE_STATE',
+        'The action plan is too close to expiry or was issued in the future.',
+      );
+    }
+    assertMarketReferenceFreshness(signedEnvelope, now);
+  }
+
   async verify(
     signedEnvelope: SignedActionEnvelopeV1,
     wallet: Address,
@@ -1147,17 +1230,7 @@ export class ActionEnvelopeVerifier {
       this.#config.credentialMaterial().pairingSecret,
     );
 
-    const issuedAt = Date.parse(signedEnvelope.issuedAt);
-    const expiresAt = Date.parse(signedEnvelope.expiresAt);
-    if (
-      issuedAt > now.getTime() + this.#config.operationExpirySkewMs ||
-      expiresAt - now.getTime() <= this.#config.operationExpirySkewMs
-    ) {
-      throw new SignerError(
-        'STALE_STATE',
-        'The action plan is too close to expiry or was issued in the future.',
-      );
-    }
+    this.assertFreshness(signedEnvelope);
     if (
       normalizeAddress(signedEnvelope.wallet) !== normalizeAddress(wallet) ||
       (this.#config.expectedWallet &&

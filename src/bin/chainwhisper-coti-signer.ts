@@ -48,10 +48,13 @@ import {
   VaultAutonomyStore,
   VaultBackedPrivateInputMaterializer,
   acquireSignerInstanceLock,
+  autonomyPolicyResumeDetails,
+  autonomyResumeBinding,
   buildPublicSignerStatus,
   createCotiSignerRuntime,
   createOfficialMessagingInvoker,
   ensurePrivateStateDirectory,
+  isExactAutonomyResumeBinding,
   loadSignerConfig,
   pendingOperation,
   replacementBlockReason,
@@ -155,33 +158,59 @@ const configuredControlSummary = async (options: {
   const autonomyStatus = autonomyDecision.allowed
     ? autonomyDecision.value
     : inactiveAutonomy();
-  const current =
-    autonomyStatus.policies
-      .filter(({ policy }) =>
-        ['active', 'paused'].includes(policy.lifecycle.state),
-      )
-      .at(-1) ?? null;
-  const remaining = current?.remaining;
-  const remainingBudgets = remaining
-    ? [
-        ...remaining.spendByAsset.map(({ asset, amount }) => ({
-          label: `Spend ${asset}`,
-          value: `${amount} base units`,
-        })),
-        ...(remaining.nativeValue === null
-          ? []
-          : [{ label: 'Native value', value: `${remaining.nativeValue} wei` }]),
-        ...(remaining.networkFee === null
-          ? []
-          : [{ label: 'Network fees', value: `${remaining.networkFee} wei` }]),
-        ...(remaining.actions === null
-          ? []
-          : [{ label: 'Actions', value: String(remaining.actions) }]),
-      ...(remaining.messages === null
-          ? []
-          : [{ label: 'Messages', value: String(remaining.messages) }]),
-      ]
-    : undefined;
+  const activePolicies = autonomyStatus.policies.filter(({ policy }) =>
+    ['active', 'paused'].includes(policy.lifecycle.state),
+  );
+  const autonomyPolicies = activePolicies.map(({ policy, remaining }) => {
+    const remainingBudgets = remaining
+      ? [
+          ...remaining.spendByAsset.map(({ asset, amount }) => ({
+            label: `Spend ${asset}`,
+            value: `${amount} base units`,
+          })),
+          ...(remaining.nativeValue === null
+            ? []
+            : [
+                {
+                  label: 'Native value',
+                  value: `${remaining.nativeValue} wei`,
+                },
+              ]),
+          ...(remaining.networkFee === null
+            ? []
+            : [
+                {
+                  label: 'Network fees',
+                  value: `${remaining.networkFee} wei`,
+                },
+              ]),
+          ...(remaining.actions === null
+            ? []
+            : [{ label: 'Actions', value: String(remaining.actions) }]),
+          ...(remaining.messages === null
+            ? []
+            : [{ label: 'Messages', value: String(remaining.messages) }]),
+        ]
+      : undefined;
+    return {
+      id: policy.id,
+      termsDigest: policy.termsDigest,
+      mode: policy.mode,
+      state: policy.lifecycle.state,
+      expiresAt: policy.expiresAt,
+      agentVisiblePrivateAmounts: policy.agentVisiblePrivateAmounts,
+      ...(remainingBudgets ? { remainingBudgets } : {}),
+      details: autonomyPolicyResumeDetails(policy),
+    };
+  });
+  const current = autonomyPolicies[autonomyPolicies.length - 1] ?? null;
+  const resumePolicies = activePolicies
+    .filter(({ policy }) => policy.lifecycle.state === 'paused')
+    .map(({ policy }) => policy);
+  const resumePolicyBinding =
+    resumePolicies.length > 0
+      ? autonomyResumeBinding(resumePolicies)
+      : undefined;
   const pending = operations.filter(pendingOperation);
   const pendingStatuses = new Map(
     await Promise.all(
@@ -294,14 +323,21 @@ const configuredControlSummary = async (options: {
       : 'ready',
     autonomy: current
       ? {
-          mode: current.policy.mode,
-          state: current.policy.lifecycle.state,
-          expiresAt: current.policy.expiresAt,
-          agentVisiblePrivateAmounts:
-            current.policy.agentVisiblePrivateAmounts,
-          ...(remainingBudgets ? { remainingBudgets } : {}),
+          mode: current.mode,
+          state: current.state,
+          expiresAt: current.expiresAt,
+          agentVisiblePrivateAmounts: current.agentVisiblePrivateAmounts,
+          ...(current.remainingBudgets
+            ? { remainingBudgets: current.remainingBudgets }
+            : {}),
+          globalPaused: autonomyStatus.globalPaused,
+          policies: autonomyPolicies,
         }
-      : { mode: 'manual' },
+      : {
+          mode: 'manual',
+          globalPaused: autonomyStatus.globalPaused,
+          policies: [],
+        },
     pendingOperations: pending.length,
     recentOperations,
     activity,
@@ -341,14 +377,20 @@ const configuredControlSummary = async (options: {
         privacyReady && !options.walletControl.restartRequired,
       refreshBalances: !options.walletControl.restartRequired,
       pause:
-        Boolean(current) &&
+        activePolicies.length > 0 &&
         !autonomyStatus.globalPaused &&
-        current?.policy.lifecycle.state === 'active',
+        activePolicies.some(
+          ({ policy }) => policy.lifecycle.state === 'active',
+        ),
       resume:
-        Boolean(current) &&
-        (autonomyStatus.globalPaused ||
-          current?.policy.lifecycle.state === 'paused'),
-      revoke: Boolean(current),
+        autonomyStatus.globalPaused && resumePolicies.length > 0,
+      revoke: activePolicies.length > 0,
+      ...(resumePolicyBinding
+        ? {
+            resumePolicyCount: resumePolicies.length,
+            resumePolicyBinding,
+          }
+        : {}),
     },
   };
 };
@@ -540,7 +582,6 @@ const initializeConfiguredSigner = async (
     journal,
     vault,
     autonomy,
-    manifestHash: hashRuntimeManifest(manifest),
     assertRuntimeAttested,
   });
   const privacyOnboarding = new PrivacyOnboardingService({
@@ -655,11 +696,38 @@ const handleConfiguredControlAction = async (
       : { ok: false, message: paused.denial.message };
   }
   if (action === 'resume-autonomy') {
-    autonomyApprovals.preapproveNextResumeFromControlPage();
-    const resumed = await service.resumeAutonomy();
-    return resumed.allowed
-      ? { ok: true, message: 'Autonomy resumed under unchanged terms.' }
-      : { ok: false, message: resumed.denial.message };
+    const status = await service.autonomyStatus();
+    if (!status.allowed) {
+      return { ok: false, message: status.denial.message };
+    }
+    const pausedPolicies = status.value.policies
+      .filter(({ policy }) => policy.lifecycle.state === 'paused')
+      .map(({ policy }) => policy);
+    const currentBinding = autonomyResumeBinding(pausedPolicies);
+    if (
+      !status.value.globalPaused ||
+      pausedPolicies.length === 0 ||
+      !isExactAutonomyResumeBinding(
+        pausedPolicies,
+        fields.resumePolicyBinding?.trim(),
+      )
+    ) {
+      return {
+        ok: false,
+        message:
+          'The displayed autonomy policies are stale. Review the refreshed policy list before resuming.',
+      };
+    }
+    const clearPreapproval =
+      autonomyApprovals.preapproveNextResumeFromControlPage(currentBinding);
+    try {
+      const resumed = await service.resumeAutonomy();
+      return resumed.allowed
+        ? { ok: true, message: 'Autonomy resumed under unchanged terms.' }
+        : { ok: false, message: resumed.denial.message };
+    } finally {
+      clearPreapproval();
+    }
   }
   if (action === 'revoke-autonomy') {
     const status = await service.autonomyStatus();

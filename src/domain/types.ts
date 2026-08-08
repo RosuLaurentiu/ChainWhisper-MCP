@@ -192,7 +192,7 @@ export type RawPriceReference = {
   quoteAsset: ResolvedAsset;
   price: DecimalString;
   basis: 'quote_per_base' | 'base_per_quote';
-  observedAt: string;
+  observedAt: string | null;
   expiresAt?: string | null;
   executable: boolean;
   liquidityChecked: boolean;
@@ -305,6 +305,7 @@ export type CreateRecurringIntent = {
     venue: string;
     price: DecimalString;
     observedAt: string;
+    expiresAt?: string | null;
     buyOffsetBps: number | null;
     sellOffsetBps: number | null;
   };

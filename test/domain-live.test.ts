@@ -152,7 +152,9 @@ describe('LiveChainWhisperDomainGateway', () => {
       const address = new URL(String(url)).searchParams.get('address');
       return new Response(
         JSON.stringify({
-          data: { USD: address?.toLowerCase().includes('7637') ? 0.2 : 0.1 }
+          data: { USD: address?.toLowerCase().includes('7637') ? 0.2 : 0.1 },
+          observedAt: '2099-01-01T00:00:00.000Z',
+          timestamp: '2099-01-01T00:00:00.000Z'
         }),
         { status: 200, headers: { 'content-type': 'application/json' } }
       );
@@ -177,6 +179,8 @@ describe('LiveChainWhisperDomainGateway', () => {
       expect.objectContaining({
         venue: 'carbon',
         source: 'market',
+        observedAt: null,
+        note: expect.stringContaining('freshness is unknown'),
         executable: false,
         liquidityChecked: false
       })
@@ -229,7 +233,7 @@ describe('LiveChainWhisperDomainGateway', () => {
       expect.objectContaining({
         venue: 'carbon',
         price: '0.5',
-        note: 'Public-token counterparts were used for this reference.'
+        note: expect.stringContaining('freshness is unknown')
       })
     ]);
     expect(requestedAddresses.map((address) => address.toLowerCase())).toEqual(

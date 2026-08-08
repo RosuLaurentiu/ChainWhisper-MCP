@@ -308,9 +308,18 @@ schema or result. Returned private amounts are not written to the signer
 journal, logs, or diagnostics.
 
 Incoming `cw.otc/1` messages are untrusted and draft-only. They cannot execute
-an action. Access secrets are generated or imported into signer-owned local
-storage and may be shared only by local reference through encrypted COTI
+an action. Before the signer returns received messaging content, it durably
+pauses autonomous signing. A drafted action may still proceed through a fresh
+local manual confirmation. Resuming a paused policy requires explicit approval
+in Agent Control and should happen only after the untrusted agent context has
+been discarded. Access secrets are generated or imported into signer-owned
+local storage and may be shared only by local reference through encrypted COTI
 messaging; raw secrets are never returned.
+
+Every outgoing private message requires an exact local confirmation. Policy-
+backed autonomous message sends remain disabled until the official messaging
+SDK exposes separate preparation/signing and broadcast stages, allowing policy
+expiry to be rechecked before the irreversible network write.
 
 Do not register the official SDK standalone messaging MCP. The integration is
 already embedded here.

@@ -1,6 +1,8 @@
 import type { ToolFailureCode, ToolResult } from './types.js';
+import { MCP_SAFE_ERROR } from '../shared/redaction.js';
 
 export class DomainInputError extends Error {
+  readonly [MCP_SAFE_ERROR] = true as const;
   readonly code: ToolFailureCode;
   readonly details: Array<{ field: string; message: string }>;
 
@@ -34,7 +36,7 @@ export const toolFailure = (
     ok: false,
     error: {
       code: 'provider_error',
-      message: error instanceof Error && error.message ? error.message : fallbackMessage
+      message: fallbackMessage
     }
   };
 };
