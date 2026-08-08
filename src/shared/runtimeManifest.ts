@@ -199,16 +199,62 @@ const selectorSetMatches = (bytecode: string, selectors: Record<string, HexStrin
   );
 };
 
+const RUNTIME_AUDIT_RPC_RETRY_DELAYS_MS = [250, 500, 1_000] as const;
+const RUNTIME_AUDIT_BYTECODE_CONCURRENCY = 4;
+
+const wait = async (milliseconds: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, milliseconds));
+
+const requestWithRuntimeAuditRetry = async <T>(
+  rpc: JsonRpcReader,
+  method: string,
+  params: unknown[]
+): Promise<T> => {
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= RUNTIME_AUDIT_RPC_RETRY_DELAYS_MS.length; attempt += 1) {
+    try {
+      return await rpc.request<T>(method, params);
+    } catch (error) {
+      lastError = error;
+      const retryDelay = RUNTIME_AUDIT_RPC_RETRY_DELAYS_MS[attempt];
+      if (retryDelay !== undefined) {
+        await wait(retryDelay);
+      }
+    }
+  }
+  throw lastError;
+};
+
+const mapWithConcurrency = async <Input, Output>(
+  inputs: readonly Input[],
+  concurrency: number,
+  mapper: (input: Input, index: number) => Promise<Output>
+): Promise<Output[]> => {
+  const outputs = new Array<Output>(inputs.length);
+  let nextIndex = 0;
+  const worker = async (): Promise<void> => {
+    while (nextIndex < inputs.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      const input = inputs[index];
+      if (input !== undefined) {
+        outputs[index] = await mapper(input, index);
+      }
+    }
+  };
+  await Promise.all(
+    Array.from(
+      { length: Math.min(concurrency, inputs.length) },
+      async () => worker()
+    )
+  );
+  return outputs;
+};
+
 export const auditRuntimeManifest = async (
   manifest: ChainWhisperRuntimeManifestV1,
   rpc: JsonRpcReader
 ): Promise<RuntimeAuditResult> => {
-  let blockNumber: string | undefined;
-  try {
-    blockNumber = await rpc.request<string>('eth_blockNumber', []);
-  } catch {
-    blockNumber = undefined;
-  }
   const entries: Array<[string, RuntimeContractManifestEntry]> = [
     ['registry', manifest.registry],
     ...Object.entries(manifest.contracts),
@@ -217,13 +263,38 @@ export const auditRuntimeManifest = async (
         [`attestation.${name}`, entry] as [
           string,
           RuntimeContractManifestEntry
-        ]
+      ]
     )
   ];
-  const contracts = await Promise.all(
-    entries.map(async ([name, entry]): Promise<RuntimeAuditContractResult> => {
+  let blockNumber: string;
+  try {
+    blockNumber = await requestWithRuntimeAuditRetry<string>(rpc, 'eth_blockNumber', []);
+  } catch {
+    return {
+      ok: false,
+      checkedAt: new Date().toISOString(),
+      registryContractsMatch: false,
+      registryContractsError: 'block-pin-failed',
+      recurringWritesEnabled: false,
+      contracts: entries.map(([name, entry]) => ({
+        name,
+        address: entry.address,
+        expectedBytecodeHash: entry.bytecodeHash,
+        bytecodeMatches: false,
+        selectorsMatch: false,
+        error: 'block-pin-failed'
+      }))
+    };
+  }
+  const contracts = await mapWithConcurrency(
+    entries,
+    RUNTIME_AUDIT_BYTECODE_CONCURRENCY,
+    async ([name, entry]): Promise<RuntimeAuditContractResult> => {
       try {
-        const code = await rpc.request<Hex>('eth_getCode', [entry.address, blockNumber ?? 'latest']);
+        const code = await requestWithRuntimeAuditRetry<Hex>(rpc, 'eth_getCode', [
+          entry.address,
+          blockNumber
+        ]);
         const observedBytecodeHash = keccak256(code);
         return {
           name,
@@ -247,14 +318,14 @@ export const auditRuntimeManifest = async (
           error: error instanceof Error ? error.message : 'runtime-audit-failed'
         };
       }
-    })
+    }
   );
   let registryContractsMatch = false;
   let registryContractsError: string | undefined;
   try {
-    const registryResult = await rpc.request<Hex>('eth_call', [
+    const registryResult = await requestWithRuntimeAuditRetry<Hex>(rpc, 'eth_call', [
       { to: manifest.registry.address, data: manifest.registry.selectors.getContracts },
-      blockNumber ?? 'latest'
+      blockNumber
     ]);
     const [registryContracts] = decodeAbiParameters(
       [

@@ -422,9 +422,11 @@ tarball, checksum, production-only SBOM, runtime audit, and release notes. The
 protected publish-only job downloads and verifies those artifacts and publishes
 the same tarball with npm provenance.
 
-The first publish requires verified ownership of `@chainwhisper` and a
-short-lived granular npm token. Configure npm trusted publishing immediately
-afterward and revoke the bootstrap token.
+The first publish requires verified ownership of `@chainwhisper` and the
+shortest-lived granular npm token with read/write scope access and **Bypass
+2FA** enabled, stored only in the protected `npm-beta` environment. Configure
+npm trusted publishing immediately afterward, remove the environment secret,
+and revoke the bootstrap token.
 
 Also review [CHANGELOG.md](./CHANGELOG.md), [SECURITY.md](./SECURITY.md), and
 [LICENSE](./LICENSE).
