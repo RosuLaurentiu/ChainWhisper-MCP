@@ -1,5 +1,5 @@
 import { validateMnemonic } from '@scure/bip39';
-import { wordlist } from '@scure/bip39/wordlists/english';
+import { wordlist } from '@scure/bip39/wordlists/english.js';
 
 export const MCP_SAFE_ERROR = Symbol('chainwhisper.mcp-safe-error');
 
