@@ -11,12 +11,14 @@ import {
 } from '../server/jsonMcpServer.js';
 import {
   getOrCreatePairingSecret,
+} from '../shared/pairing.js';
+import {
   HttpJsonRpcReader,
   loadRuntimeManifest,
-  CHAINWHISPER_AGENT_TOOLS_VERSION,
   type ChainWhisperRuntimeManifestV1,
   type JsonRpcReader
-} from '../shared/index.js';
+} from '../shared/runtimeManifest.js';
+import { CHAINWHISPER_AGENT_TOOLS_VERSION } from '../shared/version.js';
 import { SignedDomainEnvelopeFactory } from './envelopeFactory.js';
 import { ManifestExecutionPlanner } from './executionPlanner.js';
 

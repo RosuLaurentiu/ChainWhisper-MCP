@@ -70,7 +70,7 @@ describe('planner executable environment boundary', () => {
       const environmentPath = join(plannerDirectory, 'environment.js');
       const serverProbePath = join(root, 'server-probe.json');
       const plannerProbePath = join(root, 'planner-probe.json');
-      const fakeServerPath = join(serverDirectory, 'index.js');
+      const fakeServerPath = join(serverDirectory, 'jsonMcpServer.js');
       const fakePlannerPath = join(plannerDirectory, 'server.js');
 
       await Promise.all([

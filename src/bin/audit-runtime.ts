@@ -3,9 +3,9 @@
 import {
   HttpJsonRpcReader,
   auditRuntimeManifest,
-  loadRuntimeManifest,
-  redactError
-} from '../shared/index.js';
+  loadRuntimeManifest
+} from '../shared/runtimeManifest.js';
+import { redactError } from '../shared/redaction.js';
 
 const run = async (): Promise<void> => {
   const manifest = await loadRuntimeManifest();

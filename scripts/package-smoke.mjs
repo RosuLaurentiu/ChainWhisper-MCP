@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { access, mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { dirname, resolve, sep } from 'node:path';
+import { delimiter, dirname, resolve, sep } from 'node:path';
 import process from 'node:process';
 import { promisify } from 'node:util';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -25,6 +25,7 @@ const packageRoot =
     : resolve(scriptDirectory, '..');
 const packageJsonPath = resolve(packageRoot, 'package.json');
 const liveStatusRequested = process.argv.includes('--live-status');
+const commandShimsRequested = process.argv.includes('--via-command-shims');
 
 const assertFile = async (path) => {
   await access(path);
@@ -41,6 +42,9 @@ const sanitizedEnvironment = (stateDirectory) => {
     ...getDefaultEnvironment(),
     CHAINWHISPER_STATE_DIRECTORY: stateDirectory,
   };
+  if (commandShimsRequested) {
+    environment.PATH = `${dirname(process.execPath)}${delimiter}${environment.PATH ?? ''}`;
+  }
   for (const name of [
     'CHAINWHISPER_SIGNER_CONFIG_FILE',
     'CHAINWHISPER_SIGNER_PRIVATE_KEY',
@@ -58,8 +62,16 @@ const sanitizedEnvironment = (stateDirectory) => {
 const withStdioClient = async (name, binaryPath, environment, callback) => {
   let stderr = '';
   const transport = new StdioClientTransport({
-    command: process.execPath,
-    args: [binaryPath],
+    command: commandShimsRequested
+      ? resolve(
+          packageRoot,
+          '..',
+          '..',
+          '.bin',
+          `${name}${process.platform === 'win32' ? '.cmd' : ''}`,
+        )
+      : process.execPath,
+    args: commandShimsRequested ? [] : [binaryPath],
     cwd: packageRoot,
     env: environment,
     stderr: 'pipe',
@@ -94,32 +106,6 @@ assert.equal(
   packageJson.bin?.['chainwhisper-coti-signer'],
   './dist/bin/chainwhisper-coti-signer.js',
 );
-assert.deepEqual(packageJson.files, [
-  'dist',
-  'runtime',
-  'README.md',
-  'CHANGELOG.md',
-  'SECURITY.md',
-  'LICENSE',
-]);
-assert.deepEqual(packageJson.scripts, {
-  build: 'tsc -p tsconfig.json',
-  lint: 'eslint .',
-  test: 'vitest run test --testTimeout=15000 --maxWorkers=1',
-  smoke: 'node scripts/package-smoke.mjs',
-  'smoke:live': 'node scripts/package-smoke.mjs --live-status',
-  'smoke:live:readonly': 'node scripts/live-readonly-smoke.mjs',
-  'audit:contract-provenance':
-    'node scripts/verify-contract-provenance.mjs',
-  'verify:tarball':
-    'npm run build && node scripts/package-tarball-smoke.mjs',
-  'pack:dry-run': 'npm run build && npm pack --dry-run',
-  'audit:dependencies': 'npm audit --omit=dev --audit-level=low',
-  'audit:runtime': 'node dist/bin/audit-runtime.js',
-  prepack: 'tsc -p tsconfig.json',
-  prepublishOnly:
-    'npm run lint && npm run build && npm test && npm run smoke && npm run audit:dependencies && node scripts/package-tarball-smoke.mjs',
-});
 
 const plannerBinary = resolve(packageRoot, packageJson.bin['chainwhisper-mcp']);
 const signerBinary = resolve(

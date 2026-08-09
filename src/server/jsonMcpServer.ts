@@ -14,7 +14,7 @@ import {
   assertNoSensitiveMaterial,
   isMcpSafeError,
   redactError
-} from '../shared/index.js';
+} from '../shared/redaction.js';
 
 export interface JsonMcpTool {
   name: string;

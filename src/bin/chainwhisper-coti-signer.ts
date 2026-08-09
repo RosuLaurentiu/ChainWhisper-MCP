@@ -11,68 +11,88 @@ import {
   connectStdioMcpServer,
   createJsonMcpServer,
   writeFatalMcpError,
-} from '../server/index.js';
-import { LiveChainWhisperDomainGateway } from '../domain/index.js';
+} from '../server/jsonMcpServer.js';
+import { LiveChainWhisperDomainGateway } from '../domain/liveGateway.js';
 import {
-  CHAINWHISPER_AGENT_TOOLS_VERSION,
   HttpJsonRpcReader,
   hashRuntimeManifest,
   loadRuntimeManifest,
-} from '../shared/index.js';
+} from '../shared/runtimeManifest.js';
+import { CHAINWHISPER_AGENT_TOOLS_VERSION } from '../shared/version.js';
 import {
-  ACCOUNT_ONBOARD_CONTRACT,
-  AgentActivityReader,
-  AgentWalletBalanceReader,
-  AbiCallTemplateMaterializer,
-  ActionEnvelopeVerifier,
-  AuditedRuntimeStateReader,
-  AutonomyPolicyManager,
-  ChainWhisperMessagingBridge,
-  ChainWhisperSignerService,
-  ConfirmationGate,
-  ContractRuntimeFeeReader,
-  ControlPageAutonomyApprovals,
-  CotiSdkPrivateUint256Encoder,
-  EncryptedSecretVault,
-  HotSignerToolRouter,
-  LocalWebFormElicitor,
-  NonceQueue,
-  OperationJournal,
-  PrivacyOnboardingService,
-  PrivateStateDisclosureService,
-  PrivateTokenAccountService,
-  RpcAllowlistedOrderMakerReader,
-  RpcStandardOrderFactsReader,
-  SignerEngine,
-  StrictMaterializedIntentValidator,
-  VaultAutonomyStore,
-  VaultBackedPrivateInputMaterializer,
-  acquireSignerInstanceLock,
-  autonomyPolicyResumeDetails,
-  autonomyResumeBinding,
-  buildPublicSignerStatus,
-  createCotiSignerRuntime,
-  createOfficialMessagingInvoker,
-  ensurePrivateStateDirectory,
-  isExactAutonomyResumeBinding,
-  loadSignerConfig,
   pendingOperation,
   replacementBlockReason,
   resolveWalletPrivacyKey,
   safeAgentControlErrorCode,
   safeAgentControlErrorMessage,
   saveAgentWallet,
-  signerStatusInputSchema,
-  signerStatusRequiredAssets,
-  type Address,
+  type WalletControlState,
+} from '../signer/agentWallet.js';
+import { AgentWalletBalanceReader } from '../signer/agentWalletBalances.js';
+import { AgentActivityReader } from '../signer/agentActivity.js';
+import {
+  AutonomyPolicyManager,
+  autonomyResumeBinding,
+  isExactAutonomyResumeBinding,
+  type AutonomyStatusV1,
+} from '../signer/autonomy.js';
+import {
+  buildPublicSignerStatus,
+  loadSignerConfig,
+  type LoadedSignerConfig,
+} from '../signer/config.js';
+import { ConfirmationGate } from '../signer/confirmation.js';
+import {
+  ControlPageAutonomyApprovals,
+  autonomyPolicyResumeDetails,
+} from '../signer/controlAutonomyApprovals.js';
+import { createCotiSignerRuntime } from '../signer/cotiRuntime.js';
+import { SignerEngine } from '../signer/engine.js';
+import { HotSignerToolRouter } from '../signer/hotSignerTools.js';
+import { StrictMaterializedIntentValidator } from '../signer/intentValidation.js';
+import {
+  acquireSignerInstanceLock,
+  type SignerInstanceLock,
+} from '../signer/instanceLock.js';
+import { OperationJournal } from '../signer/journal.js';
+import type { AgentControlSummary } from '../signer/localControlPage.js';
+import {
+  LocalWebFormElicitor,
   type AgentControlAction,
   type AgentControlActionResult,
-  type AgentControlSummary,
-  type AutonomyStatusV1,
-  type LoadedSignerConfig,
-  type SignerInstanceLock,
-  type WalletControlState,
-} from '../signer/index.js';
+} from '../signer/localWebElicitor.js';
+import {
+  ChainWhisperMessagingBridge,
+  createOfficialMessagingInvoker,
+} from '../signer/messaging.js';
+import { NonceQueue } from '../signer/nonceQueue.js';
+import { RpcAllowlistedOrderMakerReader } from '../signer/orderMaker.js';
+import {
+  AbiCallTemplateMaterializer,
+  CotiSdkPrivateUint256Encoder,
+  VaultBackedPrivateInputMaterializer,
+} from '../signer/privateInputs.js';
+import { PrivateStateDisclosureService } from '../signer/privateState.js';
+import { PrivateTokenAccountService } from '../signer/privateTokenAccount.js';
+import {
+  ACCOUNT_ONBOARD_CONTRACT,
+  PrivacyOnboardingService,
+} from '../signer/privacyOnboarding.js';
+import {
+  AuditedRuntimeStateReader,
+  ContractRuntimeFeeReader,
+  RpcStandardOrderFactsReader,
+} from '../signer/runtime.js';
+import { ChainWhisperSignerService } from '../signer/service.js';
+import { ensurePrivateStateDirectory } from '../signer/stateSecurity.js';
+import {
+  signerStatusInputSchema,
+  signerStatusRequiredAssets,
+} from '../signer/tools.js';
+import type { Address } from '../signer/types.js';
+import { EncryptedSecretVault } from '../signer/vault.js';
+import { VaultAutonomyStore } from '../signer/vaultAutonomyStore.js';
+import { ActionEnvelopeVerifier } from '../signer/verification.js';
 
 const inactiveAutonomy = (): AutonomyStatusV1 => ({
   globalPaused: false,

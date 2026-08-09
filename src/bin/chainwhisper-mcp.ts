@@ -8,7 +8,7 @@ const main = async (): Promise<void> => {
   const {
     connectStdioMcpServer,
     writeFatalMcpError,
-  } = await import('../server/index.js');
+  } = await import('../server/jsonMcpServer.js');
   try {
     const { createChainWhisperPlanningServer } =
       await import('../planner/server.js');
