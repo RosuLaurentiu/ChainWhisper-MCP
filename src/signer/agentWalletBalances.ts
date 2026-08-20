@@ -332,13 +332,18 @@ export class AgentWalletBalanceReader {
       functionName: 'balanceOf',
       data: balanceRaw,
     });
-    const amount = this.#decrypt(
-      {
-        ciphertextHigh: BigInt(encrypted.ciphertextHigh),
-        ciphertextLow: BigInt(encrypted.ciphertextLow),
-      },
-      normalizeCotiAesKey(privacyKey),
-    );
+    const ciphertext = {
+      ciphertextHigh: BigInt(encrypted.ciphertextHigh),
+      ciphertextLow: BigInt(encrypted.ciphertextLow),
+    };
+    const amount =
+      ciphertext.ciphertextHigh === 0n &&
+      ciphertext.ciphertextLow === 0n
+        ? 0n
+        : this.#decrypt(
+            ciphertext,
+            normalizeCotiAesKey(privacyKey),
+          );
     return this.#readyRow(token, amount);
   }
 

@@ -65,6 +65,12 @@ const FEE_AMOUNT_SELECTOR = toFunctionSelector('feeAmount()');
 const FEE_RECIPIENT_SELECTOR = toFunctionSelector('feeRecipient()');
 const CHARGE_FEE_ON_EDIT_SELECTOR =
   toFunctionSelector('chargeFeeOnEdit()');
+const RUNTIME_FEE_READ_ATTEMPTS = 4;
+const RUNTIME_FEE_RETRY_DELAYS_MS = [250, 500, 1_000] as const;
+const RUNTIME_FEE_ACTION_CONCURRENCY = 2;
+
+const wait = (milliseconds: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, milliseconds));
 
 const STANDARD_GET_TRADE_VIEW_ABI = parseAbi([
   'function getTradeView(uint256 tradeId) view returns (((address maker,address taker,uint8 status,(uint8 assetType,address token,uint256 amount) offerAsset,(uint8 assetType,address token,uint256 amount) requestAsset,uint64 createdAt,uint64 expiresAt) trade,(bool isPublic,bytes32 accessHash,uint256 parentTradeId,uint256 feePaid) metadata,(uint256 remainingOfferAmount,uint256 remainingRequestAmount,uint256 filledOfferAmount,uint256 filledRequestAmount) fillState,(bool partialFillsAllowed,uint16 minPartialFillBps,uint256 minRequestAmount,uint256 maxRequestAmountPerWallet,bool oneFillPerWallet) fillPolicy,uint8 effectiveStatus,uint256 replacementTradeId,uint256 replacesTradeId,uint256 rootTradeId))',
@@ -159,16 +165,48 @@ export class ContractRuntimeFeeReader implements RuntimeFeeReader {
     );
   }
 
+  async #read<T>(method: string, params: unknown[]): Promise<T> {
+    let lastError: unknown;
+    for (let attempt = 0; attempt < RUNTIME_FEE_READ_ATTEMPTS; attempt += 1) {
+      try {
+        return await this.#rpc.request<T>(method, params);
+      } catch (error) {
+        lastError = error;
+        const retryDelay = RUNTIME_FEE_RETRY_DELAYS_MS[attempt];
+        if (retryDelay !== undefined) {
+          await wait(retryDelay);
+        }
+      }
+    }
+    throw lastError;
+  }
+
   async readFeeState(): Promise<RuntimeFeeState> {
-    const entries = await Promise.all(
-      Object.entries(this.#actionContracts).map(
-        async ([action, contract]) => {
+    const contracts = Object.entries(this.#actionContracts);
+    const entries = new Array<
+      readonly [
+        string,
+        {
+          amount: string;
+          editAmount: string;
+          recipient: Address;
+        },
+      ]
+    >(contracts.length);
+    let nextIndex = 0;
+    const worker = async (): Promise<void> => {
+      while (nextIndex < contracts.length) {
+        const index = nextIndex;
+        nextIndex += 1;
+        const pair = contracts[index];
+        if (!pair) continue;
+        const [action, contract] = pair;
           const [amountResult, recipientResult] = await Promise.all([
-            this.#rpc.request<Hex>('eth_call', [
+            this.#read<Hex>('eth_call', [
               { to: contract, data: FEE_AMOUNT_SELECTOR },
               'latest',
             ]),
-            this.#rpc.request<Hex>('eth_call', [
+            this.#read<Hex>('eth_call', [
               { to: contract, data: FEE_RECIPIENT_SELECTOR },
               'latest',
             ]),
@@ -187,7 +225,7 @@ export class ContractRuntimeFeeReader implements RuntimeFeeReader {
           if (mode === 'always') {
             editAmount = amount;
           } else if (mode === 'contract-flag') {
-            const editFlagResult = await this.#rpc.request<Hex>(
+            const editFlagResult = await this.#read<Hex>(
               'eth_call',
               [
                 {
@@ -203,7 +241,7 @@ export class ContractRuntimeFeeReader implements RuntimeFeeReader {
             );
             editAmount = chargeFee ? amount : 0n;
           }
-          return [
+          entries[index] = [
             action,
             {
               amount: amount.toString(),
@@ -211,7 +249,17 @@ export class ContractRuntimeFeeReader implements RuntimeFeeReader {
               recipient: recipient.toLowerCase() as Address,
             },
           ] as const;
+      }
+    };
+    await Promise.all(
+      Array.from(
+        {
+          length: Math.min(
+            RUNTIME_FEE_ACTION_CONCURRENCY,
+            contracts.length,
+          ),
         },
+        worker,
       ),
     );
     return {
@@ -248,11 +296,9 @@ export class AuditedRuntimeStateReader implements RuntimeStateReader {
 
   async readRegistryState(): Promise<RuntimeRegistryState> {
     const manifest = await this.#loadManifest();
-    const [audit, feeState] = await Promise.all([
-      auditRuntimeManifest(manifest, this.#rpc),
-      this.#fees.readFeeState(),
-    ]);
+    const audit = await auditRuntimeManifest(manifest, this.#rpc);
     this.#assertAudit(audit);
+    const feeState = await this.#fees.readFeeState();
     const allowedContracts = new Set<string>();
     const allowedSelectors = new Map<string, ReadonlySet<string>>();
     for (const [name, contract] of Object.entries(manifest.contracts)) {
