@@ -64,6 +64,7 @@ const manifest = {
 const rpcFixture = (
   options: {
     privateCotiMapping?: string;
+    privateCotiCiphertext?: readonly [bigint, bigint];
     walletCode?: string;
   } = {},
 ) => {
@@ -106,8 +107,18 @@ const rpcFixture = (
         abi: PRIVATE_ABI,
         functionName: 'balanceOf',
         result: {
-          ciphertextHigh: 1n,
-          ciphertextLow: 2n,
+          ciphertextHigh:
+            transaction.to.toLowerCase() ===
+              PRIVATE_COTI.toLowerCase() &&
+            options.privateCotiCiphertext
+              ? options.privateCotiCiphertext[0]
+              : 1n,
+          ciphertextLow:
+            transaction.to.toLowerCase() ===
+              PRIVATE_COTI.toLowerCase() &&
+            options.privateCotiCiphertext
+              ? options.privateCotiCiphertext[1]
+              : 2n,
         },
       }) as T;
     },
@@ -228,6 +239,29 @@ describe('AgentWalletBalanceReader', () => {
       exactAmount: '0',
       defaultVisible: true,
     });
+  });
+
+  it('treats the uninitialized zero ciphertext as a zero balance without decrypting it', async () => {
+    const fixture = rpcFixture({ privateCotiCiphertext: [0n, 0n] });
+    const decrypt = vi.fn(() => 10_000_000n);
+    const reader = new AgentWalletBalanceReader({
+      wallet: WALLET,
+      rpc: fixture.rpc,
+      manifest,
+      privacyKey: () => AES_KEY,
+      decrypt,
+    });
+
+    const snapshot = await reader.snapshot(['p.COTI']);
+
+    expect(
+      snapshot.rows.find(({ symbol }) => symbol === 'p.COTI'),
+    ).toMatchObject({
+      readiness: 'ready',
+      exactAmount: '0',
+      displayAmount: '0',
+    });
+    expect(decrypt).toHaveBeenCalledTimes(1);
   });
 
   it('does not classify a foreign mapping as ready or query wallet code', async () => {
