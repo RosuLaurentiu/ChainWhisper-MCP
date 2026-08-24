@@ -61,13 +61,13 @@
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",
-    "@types/node": "22.19.15",
-    "eslint": "10.8.0",
-    "globals": "17.9.0",
-    "solc": "0.8.19",
-    "typescript": "5.9.3",
-    "typescript-eslint": "8.66.0",
-    "vitest": "4.1.10"
+    "@types/node": "26.2.0",
+    "eslint": "10.9.0",
+    "globals": "17.11.0",
+    "solc": "0.8.36",
+    "typescript": "7.0.2",
+    "typescript-eslint": "8.67.0",
+    "vitest": "4.1.11"
   },
   "overrides": {
     "solc": {
