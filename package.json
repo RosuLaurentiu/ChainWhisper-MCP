@@ -54,7 +54,7 @@
     "@coti-io/coti-ethers": "1.0.6",
     "@coti-io/coti-sdk-private-messaging": "0.2.3",
     "@coti-io/coti-sdk-typescript": "1.0.9",
-    "@modelcontextprotocol/sdk": "1.30.0",
+    "@modelcontextprotocol/sdk": "1.32.1",
     "@scure/bip39": "2.3.0",
     "ethers": "6.17.0",
     "viem": "2.55.16"
